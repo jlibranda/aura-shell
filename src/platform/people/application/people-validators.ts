@@ -1,0 +1,6 @@
+import { invalid, issue, valid, type ValidationResult } from "@/platform/validation";
+import type { EmployeeContactChanges, EmployeeGovernmentIdChanges, EmployeeProfileChanges } from "@/platform/people/employee-repository";
+export function validateEmployeeId(employeeId: string): ValidationResult<string> { return employeeId.trim() ? valid(employeeId.trim()) : invalid([issue("employeeId", "required", "Employee ID is required.")]); }
+export function validateProfileChanges(changes: EmployeeProfileChanges): ValidationResult<EmployeeProfileChanges> { return changes.firstName !== undefined && !changes.firstName.trim() ? invalid([issue("firstName", "required", "First name is required.")]) : valid(changes); }
+export function validateContactChanges(changes: EmployeeContactChanges): ValidationResult<EmployeeContactChanges> { return changes.email !== undefined && !/^\S+@\S+\.\S+$/.test(changes.email) ? invalid([issue("email", "format", "Enter a valid email address.")]) : valid(changes); }
+export function validateGovernmentIdChanges(changes: EmployeeGovernmentIdChanges): ValidationResult<EmployeeGovernmentIdChanges> { return Object.values(changes).some((value) => value?.number !== null && value?.number !== undefined && !value.number.trim()) ? invalid([issue("governmentIds", "format", "Government ID values cannot be blank strings.")]) : valid(changes); }

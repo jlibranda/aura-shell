@@ -1,0 +1,139 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+/// Tenant is the storage isolation root. Trusted request construction—not the
+/// browser—selects the tenant used by future repository adapters.
+model Tenant {
+  id                           String                        @id @map("tenant_id")
+  createdAt                    DateTime                      @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt                    DateTime                      @updatedAt @map("updated_at") @db.Timestamptz(6)
+  employees                    Employee[]
+  auditRecords                 AuditRecord[]
+  submissionIdempotencyRecords SubmissionIdempotencyRecord[]
+  outboxMessages               OutboxMessage[]
+
+  @@map("tenants")
+}
+
+/// Transactional domain-event delivery record. Payloads are safe event
+/// projections; workers never read Employee aggregates through this model.
+model OutboxMessage {
+  messageId           String    @id @map("message_id")
+  eventId             String    @unique @map("event_id")
+  tenantId            String    @map("tenant_id")
+  eventName           String    @map("event_name")
+  aggregateType       String    @map("aggregate_type")
+  aggregateId         String    @map("aggregate_id")
+  correlationId       String    @map("correlation_id")
+  occurredAt          DateTime  @map("occurred_at") @db.Timestamptz(6)
+  payload             Json
+  state               String
+  attempts            Int       @default(0)
+  availableAt         DateTime  @map("available_at") @db.Timestamptz(6)
+  processedAt         DateTime? @map("processed_at") @db.Timestamptz(6)
+  leaseOwner          String?   @map("lease_owner")
+  processingStartedAt DateTime? @map("processing_started_at") @db.Timestamptz(6)
+  leaseExpiresAt      DateTime? @map("lease_expires_at") @db.Timestamptz(6)
+  lastErrorCode       String?   @map("last_error_code")
+  lastError           String?   @map("last_error")
+  createdAt           DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt           DateTime  @updatedAt @map("updated_at") @db.Timestamptz(6)
+  tenant              Tenant    @relation(fields: [tenantId], references: [id], onDelete: Restrict, onUpdate: Cascade)
+
+  @@index([state, availableAt])
+  @@index([state, leaseExpiresAt])
+  @@index([tenantId, occurredAt])
+  @@map("outbox_messages")
+}
+
+/// Durable replay protection for internal command submission. It records only
+/// a request hash and a sanitized result; no employee personal data is stored.
+model SubmissionIdempotencyRecord {
+  tenantId       String   @map("tenant_id")
+  idempotencyKey String   @map("idempotency_key")
+  commandType    String   @map("command_type")
+  requestHash    String   @map("request_hash")
+  state          String
+  result         Json?    @map("result_json")
+  createdAt      DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt      DateTime @updatedAt @map("updated_at") @db.Timestamptz(6)
+  tenant         Tenant   @relation(fields: [tenantId], references: [id], onDelete: Restrict, onUpdate: Cascade)
+
+  @@id([tenantId, idempotencyKey])
+  @@map("submission_idempotency_records")
+}
+
+/// This is the durable representation of the existing authoritative employee
+/// aggregate. Government identifiers, payroll, compensation, tax, and banking
+/// data are deliberately not part of this model.
+model Employee {
+  tenantId              String   @map("tenant_id")
+  employeeId            String   @map("employee_id")
+  employeeNumber        String   @map("employee_number")
+  displayName           String   @map("display_name")
+  firstName             String   @map("first_name")
+  middleName            String?  @map("middle_name")
+  lastName              String   @map("last_name")
+  preferredName         String?  @map("preferred_name")
+  dateOfBirth           DateTime @map("date_of_birth") @db.Date
+  gender                String
+  maritalStatus         String   @map("marital_status")
+  nationality           String
+  workEmail             String   @map("work_email")
+  personalEmail         String?  @map("personal_email")
+  mobileNumber          String   @map("mobile_number")
+  homeAddress           String   @map("home_address")
+  departmentId          String   @map("department_id")
+  teamId                String?  @map("team_id")
+  position              String
+  managerId             String?  @map("manager_id")
+  employmentType        String   @map("employment_type")
+  employmentStatus      String?  @map("employment_status")
+  hireDate              DateTime @map("hire_date") @db.Date
+  workLocation          String   @map("work_location")
+  emergencyContactName  String?  @map("emergency_contact_name")
+  emergencyRelationship String?  @map("emergency_relationship")
+  emergencyMobileNumber String?  @map("emergency_mobile_number")
+  emergencyEmail        String?  @map("emergency_email")
+  emergencyAddress      String?  @map("emergency_address")
+  createdAt             DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt             DateTime @updatedAt @map("updated_at") @db.Timestamptz(6)
+  tenant                Tenant   @relation(fields: [tenantId], references: [id], onDelete: Restrict, onUpdate: Cascade)
+
+  @@id([tenantId, employeeId])
+  @@unique([tenantId, employeeNumber])
+  @@unique([tenantId, workEmail])
+  @@index([tenantId, lastName, firstName])
+  @@index([tenantId, departmentId])
+  @@map("employees")
+}
+
+/// Append-only command outcome evidence. The migration installs a PostgreSQL
+/// trigger that rejects UPDATE and DELETE operations on this table.
+model AuditRecord {
+  auditId       String   @id @map("audit_id")
+  occurredAt    DateTime @map("occurred_at") @db.Timestamptz(6)
+  tenantId      String   @map("tenant_id")
+  actorUserId   String   @map("actor_user_id")
+  requestId     String   @map("request_id")
+  correlationId String   @map("correlation_id")
+  transactionId String   @map("transaction_id")
+  commandName   String   @map("command_name")
+  eventName     String   @map("event_name")
+  aggregateType String   @map("aggregate_type")
+  aggregateId   String   @map("aggregate_id")
+  result        String
+  metadata      Json
+  tenant        Tenant   @relation(fields: [tenantId], references: [id], onDelete: Restrict, onUpdate: Cascade)
+
+  @@index([tenantId, occurredAt])
+  @@index([tenantId, aggregateType, aggregateId])
+  @@index([correlationId])
+  @@map("audit_records")
+}
