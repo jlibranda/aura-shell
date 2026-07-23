@@ -11,6 +11,7 @@
     "typecheck": "tsc --noEmit",
     "test": "vitest",
     "test:run": "vitest run",
+    "test:integration": "vitest run --config vitest.integration.config.ts",
     "seed:development": "set \"AURA_SEED_ENV=development\"&& node scripts/run-development-seed.cjs",
     "outbox:inspect": "node scripts/run-outbox-inspection.cjs"
   },

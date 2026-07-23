@@ -1,4 +1,5 @@
 import { ApplicationError } from "@/platform/errors";
+import { getRequestCorrelationId } from "@/platform/observability/request-context";
 import { createTrustedRequestContext, type TrustedRequestContext } from "@/platform/runtime-context";
 
 /**
@@ -12,6 +13,7 @@ export function getDevelopmentRequestContext(): TrustedRequestContext {
     roles: ["hr_admin"],
     permissions: ["people.read", "people.write", "people.government_ids.read", "people.employee.hire"],
     actorProvenance: "development_adapter",
+    correlationId: getRequestCorrelationId(),
   });
 }
 
