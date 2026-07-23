@@ -13,6 +13,18 @@ export type PeopleEmploymentStatus =
   | "retired"
   | "not_available";
 
+/** Statuses a caller may filter the directory by; "not_available" is a display fallback, not a real status. */
+export const PEOPLE_DIRECTORY_FILTERABLE_STATUSES: readonly Exclude<PeopleEmploymentStatus, "not_available">[] = [
+  "probationary",
+  "regular",
+  "active",
+  "on_leave",
+  "suspended",
+  "resigned",
+  "terminated",
+  "retired",
+];
+
 export interface PeopleDirectoryReadModel {
   id: string;
   employeeNumber: string;
