@@ -48,8 +48,11 @@ export default function AppLayout({
     hydrateAuth();
   }, [hydrateAuth]);
 
-  // Client-side route guard (mock auth). Redirect out once we know the state.
+  // Client-side route guard (mock auth) — development only. In production,
+  // middleware and the server loaders are the authoritative guard; this
+  // localStorage flag is never set there, so it must not gate real sessions.
   useEffect(() => {
+    if (process.env.NODE_ENV === "production") return;
     if (hydrated && !isAuthenticated) {
       router.replace("/login");
     }
@@ -70,8 +73,9 @@ export default function AppLayout({
     toggleCopilot();
   });
 
-  // Avoid flashing protected content before the auth check resolves.
-  if (!hydrated || !isAuthenticated) {
+  // Avoid flashing protected content before the auth check resolves —
+  // development only; production trusts the server-side guard instead.
+  if (process.env.NODE_ENV !== "production" && (!hydrated || !isAuthenticated)) {
     return (
       <div className="flex min-h-screen items-center justify-center bg-background">
         <div className="h-6 w-6 animate-spin rounded-full border-2 border-border border-t-primary" />

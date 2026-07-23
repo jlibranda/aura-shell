@@ -1,5 +1,5 @@
 import { hasPermission } from "@/platform/context";
-import { getDevelopmentSession } from "@/platform/development-session";
+import { resolveRequestContext } from "@/platform/auth/resolve-request-context";
 import type { OrganizationReferenceOptionDto, OrganizationSummaryDto } from "@/platform/organization/organization-reference-dtos";
 import { createPrismaPeopleReadRuntime, type PrismaPeopleReadRuntime } from "@/platform/people/prisma-people-read-runtime";
 import { PEOPLE_DIRECTORY_FILTERABLE_STATUSES, type PeopleDirectoryReadModel, type PeopleEmploymentStatus } from "@/platform/people/read-models/people-read-models";
@@ -77,7 +77,7 @@ export async function loadRuntimeDirectory(input: {
     (PEOPLE_DIRECTORY_FILTERABLE_STATUSES as readonly string[]).includes(value),
   );
   const departmentId = input.departmentId?.trim() || undefined;
-  const runtime = createPrismaPeopleReadRuntime(getDevelopmentSession());
+  const runtime = createPrismaPeopleReadRuntime(await resolveRequestContext());
   const [result, departmentOptions] = await Promise.all([
     runtime.directory.list(runtime.context, {
       offset,
