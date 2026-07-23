@@ -1,10 +1,12 @@
 import type { TenantContext } from "@/platform/context";
-import type { PeopleDirectoryReadModel } from "@/platform/people/read-models/people-read-models";
+import type { PeopleDirectoryReadModel, PeopleEmploymentStatus } from "@/platform/people/read-models/people-read-models";
 
 export interface PeopleDirectoryReadInput {
   offset: number;
   limit: number;
   query?: string;
+  status?: readonly PeopleEmploymentStatus[];
+  departmentId?: string;
 }
 
 export interface PeopleDirectoryReadResult {

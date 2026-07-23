@@ -3,10 +3,10 @@ import { requirePeoplePermission } from "@/platform/people/application/people-po
 import type { TenantContext } from "@/platform/context";
 import type { PeopleDirectoryReadInput, PeopleDirectoryReadRepository, PeopleDirectoryReadResult } from "@/platform/people/read-models/people-directory-read-repository";
 import type { EmployeeProfileReadRepository } from "@/platform/people/read-models/employee-profile-read-repository";
-import type { EmployeeContactReadModel, EmployeeProfileReadModel, PeopleDirectoryReadModel, PeopleEmploymentStatus } from "@/platform/people/read-models/people-read-models";
+import { PEOPLE_DIRECTORY_FILTERABLE_STATUSES, type EmployeeContactReadModel, type EmployeeProfileReadModel, type PeopleDirectoryReadModel, type PeopleEmploymentStatus } from "@/platform/people/read-models/people-read-models";
 
 type PrismaPeopleReadClient = Pick<PrismaClient, "employee">;
-const statuses = new Set<PeopleEmploymentStatus>(["probationary", "regular", "active", "on_leave", "suspended", "resigned", "terminated", "retired"]);
+const statuses = new Set<PeopleEmploymentStatus>(PEOPLE_DIRECTORY_FILTERABLE_STATUSES);
 const dateOnly = (value: Date): string => value.toISOString().slice(0, 10);
 const optional = (value: string | null): string | undefined => value ?? undefined;
 const status = (value: string | null): PeopleEmploymentStatus => value && statuses.has(value as PeopleEmploymentStatus) ? value as PeopleEmploymentStatus : "not_available";
@@ -38,6 +38,8 @@ export class PrismaPeopleDirectoryReadRepository implements PeopleDirectoryReadR
   async list(context: TenantContext, input: PeopleDirectoryReadInput): Promise<PeopleDirectoryReadResult> {
     requirePeoplePermission(context, "people.read");
     const query = input.query?.trim();
+    const selectedStatuses = (input.status ?? []).filter((value) => statuses.has(value));
+    const departmentId = input.departmentId?.trim();
     const where: Prisma.EmployeeWhereInput = {
       tenantId: context.tenantId,
       ...(query ? { OR: [
@@ -46,6 +48,8 @@ export class PrismaPeopleDirectoryReadRepository implements PeopleDirectoryReadR
         { workEmail: { contains: query, mode: "insensitive" } },
         { position: { contains: query, mode: "insensitive" } },
       ] } : {}),
+      ...(selectedStatuses.length ? { employmentStatus: { in: selectedStatuses } } : {}),
+      ...(departmentId ? { departmentId } : {}),
     };
     const [total, employees] = await Promise.all([
       this.prisma.employee.count({ where }),
