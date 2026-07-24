@@ -48,7 +48,11 @@ const isConfigurationManifest = (file: SourceFile) => file.path === "src/platfor
 // The Organization domain (ADR-012) is a peer domain — never coupled to Configuration.
 const isConfigurationCode = (file: SourceFile) => file.path.startsWith("src/platform/configuration/");
 const isOrganizationCode = (file: SourceFile) => file.path.startsWith("src/platform/organization/");
-const isOrganizationReadRepository = (file: SourceFile) => file.path === "src/platform/organization/prisma-org-unit-read-repository.ts";
+const ORGANIZATION_READ_REPOSITORY_FILES = new Set([
+  "src/platform/organization/prisma-org-unit-read-repository.ts",
+  "src/platform/organization/prisma-assignment-read-repository.ts",
+]);
+const isOrganizationReadRepository = (file: SourceFile) => ORGANIZATION_READ_REPOSITORY_FILES.has(file.path);
 
 const WRITE_RUNTIME_IMPORTS = [
   /^@prisma\/client/,
@@ -99,19 +103,26 @@ const CONFIGURATION_PERSISTENCE_IMPORTS = [
 const WRITE_RUNTIME_MODULE_IMPORTS = [/platform\/people\/commands\//, /platform\/submissions\//, /durable-application-runtime/];
 
 // The Organization write side (ADR-012). The read repository — and any client —
-// must never reach these; writes go only through the OrgUnit service + UnitOfWork.
+// must never reach these; writes go only through the OrgUnit/Assignment
+// services + their UnitOfWork.
 const ORGANIZATION_WRITE_SIDE_IMPORTS = [
   /platform\/organization\/prisma-org-unit-write-repository/,
   /platform\/organization\/org-unit-write-transaction/,
   /platform\/organization\/prisma-org-unit-unit-of-work/,
   /platform\/organization\/in-memory-org-unit-unit-of-work/,
   /platform\/organization\/org-unit-service/,
+  /platform\/organization\/prisma-assignment-write-repository/,
+  /platform\/organization\/assignment-write-transaction/,
+  /platform\/organization\/prisma-assignment-unit-of-work/,
+  /platform\/organization\/in-memory-assignment-unit-of-work/,
+  /platform\/organization\/assignment-service/,
 ];
 
 // Server-only Organization composition a client component must never import.
 const ORGANIZATION_SERVER_ONLY_IMPORTS = [
   ...ORGANIZATION_WRITE_SIDE_IMPORTS,
   /platform\/organization\/prisma-org-unit-read-repository/,
+  /platform\/organization\/prisma-assignment-read-repository/,
 ];
 
 // Anything that lets a caller obtain or construct a TrustedRequestContext —
