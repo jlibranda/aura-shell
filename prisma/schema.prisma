@@ -21,6 +21,7 @@ model Tenant {
   sessions                     Session[]
   configurationDefinitions     ConfigurationDefinition[]
   configurationVersions        ConfigurationVersion[]
+  orgUnits                     OrgUnit[]
 
   @@map("tenants")
 }
@@ -78,6 +79,36 @@ model ConfigurationVersion {
   @@index([tenantId, definitionId, status])
   @@index([tenantId, definitionId, effectiveFrom])
   @@map("configuration_versions")
+}
+
+/// OrgUnit — the single, recursive, typed organizational node (Epic 7B.1,
+/// ADR-012). One aggregate differentiated by `kind`; never a table per level.
+/// A strict single-parent tree: `parentId` is null for a root and otherwise
+/// names one parent in the same tenant, enforced by the composite
+/// (tenant_id, parent_id) -> (tenant_id, org_unit_id) foreign key. `id` and
+/// `code` are stable identity — immutable and never reused. Not a versioned
+/// entity: it is mutable structural master data (rename, move, archive), with
+/// history captured in the immutable audit trail, not in per-row versions.
+model OrgUnit {
+  id        String    @id @default(uuid()) @map("org_unit_id")
+  tenantId  String    @map("tenant_id")
+  code      String    @map("code")
+  name      String    @map("name")
+  kind      String    @map("kind")
+  parentId  String?   @map("parent_id")
+  status    String    @default("ACTIVE") @map("status")
+  createdAt DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
+  createdBy String    @map("created_by")
+  updatedAt DateTime  @updatedAt @map("updated_at") @db.Timestamptz(6)
+  tenant    Tenant    @relation(fields: [tenantId], references: [id], onDelete: Restrict, onUpdate: Cascade)
+  parent    OrgUnit?  @relation("OrgUnitHierarchy", fields: [tenantId, parentId], references: [tenantId, id], onDelete: Restrict, onUpdate: Cascade)
+  children  OrgUnit[] @relation("OrgUnitHierarchy")
+
+  @@unique([tenantId, id])
+  @@unique([tenantId, code])
+  @@index([tenantId, parentId])
+  @@index([tenantId, status])
+  @@map("org_units")
 }
 
 /// The platform login identity (Epic 6 Slice 6M0.1). Deliberately separate

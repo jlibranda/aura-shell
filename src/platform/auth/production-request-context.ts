@@ -1,4 +1,4 @@
-import type { Permission, PlatformRole } from "@/platform/context";
+import { permissionsForRoles, type PlatformRole } from "@/platform/context";
 import { logger } from "@/platform/observability/logger";
 import { getRequestCorrelationId } from "@/platform/observability/request-context";
 import { createProductionAuthRuntime } from "@/platform/auth/production-auth-runtime";
@@ -13,39 +13,12 @@ function toKnownRoles(roles: readonly string[]): PlatformRole[] {
 }
 
 /**
- * Mirrors the rule already embedded in context.ts's hasPermission() so the
- * command pipeline's separate PermissionSet check (which reads
- * TrustedRequestContext.permissions directly, not via hasPermission()) stays
- * consistent with it. Duplicated deliberately rather than editing the
- * existing, tested, preserved hasPermission() implementation.
+ * The verified PermissionSet is derived from the single role→permission source
+ * of truth in context.ts (permissionsForRoles), so the command pipeline's
+ * PermissionSet check and hasPermission() can never disagree, and new
+ * permissions (e.g. organization.*) require no change here.
  */
-function derivePermissionsFromRoles(roles: readonly PlatformRole[]): Permission[] {
-  const permissions = new Set<Permission>();
-  if (roles.includes("hr_admin") || roles.includes("hr_operations")) {
-    permissions.add("people.read");
-    permissions.add("people.write");
-    permissions.add("people.government_ids.read");
-    permissions.add("people.employee.hire");
-  }
-  if (roles.includes("payroll")) permissions.add("people.government_ids.read");
-
-  if (roles.includes("hr_admin")) {
-    permissions.add("settings.view");
-    permissions.add("settings.manage");
-    permissions.add("settings.publish");
-    permissions.add("settings.audit.view");
-  }
-  if (roles.includes("hr_operations")) {
-    permissions.add("settings.view");
-    permissions.add("settings.manage");
-  }
-  if (roles.includes("payroll")) permissions.add("settings.view");
-  if (roles.includes("auditor")) {
-    permissions.add("settings.view");
-    permissions.add("settings.audit.view");
-  }
-  return [...permissions];
-}
+const derivePermissionsFromRoles = permissionsForRoles;
 
 /**
  * Resolves a verified production TrustedRequestContext from the session

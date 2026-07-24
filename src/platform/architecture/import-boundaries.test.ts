@@ -189,6 +189,28 @@ describe("import boundary fitness rules (fixtures prove each rule actually catch
     const file: SourceFile = { path: "src/platform/configuration/registry/configuration-registry-service.ts", content: `import { hasPermission } from "@/platform/context";\nimport type { ConfigurationReadRepository } from "@/platform/configuration/configuration-repository";\nimport { CONFIGURATION_MANIFEST } from "@/platform/configuration/registry/configuration-manifest";\n` };
     expect(scanImportBoundaries([file])).toHaveLength(0);
   });
+
+  it("flags the organization read repository importing the org write side (read model must stay read-only)", () => {
+    const file: SourceFile = { path: "src/platform/organization/prisma-org-unit-read-repository.ts", content: `import { OrgUnitService } from "@/platform/organization/org-unit-service";\n` };
+    expect(scanImportBoundaries([file])).toContainEqual({ path: file.path, rule: "organization-read-repository-must-not-import-write-side", matchedImport: "@/platform/organization/org-unit-service" });
+  });
+
+  it("flags a client component importing the org unit service (ADR-012 server composition)", () => {
+    const file: SourceFile = { path: "src/components/organization/bad-client.tsx", content: `"use client";\nimport { OrgUnitService } from "@/platform/organization/org-unit-service";\n` };
+    expect(scanImportBoundaries([file])).toContainEqual({ path: file.path, rule: "client-components-must-not-import-organization-server-composition", matchedImport: "@/platform/organization/org-unit-service" });
+  });
+
+  it("flags Configuration importing Organization, and Organization importing Configuration (peer domains must not couple)", () => {
+    const configToOrg: SourceFile = { path: "src/platform/configuration/bad.ts", content: `import { buildOrgUnitTree } from "@/platform/organization/org-unit";\n` };
+    const orgToConfig: SourceFile = { path: "src/platform/organization/bad.ts", content: `import { CONFIGURATION_MANIFEST } from "@/platform/configuration/registry/configuration-manifest";\n` };
+    expect(scanImportBoundaries([configToOrg])).toContainEqual({ path: configToOrg.path, rule: "configuration-must-not-import-organization", matchedImport: "@/platform/organization/org-unit" });
+    expect(scanImportBoundaries([orgToConfig])).toContainEqual({ path: orgToConfig.path, rule: "organization-must-not-import-configuration", matchedImport: "@/platform/configuration/registry/configuration-manifest" });
+  });
+
+  it("does not flag the legitimate org read repository reading through Prisma with a permission gate", () => {
+    const file: SourceFile = { path: "src/platform/organization/prisma-org-unit-read-repository.ts", content: `import type { PrismaClient } from "@prisma/client";\nimport { hasPermission } from "@/platform/context";\nimport type { OrgUnitReadRepository } from "@/platform/organization/org-unit-repository";\n` };
+    expect(scanImportBoundaries([file])).toHaveLength(0);
+  });
 });
 
 describe("import boundary fitness rules — real codebase scan", () => {
