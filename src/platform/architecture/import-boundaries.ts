@@ -42,6 +42,9 @@ const isDomainCommand = (file: SourceFile) =>
   file.path.endsWith("employee-aggregate-root.ts");
 const isDevelopmentSessionAdapter = (file: SourceFile) => file.path === "src/platform/development-session.ts";
 const isAuthPlatformCode = (file: SourceFile) => file.path.startsWith("src/platform/auth/");
+// The Configuration Registry (ADR-011) is a read-side platform capability.
+const isConfigurationRegistry = (file: SourceFile) => file.path.startsWith("src/platform/configuration/registry/");
+const isConfigurationManifest = (file: SourceFile) => file.path === "src/platform/configuration/registry/configuration-manifest.ts";
 
 const WRITE_RUNTIME_IMPORTS = [
   /^@prisma\/client/,
@@ -64,6 +67,29 @@ const CONFIGURATION_SERVER_ONLY_IMPORTS = [
   /platform\/configuration\/prisma-configuration-read-repository/,
   /platform\/configuration\/prisma-configuration-read-runtime/,
   /platform\/configuration\/prisma-configuration-audit-read-repository/,
+  /platform\/configuration\/registry\/configuration-registry-service/,
+];
+
+// The registry is read-only (ADR-011 §7). It must never reach the write side.
+const CONFIGURATION_WRITE_SIDE_IMPORTS = [
+  /platform\/configuration\/commands\//,
+  /platform\/configuration\/prisma-configuration-write-repository/,
+  /platform\/configuration\/configuration-write-transaction/,
+  /platform\/configuration\/prisma-configuration-unit-of-work/,
+  /platform\/configuration\/in-memory-configuration-unit-of-work/,
+  /platform\/configuration\/durable-configuration-runtime/,
+  /unit-of-work/i,
+  /platform\/outbox\//,
+];
+
+// The static manifest (ADR-011 Layer 1) is pure data — it must not depend on
+// tenant persistence, Prisma, or any read/write runtime.
+const CONFIGURATION_PERSISTENCE_IMPORTS = [
+  /^@prisma\/client/,
+  /platform\/persistence\/prisma-client/,
+  /platform\/configuration\/prisma-configuration-/,
+  /platform\/configuration\/in-memory-configuration-/,
+  /platform\/configuration\/configuration-repository/,
 ];
 
 const WRITE_RUNTIME_MODULE_IMPORTS = [/platform\/people\/commands\//, /platform\/submissions\//, /durable-application-runtime/];
@@ -148,6 +174,16 @@ export const RULES: Rule[] = [
     name: "client-components-must-not-import-configuration-server-composition",
     appliesTo: isClientComponent,
     forbidden: CONFIGURATION_SERVER_ONLY_IMPORTS,
+  },
+  {
+    name: "configuration-registry-must-not-import-write-side",
+    appliesTo: isConfigurationRegistry,
+    forbidden: CONFIGURATION_WRITE_SIDE_IMPORTS,
+  },
+  {
+    name: "configuration-manifest-must-not-import-persistence",
+    appliesTo: isConfigurationManifest,
+    forbidden: CONFIGURATION_PERSISTENCE_IMPORTS,
   },
 ];
 

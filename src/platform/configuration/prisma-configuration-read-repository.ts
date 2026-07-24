@@ -1,7 +1,7 @@
 import type { Prisma, PrismaClient } from "@prisma/client";
 import { hasPermission, type TenantContext } from "@/platform/context";
 import { AuthorizationError } from "@/platform/errors";
-import type { ConfigurationReadRepository } from "@/platform/configuration/configuration-repository";
+import type { ConfigurationCategorySummary, ConfigurationReadRepository } from "@/platform/configuration/configuration-repository";
 import type { ConfigurationDefinitionRecord, ConfigurationVersionRecord, ConfigurationVersionStatus } from "@/platform/configuration/configuration-version";
 
 export type PrismaConfigurationReadClient = Pick<PrismaClient, "configurationDefinition" | "configurationVersion">;
@@ -90,5 +90,53 @@ export class PrismaConfigurationReadRepository implements ConfigurationReadRepos
       orderBy: { effectiveFrom: "asc" },
     });
     return version ? toVersion(version) : undefined;
+  }
+
+  /**
+   * Two queries total regardless of category count: one for the definitions,
+   * one for their versions. Effective/draft/scheduled are derived in memory
+   * with the same rules as the single-record methods above — so a category's
+   * summary can never disagree with getEffectiveVersion et al. Only dates and
+   * booleans are read (select-projected); no payload is ever fetched.
+   */
+  async getConfigurationSummaries(context: TenantContext, codes: readonly string[], asOf: Date): Promise<ReadonlyMap<string, ConfigurationCategorySummary>> {
+    requireSettingsView(context);
+    const result = new Map<string, ConfigurationCategorySummary>();
+    for (const code of codes) result.set(code, Object.freeze({ code, configured: false, hasDraft: false }));
+    if (codes.length === 0) return result;
+
+    const definitions = await this.prisma.configurationDefinition.findMany({
+      where: { tenantId: context.tenantId, code: { in: [...codes] } },
+      select: { id: true, code: true },
+    });
+    if (definitions.length === 0) return result;
+
+    const idToCode = new Map(definitions.map((d) => [d.id, d.code]));
+    const versions = await this.prisma.configurationVersion.findMany({
+      where: { tenantId: context.tenantId, definitionId: { in: definitions.map((d) => d.id) } },
+      select: { definitionId: true, status: true, effectiveFrom: true, effectiveUntil: true },
+    });
+
+    const asOfMs = asOf.getTime();
+    for (const definition of definitions) {
+      const own = versions.filter((v) => v.definitionId === definition.id);
+      const hasDraft = own.some((v) => v.status === "DRAFT");
+      const effective = own
+        .filter((v) => v.status === "PUBLISHED" && v.effectiveFrom !== null && v.effectiveFrom.getTime() <= asOfMs && (v.effectiveUntil === null || v.effectiveUntil.getTime() > asOfMs))
+        .sort((a, b) => (b.effectiveFrom!.getTime()) - (a.effectiveFrom!.getTime()))[0];
+      const scheduled = own
+        .filter((v) => v.status === "PUBLISHED" && v.effectiveFrom !== null && v.effectiveFrom.getTime() > asOfMs)
+        .sort((a, b) => (a.effectiveFrom!.getTime()) - (b.effectiveFrom!.getTime()))[0];
+      const code = idToCode.get(definition.id)!;
+      result.set(code, Object.freeze({
+        code,
+        definitionId: definition.id,
+        configured: Boolean(effective),
+        ...(effective?.effectiveFrom ? { effectiveFrom: effective.effectiveFrom.toISOString() } : {}),
+        hasDraft,
+        ...(scheduled?.effectiveFrom ? { scheduledFrom: scheduled.effectiveFrom.toISOString() } : {}),
+      }));
+    }
+    return result;
   }
 }

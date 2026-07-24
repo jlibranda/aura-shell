@@ -164,6 +164,31 @@ describe("import boundary fitness rules (fixtures prove each rule actually catch
     const file: SourceFile = { path: "src/app/(app)/settings/general/actions.ts", content: `"use server";\nimport { createDurableConfigurationRuntime } from "@/platform/configuration/durable-configuration-runtime";\nimport { resolveRequestContext } from "@/platform/auth/resolve-request-context";\n` };
     expect(scanImportBoundaries([file])).toHaveLength(0);
   });
+
+  it("flags a client component importing the configuration registry service (ADR-011 server composition)", () => {
+    const file: SourceFile = { path: "src/components/settings/bad-registry-client.tsx", content: `"use client";\nimport { describeConfigurationCategories } from "@/platform/configuration/registry/configuration-registry-service";\n` };
+    const violations = scanImportBoundaries([file]);
+    expect(violations).toContainEqual({ path: file.path, rule: "client-components-must-not-import-configuration-server-composition", matchedImport: "@/platform/configuration/registry/configuration-registry-service" });
+  });
+
+  it("flags the registry importing the configuration write side (registry must stay read-only)", () => {
+    const uow: SourceFile = { path: "src/platform/configuration/registry/bad-registry.ts", content: `import { PrismaConfigurationUnitOfWork } from "@/platform/configuration/prisma-configuration-unit-of-work";\n` };
+    const command: SourceFile = { path: "src/platform/configuration/registry/bad-registry-2.ts", content: `import { SaveGeneralSettingsDraftHandler } from "@/platform/configuration/commands/general-settings-durable-handlers";\n` };
+    expect(scanImportBoundaries([uow])).toContainEqual({ path: uow.path, rule: "configuration-registry-must-not-import-write-side", matchedImport: "@/platform/configuration/prisma-configuration-unit-of-work" });
+    expect(scanImportBoundaries([command])).toContainEqual({ path: command.path, rule: "configuration-registry-must-not-import-write-side", matchedImport: "@/platform/configuration/commands/general-settings-durable-handlers" });
+  });
+
+  it("flags the static manifest importing persistence (manifest must be pure data)", () => {
+    const prismaImport: SourceFile = { path: "src/platform/configuration/registry/configuration-manifest.ts", content: `import type { PrismaClient } from "@prisma/client";\n` };
+    const readerImport: SourceFile = { path: "src/platform/configuration/registry/configuration-manifest.ts", content: `import type { ConfigurationReadRepository } from "@/platform/configuration/configuration-repository";\n` };
+    expect(scanImportBoundaries([prismaImport])).toContainEqual({ path: prismaImport.path, rule: "configuration-manifest-must-not-import-persistence", matchedImport: "@prisma/client" });
+    expect(scanImportBoundaries([readerImport])).toContainEqual({ path: readerImport.path, rule: "configuration-manifest-must-not-import-persistence", matchedImport: "@/platform/configuration/configuration-repository" });
+  });
+
+  it("does not flag the legitimate registry service reading through the read-repository port and permissions", () => {
+    const file: SourceFile = { path: "src/platform/configuration/registry/configuration-registry-service.ts", content: `import { hasPermission } from "@/platform/context";\nimport type { ConfigurationReadRepository } from "@/platform/configuration/configuration-repository";\nimport { CONFIGURATION_MANIFEST } from "@/platform/configuration/registry/configuration-manifest";\n` };
+    expect(scanImportBoundaries([file])).toHaveLength(0);
+  });
 });
 
 describe("import boundary fitness rules — real codebase scan", () => {

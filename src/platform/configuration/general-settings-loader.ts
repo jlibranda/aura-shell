@@ -3,15 +3,14 @@ import { AuthorizationError } from "@/platform/errors";
 import { resolveRequestContext } from "@/platform/auth/resolve-request-context";
 import { createPrismaConfigurationReadRuntime } from "@/platform/configuration/prisma-configuration-read-runtime";
 import { GENERAL_COMPANY_SETTINGS_CODE } from "@/platform/configuration/general-company-settings";
+import { describeConfigurationCategories, type DescribedConfigurationCategory } from "@/platform/configuration/registry/configuration-registry-service";
 import type { ConfigurationDefinitionRecord, ConfigurationVersionRecord } from "@/platform/configuration/configuration-version";
 import type { AuditRecord } from "@/platform/auditing/audit-record";
 
-export type SettingsCategoryStatus = "not_configured" | "draft_in_progress" | "configured";
-
+/** The registry-driven Settings Home model: the categories the caller may see, described. */
 export interface SettingsHomeViewModel {
   context: TenantContext;
-  general: { status: SettingsCategoryStatus; visible: boolean };
-  auditVisible: boolean;
+  categories: readonly DescribedConfigurationCategory[];
 }
 
 export type GeneralSettingsViewResult =
@@ -39,25 +38,8 @@ export async function loadSettingsHome(): Promise<SettingsHomeViewModel> {
   const request = await resolveRequestContext();
   const runtime = createPrismaConfigurationReadRuntime(request);
   const { context } = runtime;
-
-  let status: SettingsCategoryStatus = "not_configured";
-  if (hasPermission(context, "settings.view")) {
-    const definition = await runtime.reader.findDefinitionByCode(context, GENERAL_COMPANY_SETTINGS_CODE);
-    if (definition) {
-      const [effective, draft] = await Promise.all([
-        runtime.reader.getEffectiveVersion(context, definition.id, new Date()),
-        runtime.reader.getDraftVersion(context, definition.id),
-      ]);
-      if (effective) status = "configured";
-      else if (draft) status = "draft_in_progress";
-    }
-  }
-
-  return Object.freeze({
-    context,
-    general: { status, visible: hasPermission(context, "settings.view") },
-    auditVisible: hasPermission(context, "settings.audit.view"),
-  });
+  const categories = await describeConfigurationCategories(context, runtime.reader);
+  return Object.freeze({ context, categories });
 }
 
 export async function loadGeneralSettingsView(): Promise<GeneralSettingsViewResult> {
