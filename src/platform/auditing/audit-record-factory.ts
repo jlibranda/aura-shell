@@ -50,4 +50,23 @@ export class AuditRecordFactory {
       metadata: Object.freeze({ ...event.payload }),
     });
   }
+
+  /** Organization structure audits (org unit created/renamed/moved/archived). */
+  organizationEvent(context: AuditContext, event: DomainEvent): AuditRecord {
+    return Object.freeze({
+      auditId: this.ids.next(),
+      occurredAt: this.clock.now(),
+      tenantId: context.tenantId,
+      actorUserId: context.actorUserId,
+      requestId: context.requestId,
+      correlationId: context.correlationId,
+      transactionId: context.transactionId,
+      commandName: context.commandName,
+      eventName: event.eventName,
+      aggregateType: event.aggregateType,
+      aggregateId: event.aggregateId,
+      result: "SUCCESS" as const,
+      metadata: Object.freeze({ ...event.payload }),
+    });
+  }
 }

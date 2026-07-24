@@ -7,7 +7,9 @@ export type Permission =
   | "settings.view"
   | "settings.manage"
   | "settings.publish"
-  | "settings.audit.view";
+  | "settings.audit.view"
+  | "organization.view"
+  | "organization.manage";
 
 /** The canonical runtime list of every platform permission, for validation and enumeration. */
 export const ALL_PERMISSIONS: readonly Permission[] = Object.freeze([
@@ -19,6 +21,8 @@ export const ALL_PERMISSIONS: readonly Permission[] = Object.freeze([
   "settings.manage",
   "settings.publish",
   "settings.audit.view",
+  "organization.view",
+  "organization.manage",
 ]);
 
 /** Type guard: is an arbitrary string a recognized platform permission? */
@@ -56,14 +60,25 @@ export interface TenantContext {
  * pre-existing coarse hr_admin/hr_operations(/payroll for government IDs) rule.
  */
 const ROLE_PERMISSIONS: Readonly<Record<PlatformRole, readonly Permission[]>> = Object.freeze({
-  hr_admin: ["people.read", "people.write", "people.government_ids.read", "people.employee.hire", "settings.view", "settings.manage", "settings.publish", "settings.audit.view"],
-  hr_operations: ["people.read", "people.write", "people.government_ids.read", "people.employee.hire", "settings.view", "settings.manage"],
-  payroll: ["people.government_ids.read", "settings.view"],
-  auditor: ["settings.view", "settings.audit.view"],
+  hr_admin: ["people.read", "people.write", "people.government_ids.read", "people.employee.hire", "settings.view", "settings.manage", "settings.publish", "settings.audit.view", "organization.view", "organization.manage"],
+  hr_operations: ["people.read", "people.write", "people.government_ids.read", "people.employee.hire", "settings.view", "settings.manage", "organization.view"],
+  payroll: ["people.government_ids.read", "settings.view", "organization.view"],
+  auditor: ["settings.view", "settings.audit.view", "organization.view"],
   manager: [],
   employee: [],
 });
 
 export function hasPermission(context: TenantContext, permission: Permission): boolean {
   return context.roles.some((role) => ROLE_PERMISSIONS[role].includes(permission));
+}
+
+/**
+ * The union of permissions granted by a set of roles — the single source of
+ * truth used both here (hasPermission) and by the production/development
+ * identity adapters, so the two can never drift as new permissions are added.
+ */
+export function permissionsForRoles(roles: readonly PlatformRole[]): Permission[] {
+  const permissions = new Set<Permission>();
+  for (const role of roles) for (const permission of ROLE_PERMISSIONS[role]) permissions.add(permission);
+  return [...permissions];
 }

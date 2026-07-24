@@ -45,6 +45,10 @@ const isAuthPlatformCode = (file: SourceFile) => file.path.startsWith("src/platf
 // The Configuration Registry (ADR-011) is a read-side platform capability.
 const isConfigurationRegistry = (file: SourceFile) => file.path.startsWith("src/platform/configuration/registry/");
 const isConfigurationManifest = (file: SourceFile) => file.path === "src/platform/configuration/registry/configuration-manifest.ts";
+// The Organization domain (ADR-012) is a peer domain — never coupled to Configuration.
+const isConfigurationCode = (file: SourceFile) => file.path.startsWith("src/platform/configuration/");
+const isOrganizationCode = (file: SourceFile) => file.path.startsWith("src/platform/organization/");
+const isOrganizationReadRepository = (file: SourceFile) => file.path === "src/platform/organization/prisma-org-unit-read-repository.ts";
 
 const WRITE_RUNTIME_IMPORTS = [
   /^@prisma\/client/,
@@ -93,6 +97,22 @@ const CONFIGURATION_PERSISTENCE_IMPORTS = [
 ];
 
 const WRITE_RUNTIME_MODULE_IMPORTS = [/platform\/people\/commands\//, /platform\/submissions\//, /durable-application-runtime/];
+
+// The Organization write side (ADR-012). The read repository — and any client —
+// must never reach these; writes go only through the OrgUnit service + UnitOfWork.
+const ORGANIZATION_WRITE_SIDE_IMPORTS = [
+  /platform\/organization\/prisma-org-unit-write-repository/,
+  /platform\/organization\/org-unit-write-transaction/,
+  /platform\/organization\/prisma-org-unit-unit-of-work/,
+  /platform\/organization\/in-memory-org-unit-unit-of-work/,
+  /platform\/organization\/org-unit-service/,
+];
+
+// Server-only Organization composition a client component must never import.
+const ORGANIZATION_SERVER_ONLY_IMPORTS = [
+  ...ORGANIZATION_WRITE_SIDE_IMPORTS,
+  /platform\/organization\/prisma-org-unit-read-repository/,
+];
 
 // Anything that lets a caller obtain or construct a TrustedRequestContext —
 // blocking these imports blocks constructing/supplying tenant, roles, or
@@ -184,6 +204,28 @@ export const RULES: Rule[] = [
     name: "configuration-manifest-must-not-import-persistence",
     appliesTo: isConfigurationManifest,
     forbidden: CONFIGURATION_PERSISTENCE_IMPORTS,
+  },
+  {
+    name: "organization-read-repository-must-not-import-write-side",
+    appliesTo: isOrganizationReadRepository,
+    forbidden: ORGANIZATION_WRITE_SIDE_IMPORTS,
+  },
+  {
+    name: "client-components-must-not-import-organization-server-composition",
+    appliesTo: isClientComponent,
+    forbidden: ORGANIZATION_SERVER_ONLY_IMPORTS,
+  },
+  {
+    // ADR-012: Organization and Configuration are peer domains and must not
+    // couple. Configuration never owns hierarchy; Organization never owns policy.
+    name: "configuration-must-not-import-organization",
+    appliesTo: isConfigurationCode,
+    forbidden: [/platform\/organization\//],
+  },
+  {
+    name: "organization-must-not-import-configuration",
+    appliesTo: isOrganizationCode,
+    forbidden: [/platform\/configuration\//],
   },
 ];
 
