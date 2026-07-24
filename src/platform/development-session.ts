@@ -11,7 +11,7 @@ export function getDevelopmentRequestContext(): TrustedRequestContext {
   return createTrustedRequestContext({
     principal: { subjectId: "development-subject-hr-admin", userId: "development-hr-admin", tenantId: "nw-ph", displayName: "Development HR Admin", email: "development.hr@example.invalid", authenticationMethod: "development-adapter", authenticatedAt: "2026-01-01T00:00:00.000Z" },
     roles: ["hr_admin"],
-    permissions: ["people.read", "people.write", "people.government_ids.read", "people.employee.hire"],
+    permissions: ["people.read", "people.write", "people.government_ids.read", "people.employee.hire", "settings.view", "settings.manage", "settings.publish", "settings.audit.view"],
     actorProvenance: "development_adapter",
     correlationId: getRequestCorrelationId(),
   });

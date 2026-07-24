@@ -28,6 +28,22 @@ function derivePermissionsFromRoles(roles: readonly PlatformRole[]): Permission[
     permissions.add("people.employee.hire");
   }
   if (roles.includes("payroll")) permissions.add("people.government_ids.read");
+
+  if (roles.includes("hr_admin")) {
+    permissions.add("settings.view");
+    permissions.add("settings.manage");
+    permissions.add("settings.publish");
+    permissions.add("settings.audit.view");
+  }
+  if (roles.includes("hr_operations")) {
+    permissions.add("settings.view");
+    permissions.add("settings.manage");
+  }
+  if (roles.includes("payroll")) permissions.add("settings.view");
+  if (roles.includes("auditor")) {
+    permissions.add("settings.view");
+    permissions.add("settings.audit.view");
+  }
   return [...permissions];
 }
 

@@ -19,8 +19,65 @@ model Tenant {
   outboxMessages               OutboxMessage[]
   tenantMemberships            TenantMembership[]
   sessions                     Session[]
+  configurationDefinitions     ConfigurationDefinition[]
+  configurationVersions        ConfigurationVersion[]
 
   @@map("tenants")
+}
+
+/// The stable identity of one configurable policy/settings object (Epic 7
+/// Slice 7A). scopeType/scopeReference describe *where* this definition
+/// applies; only TENANT is populated today since no legal-entity/location/
+/// department tables exist yet to attach a real assignment to — the field
+/// exists so the resolver contract doesn't have to change shape later.
+model ConfigurationDefinition {
+  id           String                  @id @default(uuid()) @map("definition_id")
+  tenantId     String                  @map("tenant_id")
+  type         String                  @map("type")
+  code         String                  @map("code")
+  name         String                  @map("name")
+  description  String?                 @map("description")
+  scopeType    String                  @default("TENANT") @map("scope_type")
+  scopeRef     String                  @map("scope_ref")
+  createdAt    DateTime                @default(now()) @map("created_at") @db.Timestamptz(6)
+  createdBy    String                  @map("created_by")
+  updatedAt    DateTime                @updatedAt @map("updated_at") @db.Timestamptz(6)
+  tenant       Tenant                  @relation(fields: [tenantId], references: [id], onDelete: Restrict, onUpdate: Cascade)
+  versions     ConfigurationVersion[]
+
+  @@unique([tenantId, code])
+  @@index([tenantId, type])
+  @@map("configuration_definitions")
+}
+
+/// One version of a configuration's payload. Published versions are
+/// immutable in application code (see ConfigurationUnitOfWork); a
+/// correction always creates a new version rather than mutating this row.
+/// updatedAt doubles as the optimistic-concurrency token for draft edits.
+model ConfigurationVersion {
+  id             String                  @id @default(uuid()) @map("version_id")
+  definitionId   String                  @map("definition_id")
+  tenantId       String                  @map("tenant_id")
+  versionNumber  Int                     @map("version_number")
+  status         String                  @map("status")
+  effectiveFrom  DateTime?               @map("effective_from") @db.Timestamptz(6)
+  effectiveUntil DateTime?               @map("effective_until") @db.Timestamptz(6)
+  payload        Json                    @map("payload")
+  schemaVersion  Int                     @default(1) @map("schema_version")
+  changeReason   String?                 @map("change_reason")
+  createdAt      DateTime                @default(now()) @map("created_at") @db.Timestamptz(6)
+  createdBy      String                  @map("created_by")
+  updatedAt      DateTime                @updatedAt @map("updated_at") @db.Timestamptz(6)
+  publishedAt    DateTime?               @map("published_at") @db.Timestamptz(6)
+  publishedBy    String?                 @map("published_by")
+  retiredAt      DateTime?               @map("retired_at") @db.Timestamptz(6)
+  definition     ConfigurationDefinition @relation(fields: [definitionId], references: [id], onDelete: Restrict, onUpdate: Cascade)
+  tenant         Tenant                  @relation(fields: [tenantId], references: [id], onDelete: Restrict, onUpdate: Cascade)
+
+  @@unique([definitionId, versionNumber])
+  @@index([tenantId, definitionId, status])
+  @@index([tenantId, definitionId, effectiveFrom])
+  @@map("configuration_versions")
 }
 
 /// The platform login identity (Epic 6 Slice 6M0.1). Deliberately separate
