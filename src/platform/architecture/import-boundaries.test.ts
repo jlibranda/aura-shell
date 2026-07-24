@@ -127,6 +127,43 @@ describe("import boundary fitness rules (fixtures prove each rule actually catch
     const file: SourceFile = { path: "src/platform/observability/request-context.ts", content: `import { headers } from "next/headers";\n` };
     expect(scanImportBoundaries([file])).toHaveLength(0);
   });
+
+  it("flags a client component importing the configuration Unit of Work", () => {
+    const file: SourceFile = { path: "src/components/settings/bad-client.tsx", content: `"use client";\nimport { PrismaConfigurationUnitOfWork } from "@/platform/configuration/prisma-configuration-unit-of-work";\n` };
+    const violations = scanImportBoundaries([file]);
+    expect(violations).toContainEqual({ path: file.path, rule: "client-components-must-not-import-write-runtime", matchedImport: "@/platform/configuration/prisma-configuration-unit-of-work" });
+  });
+
+  it("flags a client component importing the durable configuration runtime (bypasses settings.* authorization)", () => {
+    const file: SourceFile = { path: "src/components/settings/bad-runtime.tsx", content: `"use client";\nimport { createDurableConfigurationRuntime } from "@/platform/configuration/durable-configuration-runtime";\n` };
+    const violations = scanImportBoundaries([file]);
+    expect(violations).toContainEqual({ path: file.path, rule: "client-components-must-not-import-configuration-server-composition", matchedImport: "@/platform/configuration/durable-configuration-runtime" });
+  });
+
+  it("flags a client component importing the configuration settings loader directly", () => {
+    const file: SourceFile = { path: "src/components/settings/bad-loader.tsx", content: `"use client";\nimport { loadGeneralSettingsView } from "@/platform/configuration/general-settings-loader";\n` };
+    expect(scanImportBoundaries([file])).toHaveLength(1);
+  });
+
+  it("flags configuration command code importing Prisma directly", () => {
+    const file: SourceFile = { path: "src/platform/configuration/commands/bad-command.ts", content: `import type { Prisma } from "@prisma/client";\n` };
+    expect(scanImportBoundaries([file])).toHaveLength(1);
+  });
+
+  it("flags configuration command code importing Next.js session APIs", () => {
+    const file: SourceFile = { path: "src/platform/configuration/commands/bad-headers.ts", content: `import { headers } from "next/headers";\n` };
+    expect(scanImportBoundaries([file])).toHaveLength(1);
+  });
+
+  it("does not flag the legitimate configuration read repository using Prisma server-side", () => {
+    const file: SourceFile = { path: "src/platform/configuration/prisma-configuration-read-repository.ts", content: `import type { Prisma, PrismaClient } from "@prisma/client";\nimport { hasPermission } from "@/platform/context";\n` };
+    expect(scanImportBoundaries([file])).toHaveLength(0);
+  });
+
+  it("does not flag the legitimate server action composing the durable configuration runtime", () => {
+    const file: SourceFile = { path: "src/app/(app)/settings/general/actions.ts", content: `"use server";\nimport { createDurableConfigurationRuntime } from "@/platform/configuration/durable-configuration-runtime";\nimport { resolveRequestContext } from "@/platform/auth/resolve-request-context";\n` };
+    expect(scanImportBoundaries([file])).toHaveLength(0);
+  });
 });
 
 describe("import boundary fitness rules — real codebase scan", () => {

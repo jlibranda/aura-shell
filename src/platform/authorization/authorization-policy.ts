@@ -29,4 +29,7 @@ export class PermissionAuthorizationPolicy implements AuthorizationPolicy {
 
 export const AURA_COMMAND_PERMISSION_REQUIREMENTS: CommandPermissionRequirements = Object.freeze({
   "people.employee.create": "people.employee.hire",
+  "configuration.general.save_draft": "settings.manage",
+  "configuration.general.discard_draft": "settings.manage",
+  "configuration.general.publish": "settings.publish",
 });

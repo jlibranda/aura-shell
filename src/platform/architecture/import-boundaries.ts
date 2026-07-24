@@ -37,7 +37,9 @@ const isReadRuntime = (file: SourceFile) =>
   file.path.endsWith("prisma-people-read-runtime.ts");
 const isPlatformCode = (file: SourceFile) => file.path.startsWith("src/platform/");
 const isDomainCommand = (file: SourceFile) =>
-  file.path.startsWith("src/platform/people/commands/") || file.path.endsWith("employee-aggregate-root.ts");
+  file.path.startsWith("src/platform/people/commands/") ||
+  file.path.startsWith("src/platform/configuration/commands/") ||
+  file.path.endsWith("employee-aggregate-root.ts");
 const isDevelopmentSessionAdapter = (file: SourceFile) => file.path === "src/platform/development-session.ts";
 const isAuthPlatformCode = (file: SourceFile) => file.path.startsWith("src/platform/auth/");
 
@@ -47,6 +49,21 @@ const WRITE_RUNTIME_IMPORTS = [
   /unit-of-work/i,
   /platform\/people\/persistence\//,
   /platform\/outbox\//,
+  /platform\/configuration\/prisma-configuration-write-repository/,
+  /platform\/configuration\/configuration-write-transaction/,
+  /platform\/configuration\/prisma-configuration-unit-of-work/,
+];
+
+// Server-only configuration composition — the same rationale as
+// TRUSTED_CONTEXT_CONSTRUCTION_IMPORTS below: a client component reaching
+// these directly would bypass the settings.* permission checks that live in
+// the read repositories and command handlers, not in the UI.
+const CONFIGURATION_SERVER_ONLY_IMPORTS = [
+  /platform\/configuration\/durable-configuration-runtime/,
+  /platform\/configuration\/general-settings-loader/,
+  /platform\/configuration\/prisma-configuration-read-repository/,
+  /platform\/configuration\/prisma-configuration-read-runtime/,
+  /platform\/configuration\/prisma-configuration-audit-read-repository/,
 ];
 
 const WRITE_RUNTIME_MODULE_IMPORTS = [/platform\/people\/commands\//, /platform\/submissions\//, /durable-application-runtime/];
@@ -126,6 +143,11 @@ export const RULES: Rule[] = [
     name: "domain-command-must-not-import-session-apis",
     appliesTo: isDomainCommand,
     forbidden: [/^next-auth/, /^@auth\//, /^next\/headers$/, /^next\/navigation$/],
+  },
+  {
+    name: "client-components-must-not-import-configuration-server-composition",
+    appliesTo: isClientComponent,
+    forbidden: CONFIGURATION_SERVER_ONLY_IMPORTS,
   },
 ];
 
