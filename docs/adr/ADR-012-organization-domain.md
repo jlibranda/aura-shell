@@ -1,0 +1,343 @@
+# ADR-012: Organization Domain
+
+| | |
+|---|---|
+| **Status** | Accepted |
+| **Date** | 2026-07-24 |
+| **Foundation for** | Epic 7B (Organization Structure) |
+| **Related** | ADR-011 (Configuration Registry); Epic 7A / 7A.1 (Configuration Foundation + Registry); AURA Engineering Constitution v1.0 (§4 Engineering Principles, §8 Configuration Philosophy, §11 Non-Negotiables) |
+
+This ADR records architectural decisions. It defines no schema, API, UI, code,
+migration, or task. It is the permanent contract every Organization
+implementation must follow. Where it and a lower-level document disagree, this
+document wins — or it is amended, deliberately, with a version bump.
+
+---
+
+## 1. Context
+
+AURA today has no organization structure. The `Employee` record carries
+organization as **denormalized free-text** — a department string, a team
+string, a manager string, a work-location string — with no foreign keys, no
+referential integrity, and no history. The only "organization" code that exists
+is a development-only, in-memory reference projection used to render display
+labels; it is not authoritative structure and is treated here as a placeholder
+to be replaced.
+
+The Configuration platform (7A) shipped one deliberate seam for this moment:
+`ConfigurationDefinition` carries a `scope` that today only ever resolves to the
+tenant, but was designed so configuration could later be scoped to an
+organizational entity without changing the resolver contract. Epic 7B is the
+consumer that seam was built for.
+
+The Phase 1 architecture review for Organization Structure has been completed
+and approved. This ADR converts its enduring decisions into a contract, and —
+per the Constitution's discipline — narrows the review further where a decision
+was not yet earned (notably deferring the Legal Entity aggregate).
+
+## 2. Problem Statement
+
+Organization structure is the backbone every future workforce module depends
+on: Attendance, Payroll, Leave, Approvals, Performance, Assets, Helpdesk, and
+Reporting all need to know *where a person sits*, *who they report to*, and
+*what that structure was at a point in the past*. Modeled wrongly, it forces a
+redesign the first time a real consumer arrives. The specific failure modes to
+avoid:
+
+- **Structure as denormalized strings** (today's state) cannot express
+  referential integrity, cannot be queried structurally (rollups, subtrees),
+  and — fatally — has no history, so a corrected payroll run, a historical leave
+  attribution, or an as-of headcount report is impossible to compute correctly.
+- **Over-modeling** (a table per org-unit type, a general graph, position
+  management, a party super-model) calcifies the schema before any consumer
+  needs the expressiveness, and cannot be walked back cheaply.
+- **Boundary bleed** (organization storing policy, or configuration owning
+  hierarchy, or organization routing approvals) collapses domains that must
+  evolve independently.
+
+## 3. Decision — Organization is a first-class peer domain
+
+**Organization is its own domain, a peer to Configuration and People. It is not
+part of Configuration.**
+
+Configuration models *policy values*: typed, versioned, effective-dated payloads
+that modules read to decide behavior. Organization models *master-data
+entities*: units, locations, and the placement of people, with identity,
+relationships, referential integrity, and per-entity lifecycle. These are
+different in kind:
+
+- Configuration is referenced by *nobody's foreign key*; Organization IDs are
+  foreign keys across the entire system.
+- Configuration has a *value* lifecycle (draft → publish → retire); Organization
+  has an *entity* lifecycle (create → rename → move → close) and a *temporal
+  relationship* lifecycle (assign → transfer → supersede).
+- Forcing organization into configuration's versioned-payload model would
+  reintroduce the single-blob storage ADR-011 §7 explicitly forbids, and would
+  lose the integrity and structural queries organization exists to provide.
+
+The two integrate in one direction only: **Organization supplies the scope that
+Configuration consumes.** Entity-level settings are modeled as *configuration
+scoped to an organizational entity*, never as columns on the entity — preserving
+the master-data / policy split.
+
+## 4. Domain boundaries
+
+| Organization owns | Configuration owns |
+|---|---|
+| Org units and the organizational hierarchy | Policy and settings |
+| Locations | Versioned, effective-dated values |
+| Assignments (person ↔ organization placement over time) | The draft → publish lifecycle of those values |
+| Management/reporting relationships | The Configuration Registry catalog (ADR-011) |
+
+The separation is absolute in both directions and is an invariant (§12):
+**Organization never owns policy; Configuration never owns hierarchy.** A
+question of the form "what is the rule/limit/policy" belongs to Configuration; a
+question of the form "what/where is this entity, and who is placed in it"
+belongs to Organization.
+
+## 5. Core aggregates
+
+Three aggregates, and no more, are adopted now:
+
+- **OrgUnit** — the organizational node. It is **recursive and typed**: a single
+  aggregate whose `kind` distinguishes division, department, team, and so on.
+  There is exactly one OrgUnit aggregate, not one per level or per label.
+- **Location** — a work site, carrying (among other things) a timezone. It is a
+  **dimension orthogonal to the org tree**, not a node within it: a unit may
+  span locations and a location may host many units.
+- **Assignment** — the effective-dated relationship placing a person into the
+  organization (unit, location, manager) over a period of time. Reporting lines
+  and manager relationships are *facets of Assignment*, not separate aggregates.
+
+Everything else named in the review is a value object, an attribute, a
+reference, or a derived view — not an aggregate. Reporting lines are derived
+from Assignment; cost centers and position titles are attributes until a
+consumer earns them.
+
+### Legal Entity is intentionally deferred
+
+The review treated Legal Entity as an aggregate. **This ADR defers it.** There
+is no concrete consumer today: Payroll (which runs per statutory entity) and
+multi-country expansion (which anchors on a legal entity's country) are not
+being built. Introducing Legal Entity now would be speculative structure — the
+same over-modeling this ADR rejects elsewhere (§9). The distinction from
+Location, which *is* adopted: Location has an immediate consumer — it is where
+the person's work-location placement lives once Assignment supersedes the
+denormalized `Employee` strings — whereas Legal Entity has none until Payroll or
+multi-country arrives.
+
+The deferral is safe because its later introduction is **additive, not a
+redesign**: when Payroll or multi-country arrives, Legal Entity enters as a new
+aggregate above OrgUnit (an org unit gains an optional owning-entity reference,
+and the configuration scope gains a legal-entity level in its fall-back chain).
+Until then, the OrgUnit tree roots at the tenant, and configuration scopes to
+tenant, org unit, or location only. The trigger to revisit is explicit: **the
+first Payroll or multi-country slice.**
+
+## 6. Hierarchy decision
+
+**The organizational hierarchy is a strict single-parent tree. Not a DAG. Not a
+general graph.**
+
+A single-parent tree is what a formal organization is, what reporting rollups
+assume, and what makes "everyone under this unit" deterministic and cacheable. A
+multi-parent structure makes rollups ambiguous and headcount double-counted — a
+reporting defect, not a feature.
+
+**Matrix and dotted-line relationships are real and are modeled separately** —
+as additional, typed relationships on Assignment, never as a second parent on
+the tree. There is exactly one authoritative structural hierarchy (the primary
+reporting structure) and any number of non-authoritative relationships beside
+it. This keeps the one rollup that must be deterministic deterministic, while
+still expressing matrix organizations. Location is a second, orthogonal
+dimension — not a node in the org tree.
+
+## 7. Assignment model
+
+**A person's organizational placement belongs to Assignment, not to Employee.**
+The person record holds identity; the organization placement — unit, location,
+manager — is an Assignment, and Assignment is **effective-dated**.
+
+This is a platform invariant, not an implementation preference:
+
+- A transfer, promotion, or manager change **supersedes** the current
+  assignment (end-dates it and creates its successor). The past is never
+  mutated.
+- **Historical placement must always be resolvable.** Any module must be able to
+  ask "where was this person, and who did they report to, as of date D" and get
+  the correct answer.
+- **Future modules resolve assignment as-of a point in time**, never by reading a
+  "current" denormalized field. This is what makes corrected/retroactive
+  Payroll, historical Leave attribution, and as-of Reporting correct.
+
+The existing denormalized organization fields on `Employee` are therefore
+**superseded** by Assignment. They were a bootstrap; they are incompatible with
+temporal correctness, and completing that bootstrap is a decision this ADR
+ratifies (§10, §12).
+
+## 8. Historical model
+
+Organization reuses the platform's existing temporal and integrity primitives —
+**there is no custom temporal engine.**
+
+- **Effective dating** for assignments (supersede-only) and for entity lifecycle
+  transitions (a unit or location opening and closing), reusing the *pattern*
+  established by the Configuration platform (7A) — the pattern, not its tables.
+- **Immutable audit** for every organizational change — create, rename, move,
+  close, assign, transfer, reassign — through the existing append-only,
+  trigger-enforced audit boundary. This is a Constitution non-negotiable.
+- **Transactional events** for changes other modules must react to (a transfer,
+  a unit closure), emitted through the existing transactional outbox, atomically
+  with the write.
+
+Structural entities are mutable in identity and status; their history lives in
+the audit trail, and as-of attribute history (e.g. a historical name) is added
+only where a specific consumer proves it necessary — never as blanket
+bitemporal modeling of every field.
+
+## 9. Integration
+
+Organization is a peer domain that reuses platform primitives and never reaches
+across a boundary it should not.
+
+- **Configuration Registry / Configuration:** Organization is the scope
+  *provider*. The configuration scope gains organizational referents (org unit,
+  location), and the effective-configuration resolver gains the
+  most-specific-scope-wins, fall-back-to-tenant inheritance that ADR-011 §5
+  anticipated. Organization does not import Configuration; Configuration treats
+  organizational IDs as opaque scope references. The Registry's Organization
+  category becomes implemented; the *data* lives in the Organization domain, not
+  in configuration versions.
+- **Authentication:** unchanged. Auth remains the sole source of verified
+  identity and tenant. (Linking a login identity to a person record, required
+  before any "a manager acts on their reports" capability, is a known dependency
+  recorded for the relevant future slice — not a responsibility of the
+  Organization structure itself.)
+- **Permissions:** Organization *enables* scoped authority by making the
+  management chain and subtree computable — it does **not** implement a scoped
+  permission engine. Tenant-wide authorization is unchanged. A general
+  org-scoped RBAC/ABAC engine is deferred until a concrete consumer (Approvals,
+  Leave) provides a rule to enforce (§9 rejections).
+- **Navigation:** administration of organization entities surfaces as a
+  Configuration Registry category (Settings), and read-only consumption (the org
+  chart) surfaces in the People area — both registry/navigation-driven, no
+  hardcoded navigation.
+- **Audit / Outbox / Unit of Work:** reused unchanged. Every organizational
+  write commits entity, audit, and outbox atomically, exactly as existing
+  domains do.
+- **Workflow:** Organization does not route approvals. It exposes the management
+  chain as a query; the future Approvals domain owns routing. Organization
+  provides data, never process.
+
+## 10. Performance philosophy
+
+**Adjacency tree today. Derived read models later. Measure first.**
+
+An adjacency-list org tree plus effective-dated assignments with the right
+indexes serves correctly from small tenants to large ones. Where descendant
+traversal or rollup at the largest scale is *measured* to be too slow, the
+proven remedy is a **derived read model** (a closure table or materialized
+rollup) built over the same write model — introduced only when measured, never
+speculatively. The write model is chosen so such a read model can be added
+without changing it. No graph database, no caching infrastructure, no
+denormalized status persisted ahead of a demonstrated need.
+
+## 11. Rejected alternatives
+
+- **DAG / multi-parent hierarchy** — ambiguous rollups and double-counted
+  headcount. Matrix is modeled as separate typed relationships instead (§6).
+- **Graph database** — Postgres with an adjacency list, and a closure table if
+  ever measured to be necessary, scales organizational trees to millions of
+  nodes. A graph database is infrastructure the problem does not require.
+- **Position / Job catalog** — genuinely useful (vacant-headcount, position-based
+  approvals) but with no current consumer; person-centric assignment covers what
+  People, Payroll, and Leave need. Deferred behind a clean seam (Rule of Three).
+- **Generic Party model** (person/organization polymorphism) — elegant but
+  premature: it adds indirection before a second party type (vendors, applicants)
+  exists to justify it. Revisit only when such types proliferate.
+- **Workflow engine inside Organization** — violates separation of concerns.
+  Organization provides the management chain; Approvals owns routing.
+- **Configuration as Organization (or vice-versa)** — collapses two domains with
+  different data shapes and lifecycles; forbidden in both directions (§4).
+- **Speculative permission engine** — a scoped-authorization subsystem with no
+  concrete rule to enforce is guessing the seam. Deferred until Approvals/Leave
+  provide the rule.
+- **Multiple OrgUnit tables** (one per division/department/team/branch) — companies
+  use these terms inconsistently; per-type tables cannot fit a new customer's
+  structure and force a migration for every structural variation. One recursive,
+  typed OrgUnit instead.
+- **Premature Legal Entity** — no consumer until Payroll or multi-country;
+  adopting it now is speculative structure. Deferred with an explicit trigger and
+  a non-breaking introduction path (§5).
+
+## 12. Architectural invariants
+
+These hold for every Organization implementation, forever, unless this ADR is
+amended:
+
+1. **OrgUnit identifiers are immutable and are never reused.** A unit's identity
+   survives renames and moves; a retired identifier is never reassigned.
+2. **The organizational hierarchy has exactly one authoritative parent per
+   OrgUnit.** Matrix, dotted-line, and acting relationships are non-authoritative
+   and never constitute a second parent.
+3. **At most one *primary* Assignment exists for a person at any instant.**
+   Secondary, acting, and temporary relationships may coexist; the primary is
+   singular and is the record used for rollup, headcount, and pay.
+4. **Historical (superseded) assignments are immutable.** Placement changes
+   create successors; they never edit the past.
+5. **Modules never read a person's organization from a denormalized field**
+   (there is no authoritative `Employee.department`). Modules **resolve
+   Assignment as of a date**.
+6. **Organization never owns policy; Configuration never owns hierarchy.**
+7. **Every Organization entity and query is tenant-scoped**, and tenant identity
+   comes only from the trusted request context — never from the caller.
+8. **Every Organization change is audited immutably and, when other modules must
+   react, emitted through the transactional outbox** — atomically with the write.
+
+## 13. Future compatibility
+
+The test of this ADR's success, mirroring ADR-011's: **a new consuming module is
+new *reads* against Organization's stable identifiers and point-in-time queries —
+never a change to the Organization model.** If a future module forces an
+Organization schema change, the boundary was drawn wrong.
+
+- **Attendance** resolves a person's location (timezone, site) and unit as of a
+  date, and reads unit-scoped shift configuration.
+- **Payroll** resolves each person's placement and cost coding as of payday and
+  reads entity-scoped policy; effective-dated assignments make corrected and
+  retroactive runs correct. (Payroll is also the trigger to introduce the
+  deferred Legal Entity — additively.)
+- **Leave** resolves the management chain for approval and the applicable
+  policy scope; acting managers are acting assignments.
+- **Approvals** walks the management chain from the requester's current
+  assignment.
+- **Performance** rolls up the tree and reads the manager of record from
+  assignments.
+- **Assets, Helpdesk, Cases** tag and route by unit or location, referencing
+  stable Organization IDs.
+- **Reporting** slices and rolls up by unit and location, as of a period —
+  precisely what a single-parent tree plus effective-dated assignments provide.
+
+## 14. Consequences
+
+**Positive.** One authoritative, temporal source of organizational truth;
+correct as-of computation for every downstream module; deterministic rollups; a
+small, defensible aggregate set; clean reuse of audit, outbox, and effective
+dating; and full alignment with the Constitution and ADR-011. The marginal cost
+of a new consuming module is capped at "new reads," not a redesign.
+
+**Negative / trade-offs.** The denormalized organization fields on `Employee`
+must be superseded by Assignment — a real migration with a backfill, and a
+transition period. Effective-dated resolution is more work at every read site
+than reading a current field — mitigated by a single shared point-in-time
+resolver that all consumers use, never per-module temporal logic. Deferring
+Legal Entity means the first Payroll/multi-country slice must introduce it
+before it can proceed — an accepted, explicitly-triggered cost, chosen over
+carrying speculative structure now.
+
+**The decision to reconsider, ratified here.** The `Employee` denormalized
+organization fields are retired in favor of effective-dated Assignment. This is
+not a rewrite; it completes a bootstrap the original slice deliberately left as
+strings, and it is required for temporal correctness. It also validates, rather
+than overturns, the 7A decision to ship a configuration scope seam early — Epic
+7B is exactly the consumer that seam was built for.
