@@ -1,0 +1,1687 @@
+From 1524c99261ed163130671b07cec2b4fa9bdfe398 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Fri, 24 Jul 2026 07:26:03 +0000
+Subject: [PATCH] Epic 7 Slice 7A.1: Configuration Registry (ADR-011)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Implements ADR-011: a thin, read-side registry that is the single source of
+truth for Settings categories, removing the hardcoded category cards from the
+Settings Home.
+
+Layer 1 — static manifest (code, no persistence): one CONFIGURATION_MANIFEST
+describing every category (key, type, title, description, group, order,
+permission, owner, status, route, advisory dependencies/consumers), with
+validateConfigurationManifest() enforcing unique keys/routes/order, valid
+permissions and routes, and dependency hygiene — no graph traversal, cycle
+detection, or dependency enforcement (advisory only).
+
+Layer 2 — per-tenant read model + describe service:
+describeConfigurationCategories(context, reader) joins the manifest to derived
+tenant state, permission-filtered, tenant-scoped, in deterministic display
+order, returning no configuration payloads. Status precedence:
+coming_soon > available > configured/not_configured, with hasDraft and
+hasScheduledChange as additive flags (never hiding the effective state).
+"needs attention" is intentionally not emitted — no truthful read-side source.
+
+Runtime state is read via one batched getConfigurationSummaries() (2 queries
+regardless of category count; dates and booleans only), so Settings Home never
+does per-category querying. No caching, no denormalized status, no new
+persistence.
+
+Settings Home and the card now render entirely from the registry; a pure
+settings-navigation projection exposes the same list for any future sub-nav.
+The global app navigation is intentionally left out of the registry.
+
+Adds import-boundary fitness rules (registry must not import the write side;
+manifest must not import persistence; clients must not import registry server
+composition) with fixtures, plus a structural test that Settings Home has no
+hardcoded category list. Adds ALL_PERMISSIONS/isPermission to context for
+manifest validation.
+
+Tests: +48 (manifest, service status/permission/tenant-isolation/ordering/no-
+payload-leak, navigation projection, card presentation, Home structure).
+Full suite 327 unit + 10 integration green; lint, typecheck, build, and
+architecture-fitness pass; dev + production-mode browser flows verified.
+
+Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_012xkyMKxXWptQtBxJmKLszv
+---
+ docs/architecture/configuration-registry.md   | 114 +++++++++++++
+ src/app/(app)/settings/page.tsx               |  62 ++-----
+ .../settings/settings-category-card.tsx       |  64 ++++----
+ .../settings/settings-category-icons.tsx      |  20 +++
+ .../settings-category-presentation.test.ts    |  48 ++++++
+ .../settings-category-presentation.ts         |  56 +++++++
+ .../architecture/import-boundaries.test.ts    |  25 +++
+ .../architecture/import-boundaries.ts         |  36 +++++
+ .../configuration/configuration-repository.ts |  26 +++
+ .../configuration/general-settings-loader.ts  |  28 +---
+ .../in-memory-configuration-repository.ts     |  31 ++++
+ .../prisma-configuration-read-repository.ts   |  50 +++++-
+ .../registry/configuration-manifest.test.ts   | 120 ++++++++++++++
+ .../registry/configuration-manifest.ts        | 153 ++++++++++++++++++
+ .../configuration-registry-service.test.ts    | 143 ++++++++++++++++
+ .../configuration-registry-service.ts         | 142 ++++++++++++++++
+ .../registry/manifest-validation.ts           |  90 +++++++++++
+ .../registry/settings-home-structure.test.ts  |  33 ++++
+ .../registry/settings-navigation.test.ts      |  48 ++++++
+ .../registry/settings-navigation.ts           |  51 ++++++
+ src/platform/context.ts                       |  17 ++
+ 21 files changed, 1255 insertions(+), 102 deletions(-)
+ create mode 100644 docs/architecture/configuration-registry.md
+ create mode 100644 src/components/settings/settings-category-icons.tsx
+ create mode 100644 src/components/settings/settings-category-presentation.test.ts
+ create mode 100644 src/components/settings/settings-category-presentation.ts
+ create mode 100644 src/platform/configuration/registry/configuration-manifest.test.ts
+ create mode 100644 src/platform/configuration/registry/configuration-manifest.ts
+ create mode 100644 src/platform/configuration/registry/configuration-registry-service.test.ts
+ create mode 100644 src/platform/configuration/registry/configuration-registry-service.ts
+ create mode 100644 src/platform/configuration/registry/manifest-validation.ts
+ create mode 100644 src/platform/configuration/registry/settings-home-structure.test.ts
+ create mode 100644 src/platform/configuration/registry/settings-navigation.test.ts
+ create mode 100644 src/platform/configuration/registry/settings-navigation.ts
+
+diff --git a/docs/architecture/configuration-registry.md b/docs/architecture/configuration-registry.md
+new file mode 100644
+index 0000000..512e2f7
+--- /dev/null
++++ b/docs/architecture/configuration-registry.md
+@@ -0,0 +1,114 @@
++# Configuration Registry — implementation guide (Epic 7A.1)
++
++The Configuration Registry is the single source of truth describing every
++Settings category. It implements ADR-011; this document explains **how to use
++and extend it**. For *why* it is shaped this way — the two-layer decision, the
++non-responsibilities, the alternatives rejected — read
++[ADR-011](../adr/ADR-011-configuration-registry.md). This guide does not repeat
++that reasoning.
++
++## Where things live
++
++| Concern | File |
++|---|---|
++| Layer 1 — static manifest (the category catalog) | `src/platform/configuration/registry/configuration-manifest.ts` |
++| Manifest validation | `src/platform/configuration/registry/manifest-validation.ts` |
++| Layer 2 — describe service + read model | `src/platform/configuration/registry/configuration-registry-service.ts` |
++| Navigation projection (pure) | `src/platform/configuration/registry/settings-navigation.ts` |
++| Batched status read | `getConfigurationSummaries` on `ConfigurationReadRepository` |
++| Settings Home (consumer) | `src/app/(app)/settings/page.tsx` |
++| Card presentation (consumer) | `src/components/settings/settings-category-card.tsx`, `settings-category-presentation.ts` |
++
++## Static vs. derived — the two layers
++
++**Static (Layer 1, `configuration-manifest.ts`):** everything identical across
++tenants — key, title, description, group, order, permission, owner,
++implementation status, route, configurationType, and advisory
++dependencies/consumers. This is code, versioned with the build. It never
++touches the database.
++
++**Derived per tenant (Layer 2, the service):** current status, effective/
++scheduled version dates, and the draft/scheduled flags — computed on demand
++from the existing configuration read side. Never stored, never a new column.
++
++The service `describeConfigurationCategories(context, reader)` joins the two:
++it filters the manifest to the categories the caller may see, fetches their
++runtime state in one batched call, and returns an ordered list of described
++categories.
++
++## How permissions affect visibility
++
++Each manifest entry names the `permission` that gates it. The service excludes
++any category the caller lacks that permission for, using the existing
++`hasPermission`. **This is visibility, not authorization** — the route handlers
++and command pipeline still enforce their own server-side authorization
++independently (ADR-011 §7, ticket §8). Hiding a card is never the control.
++
++## How runtime status is derived (and its precedence)
++
++Primary status, in order:
++
++1. **coming_soon** — the category is not implemented in this build. No query is
++   performed for it.
++2. **available** — implemented but not a versioned configuration category
++   (e.g. the audit trail): usable, nothing to configure.
++3. **configured** — a configuration category with an effective version in force.
++4. **not_configured** — a configuration category with no effective version yet.
++
++`hasDraft` and `hasScheduledChange` are **additive flags**, shown alongside the
++primary status (a scheduled change or in-progress draft never hides the current
++effective state). "Needs attention" is intentionally **not** produced: there is
++no truthful read-side validation source yet, and a fabricated one would violate
++the Constitution's "clear status, never arbitrary" rule.
++
++## Query strategy (performance)
++
++Settings Home issues **no per-category query**. The service collects the visible,
++implemented, versioned category codes and calls `getConfigurationSummaries`
++once — two queries total (definitions, then their versions), regardless of how
++many categories exist. Effective/draft/scheduled are derived in memory with the
++same rules as the single-record read methods, so a summary can never disagree
++with `getEffectiveVersion`. No caching layer, no denormalized status (ADR-011,
++ticket §10).
++
++## Why dependencies and consumers are advisory
++
++The manifest's `dependencies`/`consumers` are human-authored documentation. The
++registry never resolves, orders, or enforces them — the real dependency is
++which code reads which configuration, and a declared list can lag that. Manifest
++validation therefore checks only referential hygiene (dependencies name real
++keys; no self/duplicate entries) and deliberately allows a `consumer` to name a
++future module not yet in the manifest. There is no graph, no cycle detection, no
++topological sort (ADR-011 §7).
++
++## Adding a new Settings category
++
++1. **Add one manifest entry** to `CONFIGURATION_MANIFEST`. Pick a stable `key`,
++   a `group` and unique `order`, the gating `permission`, an `owner`, and the
++   `status`. That is the *only* change the Settings surface needs — Home and
++   navigation pick it up automatically.
++2. If it is a **coming-soon** category, stop here: no route, no configuration
++   type. It renders as a labeled, non-interactive card.
++3. If it is an **implemented configuration category**, additionally: build its
++   typed payload + validator (mirror `general-company-settings.ts`), its
++   commands/handlers, and its routes (mirror `/settings/general/*`); set
++   `status: "implemented"`, its `route`, and its `configurationType`; and add
++   the type→code entry to `CONFIGURATION_TYPE_TO_CODE` (and the resolver's
++   `CONFIGURATION_TYPE_CODES`). The registry then derives its status with no
++   further change to the service.
++4. Add an icon for the key in `settings-category-icons.tsx` (presentation only).
++5. Run the manifest validation test — it will fail loudly on a duplicate key,
++   duplicate route, duplicate order-within-group, missing route, invalid
++   permission, or bad dependency reference.
++
++## What the registry intentionally does NOT do
++
++It never writes configuration, publishes, authorizes commands, audits, emits
++outbox messages, computes a business outcome, stores anything, or acts as a
++dependency/graph/workflow/simulation engine. It is a read-only catalog and a
++per-tenant projection. Enforcing these boundaries: the import-boundary fitness
++rules `configuration-registry-must-not-import-write-side`,
++`configuration-manifest-must-not-import-persistence`, and
++`client-components-must-not-import-configuration-server-composition`, plus the
++structural test that Settings Home renders from the registry rather than a
++hardcoded list.
+diff --git a/src/app/(app)/settings/page.tsx b/src/app/(app)/settings/page.tsx
+index e1e29b2..9b08d46 100644
+--- a/src/app/(app)/settings/page.tsx
++++ b/src/app/(app)/settings/page.tsx
+@@ -1,14 +1,15 @@
+ import type { Metadata } from "next";
+-import { Building2, ClipboardList, Landmark, ShieldCheck, Sliders, Wallet } from "lucide-react";
+-import { SettingsCategoryCard, type SettingsCategoryCardStatus } from "@/components/settings/settings-category-card";
++import { EmptyState } from "@/components/ui/primitives";
++import { Settings2 } from "lucide-react";
++import { SettingsCategoryCard } from "@/components/settings/settings-category-card";
++import { iconForCategory } from "@/components/settings/settings-category-icons";
+ import { loadSettingsHome } from "@/platform/configuration/general-settings-loader";
+ 
+ export const metadata: Metadata = { title: "Settings" };
+ export const dynamic = "force-dynamic";
+ 
+ export default async function SettingsPage() {
+-  const { general, auditVisible } = await loadSettingsHome();
+-  const generalStatus: SettingsCategoryCardStatus = general.visible ? general.status : "coming_soon";
++  const { categories } = await loadSettingsHome();
+ 
+   return (
+     <div className="mx-auto max-w-5xl">
+@@ -19,48 +20,19 @@ export default async function SettingsPage() {
+         </p>
+       </div>
+ 
+-      <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
+-        <SettingsCategoryCard
+-          icon={Sliders}
+-          title="General"
+-          description="Company name, time zone, locale, currency, and the working-week defaults other policies build on."
+-          status={generalStatus}
+-          href={general.visible ? "/settings/general" : undefined}
++      {categories.length === 0 ? (
++        <EmptyState
++          icon={Settings2}
++          title="No settings available"
++          description="You don't have access to any settings categories. Ask an administrator if you believe this is a mistake."
+         />
+-        <SettingsCategoryCard
+-          icon={Building2}
+-          title="Organization"
+-          description="Legal entities, departments, and reporting structure."
+-          status="coming_soon"
+-        />
+-        <SettingsCategoryCard
+-          icon={ShieldCheck}
+-          title="Access Control"
+-          description="Roles, permissions, and who can see or change what."
+-          status="coming_soon"
+-        />
+-        <SettingsCategoryCard
+-          icon={ClipboardList}
+-          title="Timekeeping"
+-          description="Shift rules, attendance, and time-off policies. Full policy catalog arrives in a later slice."
+-          status="coming_soon"
+-        />
+-        <SettingsCategoryCard
+-          icon={Wallet}
+-          title="Payroll"
+-          description="Pay schedules, statutory rules, and compensation policies. Full policy catalog arrives in a later slice."
+-          status="coming_soon"
+-        />
+-        {auditVisible ? (
+-          <SettingsCategoryCard
+-            icon={Landmark}
+-            title="Audit and Diagnostics"
+-            description="Who changed what, and when — across every settings category."
+-            status="available"
+-            href="/settings/audit"
+-          />
+-        ) : null}
+-      </div>
++      ) : (
++        <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
++          {categories.map((category) => (
++            <SettingsCategoryCard key={category.key} category={category} icon={iconForCategory(category.key)} />
++          ))}
++        </div>
++      )}
+     </div>
+   );
+ }
+diff --git a/src/components/settings/settings-category-card.tsx b/src/components/settings/settings-category-card.tsx
+index a17f514..9b4bb85 100644
+--- a/src/components/settings/settings-category-card.tsx
++++ b/src/components/settings/settings-category-card.tsx
+@@ -1,57 +1,55 @@
+ import Link from "next/link";
+ import type { LucideIcon } from "lucide-react";
+ import { Badge, Card } from "@/components/ui/primitives";
++import type { DescribedConfigurationCategory } from "@/platform/configuration/registry/configuration-registry-service";
++import { presentSettingsCategory } from "@/components/settings/settings-category-presentation";
+ 
+-export type SettingsCategoryCardStatus = "not_configured" | "draft_in_progress" | "configured" | "coming_soon" | "available";
+-
+-const STATUS_LABEL: Record<SettingsCategoryCardStatus, string> = {
+-  not_configured: "Not set up yet",
+-  draft_in_progress: "Draft in progress",
+-  configured: "Configured",
+-  coming_soon: "Coming soon",
+-  available: "Available",
+-};
+-
+-const STATUS_TONE: Record<SettingsCategoryCardStatus, "neutral" | "warning" | "success"> = {
+-  not_configured: "neutral",
+-  draft_in_progress: "warning",
+-  configured: "success",
+-  coming_soon: "neutral",
+-  available: "success",
+-};
+-
++/**
++ * Presentational card for one described category. It renders registry-provided
++ * data only — it holds no category identity, status, or list of its own.
++ */
+ export function SettingsCategoryCard({
++  category,
+   icon: Icon,
+-  title,
+-  description,
+-  status,
+-  href,
+ }: {
++  category: DescribedConfigurationCategory;
+   icon: LucideIcon;
+-  title: string;
+-  description: string;
+-  status: SettingsCategoryCardStatus;
+-  /** Omit for categories not yet functional — the card renders as a non-interactive placeholder. */
+-  href?: string;
+ }) {
++  const { statusLabel, statusTone, annotations, href, interactive, accessibleStatus } = presentSettingsCategory(category);
++
+   const body = (
+-    <Card className={href ? "flex h-full flex-col gap-3 p-5 transition-shadow hover:shadow-sm" : "flex h-full flex-col gap-3 p-5 opacity-80"}>
++    <Card className={interactive ? "flex h-full flex-col gap-3 p-5 transition-shadow hover:shadow-sm" : "flex h-full flex-col gap-3 p-5 opacity-80"}>
+       <div className="flex items-start justify-between gap-3">
+         <span className="flex h-9 w-9 items-center justify-center rounded-lg bg-primary/10 text-primary">
+           <Icon className="h-4 w-4" aria-hidden />
+         </span>
+-        <Badge tone={STATUS_TONE[status]}>{STATUS_LABEL[status]}</Badge>
++        <Badge tone={statusTone}>{statusLabel}</Badge>
+       </div>
+       <div>
+-        <h2 className="text-sm font-semibold text-foreground">{title}</h2>
+-        <p className="mt-1 text-sm text-muted-foreground">{description}</p>
++        <h2 className="text-sm font-semibold text-foreground">{category.title}</h2>
++        <p className="mt-1 text-sm text-muted-foreground">{category.description}</p>
++        {annotations.length > 0 ? (
++          <ul className="mt-2 space-y-0.5">
++            {annotations.map((note) => (
++              <li key={note} className="text-xs text-muted-foreground">
++                {note}
++              </li>
++            ))}
++          </ul>
++        ) : null}
+       </div>
+     </Card>
+   );
+ 
+-  if (!href) return <div aria-disabled="true">{body}</div>;
++  if (!href) {
++    return (
++      <div aria-disabled="true" aria-label={`${category.title}: ${accessibleStatus}`}>
++        {body}
++      </div>
++    );
++  }
+   return (
+-    <Link href={href} className="block rounded-xl focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary" aria-label={`${title}: ${STATUS_LABEL[status]}`}>
++    <Link href={href} className="block rounded-xl focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary" aria-label={`${category.title}: ${accessibleStatus}`}>
+       {body}
+     </Link>
+   );
+diff --git a/src/components/settings/settings-category-icons.tsx b/src/components/settings/settings-category-icons.tsx
+new file mode 100644
+index 0000000..7b7288a
+--- /dev/null
++++ b/src/components/settings/settings-category-icons.tsx
+@@ -0,0 +1,20 @@
++import { Building2, ClipboardList, Landmark, Settings2, ShieldCheck, Sliders, Wallet, type LucideIcon } from "lucide-react";
++
++/**
++ * Presentation-only mapping from a category key to its icon. This holds NO
++ * category identity, status, ordering, or copy — those live solely in the
++ * registry manifest. It exists only because an icon is a visual choice, not
++ * platform metadata. A key with no entry falls back to a neutral icon.
++ */
++const ICONS: Readonly<Record<string, LucideIcon>> = Object.freeze({
++  general: Sliders,
++  organization: Building2,
++  access_control: ShieldCheck,
++  timekeeping: ClipboardList,
++  payroll: Wallet,
++  audit: Landmark,
++});
++
++export function iconForCategory(key: string): LucideIcon {
++  return ICONS[key] ?? Settings2;
++}
+diff --git a/src/components/settings/settings-category-presentation.test.ts b/src/components/settings/settings-category-presentation.test.ts
+new file mode 100644
+index 0000000..05ae0fc
+--- /dev/null
++++ b/src/components/settings/settings-category-presentation.test.ts
+@@ -0,0 +1,48 @@
++import { describe, expect, it } from "vitest";
++import { presentSettingsCategory } from "@/components/settings/settings-category-presentation";
++import type { DescribedConfigurationCategory } from "@/platform/configuration/registry/configuration-registry-service";
++
++function described(overrides: Partial<DescribedConfigurationCategory>): DescribedConfigurationCategory {
++  return Object.freeze({
++    key: "general", title: "General", description: "d", group: "company", order: 10, owner: "P",
++    implemented: true, route: "/settings/general", status: "not_configured", hasDraft: false, hasScheduledChange: false,
++    dependencies: [], consumers: [], ...overrides,
++  });
++}
++
++describe("presentSettingsCategory", () => {
++  it("links an implemented category to its route", () => {
++    const p = presentSettingsCategory(described({ status: "configured" }));
++    expect(p.interactive).toBe(true);
++    expect(p.href).toBe("/settings/general");
++    expect(p.statusLabel).toBe("Configured");
++  });
++
++  it("renders a coming-soon category as non-interactive with no href", () => {
++    const p = presentSettingsCategory(described({ key: "organization", implemented: false, route: undefined, status: "coming_soon" }));
++    expect(p.interactive).toBe(false);
++    expect(p.href).toBeUndefined();
++    expect(p.statusLabel).toBe("Coming soon");
++  });
++
++  it("shows the not-set-up label for an implemented but unconfigured category", () => {
++    expect(presentSettingsCategory(described({ status: "not_configured" })).statusLabel).toBe("Not set up yet");
++  });
++
++  it("surfaces a draft as an additive annotation without changing the primary status", () => {
++    const p = presentSettingsCategory(described({ status: "configured", hasDraft: true }));
++    expect(p.statusLabel).toBe("Configured");
++    expect(p.annotations).toContain("Unpublished draft in progress");
++  });
++
++  it("surfaces a scheduled change with its date as an annotation", () => {
++    const p = presentSettingsCategory(described({ status: "configured", hasScheduledChange: true, scheduledFor: "2999-09-01T00:00:00.000Z" }));
++    expect(p.annotations.some((a) => a.startsWith("Change scheduled for"))).toBe(true);
++  });
++
++  it("builds an accessible status that includes annotations (status is not color-only)", () => {
++    const p = presentSettingsCategory(described({ status: "configured", hasDraft: true }));
++    expect(p.accessibleStatus).toContain("Configured");
++    expect(p.accessibleStatus).toContain("Unpublished draft in progress");
++  });
++});
+diff --git a/src/components/settings/settings-category-presentation.ts b/src/components/settings/settings-category-presentation.ts
+new file mode 100644
+index 0000000..b565ee7
+--- /dev/null
++++ b/src/components/settings/settings-category-presentation.ts
+@@ -0,0 +1,56 @@
++import type {
++  ConfigurationCategoryStatus,
++  DescribedConfigurationCategory,
++} from "@/platform/configuration/registry/configuration-registry-service";
++
++const STATUS_LABEL: Record<ConfigurationCategoryStatus, string> = {
++  coming_soon: "Coming soon",
++  available: "Available",
++  not_configured: "Not set up yet",
++  configured: "Configured",
++};
++
++const STATUS_TONE: Record<ConfigurationCategoryStatus, "neutral" | "warning" | "success"> = {
++  coming_soon: "neutral",
++  available: "success",
++  not_configured: "neutral",
++  configured: "success",
++};
++
++export interface SettingsCategoryPresentation {
++  statusLabel: string;
++  statusTone: "neutral" | "warning" | "success";
++  /** Additive notes shown alongside the primary status (draft, scheduled change). */
++  annotations: string[];
++  /** The link target, present only when the category is an implemented, reachable destination. */
++  href?: string;
++  /** Whether the card is an interactive link. */
++  interactive: boolean;
++  /** A single spoken status string for the accessible name. */
++  accessibleStatus: string;
++}
++
++function formatDate(iso: string): string {
++  return new Date(iso).toLocaleDateString(undefined, { year: "numeric", month: "long", day: "numeric" });
++}
++
++/**
++ * Pure presentation mapping for one described category. Extracted from the card
++ * so status/label/annotation logic is unit-testable without a DOM renderer.
++ * Holds no category identity of its own — everything derives from the input.
++ */
++export function presentSettingsCategory(category: DescribedConfigurationCategory): SettingsCategoryPresentation {
++  const annotations: string[] = [];
++  if (category.hasScheduledChange && category.scheduledFor) annotations.push(`Change scheduled for ${formatDate(category.scheduledFor)}`);
++  if (category.hasDraft) annotations.push("Unpublished draft in progress");
++
++  const href = category.implemented ? category.route : undefined;
++  return {
++    statusLabel: STATUS_LABEL[category.status],
++    statusTone: STATUS_TONE[category.status],
++    annotations,
++    ...(href ? { href } : {}),
++    interactive: Boolean(href),
++    accessibleStatus: [STATUS_LABEL[category.status], ...annotations].join(". "),
++  };
++}
+diff --git a/src/platform/architecture/import-boundaries.test.ts b/src/platform/architecture/import-boundaries.test.ts
+index 45c2154..7c76195 100644
+--- a/src/platform/architecture/import-boundaries.test.ts
++++ b/src/platform/architecture/import-boundaries.test.ts
+@@ -164,6 +164,31 @@ describe("import boundary fitness rules (fixtures prove each rule actually catch
+     const file: SourceFile = { path: "src/app/(app)/settings/general/actions.ts", content: `"use server";\nimport { createDurableConfigurationRuntime } from "@/platform/configuration/durable-configuration-runtime";\nimport { resolveRequestContext } from "@/platform/auth/resolve-request-context";\n` };
+     expect(scanImportBoundaries([file])).toHaveLength(0);
+   });
++
++  it("flags a client component importing the configuration registry service (ADR-011 server composition)", () => {
++    const file: SourceFile = { path: "src/components/settings/bad-registry-client.tsx", content: `"use client";\nimport { describeConfigurationCategories } from "@/platform/configuration/registry/configuration-registry-service";\n` };
++    const violations = scanImportBoundaries([file]);
++    expect(violations).toContainEqual({ path: file.path, rule: "client-components-must-not-import-configuration-server-composition", matchedImport: "@/platform/configuration/registry/configuration-registry-service" });
++  });
++
++  it("flags the registry importing the configuration write side (registry must stay read-only)", () => {
++    const uow: SourceFile = { path: "src/platform/configuration/registry/bad-registry.ts", content: `import { PrismaConfigurationUnitOfWork } from "@/platform/configuration/prisma-configuration-unit-of-work";\n` };
++    const command: SourceFile = { path: "src/platform/configuration/registry/bad-registry-2.ts", content: `import { SaveGeneralSettingsDraftHandler } from "@/platform/configuration/commands/general-settings-durable-handlers";\n` };
++    expect(scanImportBoundaries([uow])).toContainEqual({ path: uow.path, rule: "configuration-registry-must-not-import-write-side", matchedImport: "@/platform/configuration/prisma-configuration-unit-of-work" });
++    expect(scanImportBoundaries([command])).toContainEqual({ path: command.path, rule: "configuration-registry-must-not-import-write-side", matchedImport: "@/platform/configuration/commands/general-settings-durable-handlers" });
++  });
++
++  it("flags the static manifest importing persistence (manifest must be pure data)", () => {
++    const prismaImport: SourceFile = { path: "src/platform/configuration/registry/configuration-manifest.ts", content: `import type { PrismaClient } from "@prisma/client";\n` };
++    const readerImport: SourceFile = { path: "src/platform/configuration/registry/configuration-manifest.ts", content: `import type { ConfigurationReadRepository } from "@/platform/configuration/configuration-repository";\n` };
++    expect(scanImportBoundaries([prismaImport])).toContainEqual({ path: prismaImport.path, rule: "configuration-manifest-must-not-import-persistence", matchedImport: "@prisma/client" });
++    expect(scanImportBoundaries([readerImport])).toContainEqual({ path: readerImport.path, rule: "configuration-manifest-must-not-import-persistence", matchedImport: "@/platform/configuration/configuration-repository" });
++  });
++
++  it("does not flag the legitimate registry service reading through the read-repository port and permissions", () => {
++    const file: SourceFile = { path: "src/platform/configuration/registry/configuration-registry-service.ts", content: `import { hasPermission } from "@/platform/context";\nimport type { ConfigurationReadRepository } from "@/platform/configuration/configuration-repository";\nimport { CONFIGURATION_MANIFEST } from "@/platform/configuration/registry/configuration-manifest";\n` };
++    expect(scanImportBoundaries([file])).toHaveLength(0);
++  });
+ });
+ 
+ describe("import boundary fitness rules — real codebase scan", () => {
+diff --git a/src/platform/architecture/import-boundaries.ts b/src/platform/architecture/import-boundaries.ts
+index cb23987..1a13905 100644
+--- a/src/platform/architecture/import-boundaries.ts
++++ b/src/platform/architecture/import-boundaries.ts
+@@ -42,6 +42,9 @@ const isDomainCommand = (file: SourceFile) =>
+   file.path.endsWith("employee-aggregate-root.ts");
+ const isDevelopmentSessionAdapter = (file: SourceFile) => file.path === "src/platform/development-session.ts";
+ const isAuthPlatformCode = (file: SourceFile) => file.path.startsWith("src/platform/auth/");
++// The Configuration Registry (ADR-011) is a read-side platform capability.
++const isConfigurationRegistry = (file: SourceFile) => file.path.startsWith("src/platform/configuration/registry/");
++const isConfigurationManifest = (file: SourceFile) => file.path === "src/platform/configuration/registry/configuration-manifest.ts";
+ 
+ const WRITE_RUNTIME_IMPORTS = [
+   /^@prisma\/client/,
+@@ -64,6 +67,29 @@ const CONFIGURATION_SERVER_ONLY_IMPORTS = [
+   /platform\/configuration\/prisma-configuration-read-repository/,
+   /platform\/configuration\/prisma-configuration-read-runtime/,
+   /platform\/configuration\/prisma-configuration-audit-read-repository/,
++  /platform\/configuration\/registry\/configuration-registry-service/,
++];
++
++// The registry is read-only (ADR-011 §7). It must never reach the write side.
++const CONFIGURATION_WRITE_SIDE_IMPORTS = [
++  /platform\/configuration\/commands\//,
++  /platform\/configuration\/prisma-configuration-write-repository/,
++  /platform\/configuration\/configuration-write-transaction/,
++  /platform\/configuration\/prisma-configuration-unit-of-work/,
++  /platform\/configuration\/in-memory-configuration-unit-of-work/,
++  /platform\/configuration\/durable-configuration-runtime/,
++  /unit-of-work/i,
++  /platform\/outbox\//,
++];
++
++// The static manifest (ADR-011 Layer 1) is pure data — it must not depend on
++// tenant persistence, Prisma, or any read/write runtime.
++const CONFIGURATION_PERSISTENCE_IMPORTS = [
++  /^@prisma\/client/,
++  /platform\/persistence\/prisma-client/,
++  /platform\/configuration\/prisma-configuration-/,
++  /platform\/configuration\/in-memory-configuration-/,
++  /platform\/configuration\/configuration-repository/,
+ ];
+ 
+ const WRITE_RUNTIME_MODULE_IMPORTS = [/platform\/people\/commands\//, /platform\/submissions\//, /durable-application-runtime/];
+@@ -149,6 +175,16 @@ export const RULES: Rule[] = [
+     appliesTo: isClientComponent,
+     forbidden: CONFIGURATION_SERVER_ONLY_IMPORTS,
+   },
++  {
++    name: "configuration-registry-must-not-import-write-side",
++    appliesTo: isConfigurationRegistry,
++    forbidden: CONFIGURATION_WRITE_SIDE_IMPORTS,
++  },
++  {
++    name: "configuration-manifest-must-not-import-persistence",
++    appliesTo: isConfigurationManifest,
++    forbidden: CONFIGURATION_PERSISTENCE_IMPORTS,
++  },
+ ];
+ 
+ /** Pure scan: given source files, returns every boundary violation found. Deterministic, no filesystem access. */
+diff --git a/src/platform/configuration/configuration-repository.ts b/src/platform/configuration/configuration-repository.ts
+index 643cdc1..9411e8a 100644
+--- a/src/platform/configuration/configuration-repository.ts
++++ b/src/platform/configuration/configuration-repository.ts
+@@ -56,6 +56,26 @@ export interface ConfigurationWriteRepository {
+ /** Transaction-scoped repositories exposed to configuration command handlers via UnitOfWork.execute(). */
+ export type ConfigurationTransactionRepositories = Readonly<{ configuration: ConfigurationWriteRepository }>;
+ 
++/**
++ * A safe, minimal per-category status summary — dates and booleans only, never
++ * a configuration payload. Used by the Configuration Registry (ADR-011 Layer 2)
++ * to describe many categories without a per-category query.
++ */
++export interface ConfigurationCategorySummary {
++  /** The definition code this summary is for. */
++  code: string;
++  /** The tenant's definition id for this code, if one exists yet. */
++  definitionId?: string;
++  /** True when an effective published version is in force as of the queried instant. */
++  configured: boolean;
++  /** The in-force version's effectiveFrom, when configured. */
++  effectiveFrom?: string;
++  /** True when an editable draft exists. */
++  hasDraft: boolean;
++  /** The next future-dated published version's effectiveFrom, when one is scheduled. */
++  scheduledFrom?: string;
++}
++
+ /** Server-only port. Read-only, tenant-scoped, used outside any write transaction. */
+ export interface ConfigurationReadRepository {
+   findDefinitionByCode(context: TenantContext, code: string): Promise<ConfigurationDefinitionRecord | undefined>;
+@@ -64,4 +84,10 @@ export interface ConfigurationReadRepository {
+   getDraftVersion(context: TenantContext, definitionId: string): Promise<ConfigurationVersionRecord | undefined>;
+   getEffectiveVersion(context: TenantContext, definitionId: string, asOf: Date): Promise<ConfigurationVersionRecord | undefined>;
+   getNextScheduledVersion(context: TenantContext, definitionId: string, asOf: Date): Promise<ConfigurationVersionRecord | undefined>;
++  /**
++   * Batched status summary for many categories at once, in a bounded number of
++   * queries (never one-per-category). Returns an entry for every requested
++   * code; codes with no definition come back configured:false, hasDraft:false.
++   */
++  getConfigurationSummaries(context: TenantContext, codes: readonly string[], asOf: Date): Promise<ReadonlyMap<string, ConfigurationCategorySummary>>;
+ }
+diff --git a/src/platform/configuration/general-settings-loader.ts b/src/platform/configuration/general-settings-loader.ts
+index 4fe5244..c5b2771 100644
+--- a/src/platform/configuration/general-settings-loader.ts
++++ b/src/platform/configuration/general-settings-loader.ts
+@@ -3,15 +3,14 @@ import { AuthorizationError } from "@/platform/errors";
+ import { resolveRequestContext } from "@/platform/auth/resolve-request-context";
+ import { createPrismaConfigurationReadRuntime } from "@/platform/configuration/prisma-configuration-read-runtime";
+ import { GENERAL_COMPANY_SETTINGS_CODE } from "@/platform/configuration/general-company-settings";
++import { describeConfigurationCategories, type DescribedConfigurationCategory } from "@/platform/configuration/registry/configuration-registry-service";
+ import type { ConfigurationDefinitionRecord, ConfigurationVersionRecord } from "@/platform/configuration/configuration-version";
+ import type { AuditRecord } from "@/platform/auditing/audit-record";
+ 
+-export type SettingsCategoryStatus = "not_configured" | "draft_in_progress" | "configured";
+-
++/** The registry-driven Settings Home model: the categories the caller may see, described. */
+ export interface SettingsHomeViewModel {
+   context: TenantContext;
+-  general: { status: SettingsCategoryStatus; visible: boolean };
+-  auditVisible: boolean;
++  categories: readonly DescribedConfigurationCategory[];
+ }
+ 
+ export type GeneralSettingsViewResult =
+@@ -39,25 +38,8 @@ export async function loadSettingsHome(): Promise<SettingsHomeViewModel> {
+   const request = await resolveRequestContext();
+   const runtime = createPrismaConfigurationReadRuntime(request);
+   const { context } = runtime;
+-
+-  let status: SettingsCategoryStatus = "not_configured";
+-  if (hasPermission(context, "settings.view")) {
+-    const definition = await runtime.reader.findDefinitionByCode(context, GENERAL_COMPANY_SETTINGS_CODE);
+-    if (definition) {
+-      const [effective, draft] = await Promise.all([
+-        runtime.reader.getEffectiveVersion(context, definition.id, new Date()),
+-        runtime.reader.getDraftVersion(context, definition.id),
+-      ]);
+-      if (effective) status = "configured";
+-      else if (draft) status = "draft_in_progress";
+-    }
+-  }
+-
+-  return Object.freeze({
+-    context,
+-    general: { status, visible: hasPermission(context, "settings.view") },
+-    auditVisible: hasPermission(context, "settings.audit.view"),
+-  });
++  const categories = await describeConfigurationCategories(context, runtime.reader);
++  return Object.freeze({ context, categories });
+ }
+ 
+ export async function loadGeneralSettingsView(): Promise<GeneralSettingsViewResult> {
+diff --git a/src/platform/configuration/in-memory-configuration-repository.ts b/src/platform/configuration/in-memory-configuration-repository.ts
+index 87cb2af..b7271ca 100644
+--- a/src/platform/configuration/in-memory-configuration-repository.ts
++++ b/src/platform/configuration/in-memory-configuration-repository.ts
+@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
+ import { hasPermission, type TenantContext } from "@/platform/context";
+ import { AuthorizationError } from "@/platform/errors";
+ import type {
++  ConfigurationCategorySummary,
+   ConfigurationReadRepository,
+   ConfigurationWriteRepository,
+   CreateDefinitionInput,
+@@ -165,4 +166,34 @@ export class InMemoryConfigurationReadRepository implements ConfigurationReadRep
+     candidates.sort((a, b) => new Date(a.effectiveFrom!).getTime() - new Date(b.effectiveFrom!).getTime());
+     return candidates[0];
+   }
++
++  async getConfigurationSummaries(context: TenantContext, codes: readonly string[], asOf: Date): Promise<ReadonlyMap<string, ConfigurationCategorySummary>> {
++    requireSettingsView(context);
++    const asOfMs = asOf.getTime();
++    const result = new Map<string, ConfigurationCategorySummary>();
++    for (const code of codes) {
++      const definition = this.store.definitions.find((d) => d.tenantId === context.tenantId && d.code === code);
++      if (!definition) {
++        result.set(code, Object.freeze({ code, configured: false, hasDraft: false }));
++        continue;
++      }
++      const own = this.store.versions.filter((v) => v.tenantId === context.tenantId && v.definitionId === definition.id);
++      const hasDraft = own.some((v) => v.status === "DRAFT");
++      const effective = own
++        .filter((v) => v.status === "PUBLISHED" && v.effectiveFrom && new Date(v.effectiveFrom).getTime() <= asOfMs && (!v.effectiveUntil || new Date(v.effectiveUntil).getTime() > asOfMs))
++        .sort((a, b) => new Date(b.effectiveFrom!).getTime() - new Date(a.effectiveFrom!).getTime())[0];
++      const scheduled = own
++        .filter((v) => v.status === "PUBLISHED" && v.effectiveFrom && new Date(v.effectiveFrom).getTime() > asOfMs)
++        .sort((a, b) => new Date(a.effectiveFrom!).getTime() - new Date(b.effectiveFrom!).getTime())[0];
++      result.set(code, Object.freeze({
++        code,
++        definitionId: definition.id,
++        configured: Boolean(effective),
++        ...(effective?.effectiveFrom ? { effectiveFrom: effective.effectiveFrom } : {}),
++        hasDraft,
++        ...(scheduled?.effectiveFrom ? { scheduledFrom: scheduled.effectiveFrom } : {}),
++      }));
++    }
++    return result;
++  }
+ }
+diff --git a/src/platform/configuration/prisma-configuration-read-repository.ts b/src/platform/configuration/prisma-configuration-read-repository.ts
+index 0bf0a4e..7a44e00 100644
+--- a/src/platform/configuration/prisma-configuration-read-repository.ts
++++ b/src/platform/configuration/prisma-configuration-read-repository.ts
+@@ -1,7 +1,7 @@
+ import type { Prisma, PrismaClient } from "@prisma/client";
+ import { hasPermission, type TenantContext } from "@/platform/context";
+ import { AuthorizationError } from "@/platform/errors";
+-import type { ConfigurationReadRepository } from "@/platform/configuration/configuration-repository";
++import type { ConfigurationCategorySummary, ConfigurationReadRepository } from "@/platform/configuration/configuration-repository";
+ import type { ConfigurationDefinitionRecord, ConfigurationVersionRecord, ConfigurationVersionStatus } from "@/platform/configuration/configuration-version";
+ 
+ export type PrismaConfigurationReadClient = Pick<PrismaClient, "configurationDefinition" | "configurationVersion">;
+@@ -91,4 +91,52 @@ export class PrismaConfigurationReadRepository implements ConfigurationReadRepos
+     });
+     return version ? toVersion(version) : undefined;
+   }
++
++  /**
++   * Two queries total regardless of category count: one for the definitions,
++   * one for their versions. Effective/draft/scheduled are derived in memory
++   * with the same rules as the single-record methods above — so a category's
++   * summary can never disagree with getEffectiveVersion et al. Only dates and
++   * booleans are read (select-projected); no payload is ever fetched.
++   */
++  async getConfigurationSummaries(context: TenantContext, codes: readonly string[], asOf: Date): Promise<ReadonlyMap<string, ConfigurationCategorySummary>> {
++    requireSettingsView(context);
++    const result = new Map<string, ConfigurationCategorySummary>();
++    for (const code of codes) result.set(code, Object.freeze({ code, configured: false, hasDraft: false }));
++    if (codes.length === 0) return result;
++
++    const definitions = await this.prisma.configurationDefinition.findMany({
++      where: { tenantId: context.tenantId, code: { in: [...codes] } },
++      select: { id: true, code: true },
++    });
++    if (definitions.length === 0) return result;
++
++    const idToCode = new Map(definitions.map((d) => [d.id, d.code]));
++    const versions = await this.prisma.configurationVersion.findMany({
++      where: { tenantId: context.tenantId, definitionId: { in: definitions.map((d) => d.id) } },
++      select: { definitionId: true, status: true, effectiveFrom: true, effectiveUntil: true },
++    });
++
++    const asOfMs = asOf.getTime();
++    for (const definition of definitions) {
++      const own = versions.filter((v) => v.definitionId === definition.id);
++      const hasDraft = own.some((v) => v.status === "DRAFT");
++      const effective = own
++        .filter((v) => v.status === "PUBLISHED" && v.effectiveFrom !== null && v.effectiveFrom.getTime() <= asOfMs && (v.effectiveUntil === null || v.effectiveUntil.getTime() > asOfMs))
++        .sort((a, b) => (b.effectiveFrom!.getTime()) - (a.effectiveFrom!.getTime()))[0];
++      const scheduled = own
++        .filter((v) => v.status === "PUBLISHED" && v.effectiveFrom !== null && v.effectiveFrom.getTime() > asOfMs)
++        .sort((a, b) => (a.effectiveFrom!.getTime()) - (b.effectiveFrom!.getTime()))[0];
++      const code = idToCode.get(definition.id)!;
++      result.set(code, Object.freeze({
++        code,
++        definitionId: definition.id,
++        configured: Boolean(effective),
++        ...(effective?.effectiveFrom ? { effectiveFrom: effective.effectiveFrom.toISOString() } : {}),
++        hasDraft,
++        ...(scheduled?.effectiveFrom ? { scheduledFrom: scheduled.effectiveFrom.toISOString() } : {}),
++      }));
++    }
++    return result;
++  }
+ }
+diff --git a/src/platform/configuration/registry/configuration-manifest.test.ts b/src/platform/configuration/registry/configuration-manifest.test.ts
+new file mode 100644
+index 0000000..3c22aaa
+--- /dev/null
++++ b/src/platform/configuration/registry/configuration-manifest.test.ts
+@@ -0,0 +1,120 @@
++import { describe, expect, it } from "vitest";
++import { isPermission } from "@/platform/context";
++import { CONFIGURATION_MANIFEST, NAVIGATION_GROUPS, type ConfigurationCategoryManifestEntry } from "@/platform/configuration/registry/configuration-manifest";
++import { validateConfigurationManifest } from "@/platform/configuration/registry/manifest-validation";
++
++const base: ConfigurationCategoryManifestEntry = {
++  key: "sample",
++  title: "Sample",
++  description: "A sample category.",
++  group: "company",
++  order: 10,
++  permission: "settings.view",
++  owner: "Platform",
++  status: "coming_soon",
++  dependencies: [],
++  consumers: [],
++};
++
++describe("the real CONFIGURATION_MANIFEST", () => {
++  it("passes its own validation with zero issues", () => {
++    expect(validateConfigurationManifest(CONFIGURATION_MANIFEST)).toEqual([]);
++  });
++
++  it("has unique category keys", () => {
++    const keys = CONFIGURATION_MANIFEST.map((e) => e.key);
++    expect(new Set(keys).size).toBe(keys.length);
++  });
++
++  it("uses only known navigation groups and real permissions", () => {
++    for (const entry of CONFIGURATION_MANIFEST) {
++      expect(NAVIGATION_GROUPS).toContain(entry.group);
++      expect(isPermission(entry.permission)).toBe(true);
++    }
++  });
++
++  it("gives every implemented category a route, and no coming-soon category a route", () => {
++    for (const entry of CONFIGURATION_MANIFEST) {
++      if (entry.status === "implemented") expect(entry.route).toBeTruthy();
++      else expect(entry.route).toBeUndefined();
++    }
++  });
++
++  it("references only known category keys in dependencies", () => {
++    const keys = new Set(CONFIGURATION_MANIFEST.map((e) => e.key));
++    for (const entry of CONFIGURATION_MANIFEST) {
++      for (const dep of entry.dependencies) expect(keys.has(dep)).toBe(true);
++    }
++  });
++});
++
++describe("validateConfigurationManifest catches malformed manifests", () => {
++  it("flags duplicate keys", () => {
++    const issues = validateConfigurationManifest([base, { ...base, order: 20 }]);
++    expect(issues.some((i) => i.code === "DUPLICATE_KEY")).toBe(true);
++  });
++
++  it("flags duplicate display order within a group", () => {
++    const issues = validateConfigurationManifest([base, { ...base, key: "other" }]);
++    expect(issues.some((i) => i.code === "DUPLICATE_ORDER")).toBe(true);
++  });
++
++  it("allows the same order in different groups", () => {
++    const issues = validateConfigurationManifest([base, { ...base, key: "other", group: "workforce" }]);
++    expect(issues.some((i) => i.code === "DUPLICATE_ORDER")).toBe(false);
++  });
++
++  it("flags an implemented category with no route", () => {
++    const issues = validateConfigurationManifest([{ ...base, status: "implemented" }]);
++    expect(issues.some((i) => i.code === "MISSING_ROUTE")).toBe(true);
++  });
++
++  it("flags duplicate routes across implemented categories", () => {
++    const issues = validateConfigurationManifest([
++      { ...base, key: "a", status: "implemented", route: "/settings/x" },
++      { ...base, key: "b", order: 20, status: "implemented", route: "/settings/x" },
++    ]);
++    expect(issues.some((i) => i.code === "DUPLICATE_ROUTE")).toBe(true);
++  });
++
++  it("flags a coming-soon category that declares a route", () => {
++    const issues = validateConfigurationManifest([{ ...base, route: "/settings/nope" }]);
++    expect(issues.some((i) => i.code === "UNEXPECTED_ROUTE")).toBe(true);
++  });
++
++  it("flags an invalid permission", () => {
++    const issues = validateConfigurationManifest([{ ...base, permission: "settings.superuser" as never }]);
++    expect(issues.some((i) => i.code === "INVALID_PERMISSION")).toBe(true);
++  });
++
++  it("flags a self-dependency", () => {
++    const issues = validateConfigurationManifest([{ ...base, dependencies: ["sample"] }]);
++    expect(issues.some((i) => i.code === "SELF_DEPENDENCY")).toBe(true);
++  });
++
++  it("flags a dependency on an unknown category", () => {
++    const issues = validateConfigurationManifest([{ ...base, dependencies: ["ghost"] }]);
++    expect(issues.some((i) => i.code === "UNKNOWN_DEPENDENCY")).toBe(true);
++  });
++
++  it("flags duplicate dependency and consumer entries", () => {
++    const issues = validateConfigurationManifest([
++      { ...base, key: "a", dependencies: ["b", "b"], consumers: ["c", "c"] },
++      { ...base, key: "b", order: 20 },
++    ]);
++    expect(issues.some((i) => i.code === "DUPLICATE_DEPENDENCY")).toBe(true);
++    expect(issues.some((i) => i.code === "DUPLICATE_CONSUMER")).toBe(true);
++  });
++
++  it("does NOT treat consumers as enforced dependencies (an unknown consumer key is allowed)", () => {
++    // A consumer may name a future module not yet in the manifest — advisory only (ADR-011 §7).
++    const issues = validateConfigurationManifest([{ ...base, consumers: ["future_module_not_in_manifest"] }]);
++    expect(issues.some((i) => i.code === "UNKNOWN_DEPENDENCY")).toBe(false);
++    expect(issues).toEqual([]);
++  });
++
++  it("flags a configuration type declared on an unimplemented category", () => {
++    const issues = validateConfigurationManifest([{ ...base, configurationType: "SOME_TYPE" }]);
++    expect(issues.some((i) => i.code === "TYPE_ON_UNIMPLEMENTED")).toBe(true);
++  });
++});
+diff --git a/src/platform/configuration/registry/configuration-manifest.ts b/src/platform/configuration/registry/configuration-manifest.ts
+new file mode 100644
+index 0000000..7cf1934
+--- /dev/null
++++ b/src/platform/configuration/registry/configuration-manifest.ts
+@@ -0,0 +1,153 @@
++import type { Permission } from "@/platform/context";
++import { GENERAL_COMPANY_SETTINGS_CODE, GENERAL_COMPANY_SETTINGS_TYPE } from "@/platform/configuration/general-company-settings";
++
++/**
++ * ADR-011 Layer 1 — the Static Configuration Manifest.
++ *
++ * This is the single, code-owned source of truth describing every Settings
++ * category the current software build provides. It is intentionally pure
++ * data: no tenant persistence, no runtime state, no behavior. Per-tenant
++ * status is Layer 2 and is derived elsewhere (configuration-registry-service).
++ *
++ * Adding a category is adding an entry here — nothing else in the Settings
++ * surface needs editing. See docs/architecture/configuration-registry.md.
++ */
++
++/** Where a category sits in the Settings information architecture. */
++export const NAVIGATION_GROUPS = ["company", "workforce", "governance"] as const;
++export type NavigationGroup = (typeof NAVIGATION_GROUPS)[number];
++
++/**
++ * A category's build-time implementation status.
++ * - "implemented": functional this build (has a route).
++ * - "coming_soon": declared but not yet built.
++ */
++export type ImplementationStatus = "implemented" | "coming_soon";
++
++/**
++ * One canonical description of a Settings category. Everything here is
++ * identical across tenants and versioned with the code.
++ */
++export interface ConfigurationCategoryManifestEntry {
++  /** Stable identifier. Never reused, never changed once shipped. */
++  readonly key: string;
++  /** Human-facing name. */
++  readonly title: string;
++  /** Plain-language purpose, understandable to a non-technical HR/payroll admin. */
++  readonly description: string;
++  /** Information-architecture group. */
++  readonly group: NavigationGroup;
++  /** Deterministic ordering within the group (ascending). Unique per group. */
++  readonly order: number;
++  /** The permission that gates viewing this category. */
++  readonly permission: Permission;
++  /** The team/platform area accountable for the category. */
++  readonly owner: string;
++  /** Build-time status. */
++  readonly status: ImplementationStatus;
++  /**
++   * The configuration type this category edits, when it is a versioned
++   * configuration category. Absent for functional-but-non-configuration
++   * surfaces (e.g. the audit trail) and for coming-soon entries.
++   */
++  readonly configurationType?: string;
++  /** The route, present only for implemented categories. */
++  readonly route?: string;
++  /**
++   * Advisory-only: categories this one is understood to build on. NEVER
++   * enforced or resolved (ADR-011 §7) — human documentation, may lag reality.
++   */
++  readonly dependencies: readonly string[];
++  /**
++   * Advisory-only: categories/modules understood to consume this one. NEVER
++   * treated as an enforced dependency (ADR-011 §7).
++   */
++  readonly consumers: readonly string[];
++}
++
++/**
++ * The canonical manifest. Order of declaration is not significant — display
++ * order is (group, order). Validated by validateConfigurationManifest().
++ */
++export const CONFIGURATION_MANIFEST: readonly ConfigurationCategoryManifestEntry[] = Object.freeze([
++  {
++    key: "general",
++    title: "General",
++    description: "Company name, time zone, locale, currency, and the working-week defaults other policies build on.",
++    group: "company",
++    order: 10,
++    permission: "settings.view",
++    owner: "Platform / Configuration",
++    status: "implemented",
++    configurationType: GENERAL_COMPANY_SETTINGS_TYPE,
++    route: "/settings/general",
++    dependencies: [],
++    consumers: ["organization", "timekeeping", "payroll"],
++  },
++  {
++    key: "organization",
++    title: "Organization",
++    description: "Legal entities, departments, and reporting structure.",
++    group: "company",
++    order: 20,
++    permission: "settings.view",
++    owner: "Platform / Organization",
++    status: "coming_soon",
++    dependencies: ["general"],
++    consumers: ["timekeeping", "payroll"],
++  },
++  {
++    key: "access_control",
++    title: "Access Control",
++    description: "Roles, permissions, and who can see or change what.",
++    group: "governance",
++    order: 10,
++    permission: "settings.view",
++    owner: "Platform / Security",
++    status: "coming_soon",
++    dependencies: [],
++    consumers: [],
++  },
++  {
++    key: "timekeeping",
++    title: "Timekeeping",
++    description: "Shift rules, attendance, and time-off policies. Full policy catalog arrives in a later slice.",
++    group: "workforce",
++    order: 10,
++    permission: "settings.view",
++    owner: "Platform / Timekeeping",
++    status: "coming_soon",
++    dependencies: ["general", "organization"],
++    consumers: ["payroll"],
++  },
++  {
++    key: "payroll",
++    title: "Payroll",
++    description: "Pay schedules, statutory rules, and compensation policies. Full policy catalog arrives in a later slice.",
++    group: "workforce",
++    order: 20,
++    permission: "settings.view",
++    owner: "Platform / Payroll",
++    status: "coming_soon",
++    dependencies: ["general", "organization", "timekeeping"],
++    consumers: [],
++  },
++  {
++    key: "audit",
++    title: "Audit and Diagnostics",
++    description: "Who changed what, and when — across every settings category.",
++    group: "governance",
++    order: 20,
++    permission: "settings.audit.view",
++    owner: "Platform / Configuration",
++    status: "implemented",
++    route: "/settings/audit",
++    dependencies: [],
++    consumers: [],
++  },
++]);
++
++/** The definition code for a configuration category, mirroring the resolver's type→code mapping. */
++export const CONFIGURATION_TYPE_TO_CODE: Readonly<Record<string, string>> = Object.freeze({
++  [GENERAL_COMPANY_SETTINGS_TYPE]: GENERAL_COMPANY_SETTINGS_CODE,
++});
+diff --git a/src/platform/configuration/registry/configuration-registry-service.test.ts b/src/platform/configuration/registry/configuration-registry-service.test.ts
+new file mode 100644
+index 0000000..1927113
+--- /dev/null
++++ b/src/platform/configuration/registry/configuration-registry-service.test.ts
+@@ -0,0 +1,143 @@
++import { describe, expect, it } from "vitest";
++import { PermissionSet, type Permission, type PlatformRole, type TenantContext } from "@/platform/context";
++import { ConfigurationStore, InMemoryConfigurationReadRepository, InMemoryConfigurationWriteRepository } from "@/platform/configuration/in-memory-configuration-repository";
++import { describeConfigurationCategories } from "@/platform/configuration/registry/configuration-registry-service";
++import type { ConfigurationCategoryManifestEntry } from "@/platform/configuration/registry/configuration-manifest";
++import { GENERAL_COMPANY_SETTINGS_CODE, GENERAL_COMPANY_SETTINGS_TYPE } from "@/platform/configuration/general-company-settings";
++
++function contextFor(tenantId: string, roles: readonly PlatformRole[] = ["hr_admin"], permissions: readonly Permission[] = []): TenantContext {
++  return { tenantId, actorId: "actor-1", actorName: "Actor One", roles, permissions: new PermissionSet(permissions), correlationId: "corr-1", authenticationMethod: "test", actorProvenance: "server_verified" };
++}
++
++const MANIFEST: readonly ConfigurationCategoryManifestEntry[] = [
++  { key: "general", title: "General", description: "d", group: "company", order: 10, permission: "settings.view", owner: "P", status: "implemented", configurationType: GENERAL_COMPANY_SETTINGS_TYPE, route: "/settings/general", dependencies: [], consumers: [] },
++  { key: "organization", title: "Organization", description: "d", group: "company", order: 20, permission: "settings.view", owner: "P", status: "coming_soon", dependencies: ["general"], consumers: [] },
++  { key: "audit", title: "Audit", description: "d", group: "governance", order: 10, permission: "settings.audit.view", owner: "P", status: "implemented", route: "/settings/audit", dependencies: [], consumers: [] },
++];
++
++async function seedGeneral(store: ConfigurationStore, tenantId: string) {
++  const write = new InMemoryConfigurationWriteRepository(store);
++  const def = await write.createDefinition({ tenantId, type: GENERAL_COMPANY_SETTINGS_TYPE, code: GENERAL_COMPANY_SETTINGS_CODE, name: "General", createdBy: "actor-1" });
++  return { write, def };
++}
++
++describe("describeConfigurationCategories — status derivation", () => {
++  it("reports a not_configured status for an implemented category with no versions", async () => {
++    const store = new ConfigurationStore();
++    const reader = new InMemoryConfigurationReadRepository(store);
++    const categories = await describeConfigurationCategories(contextFor("t1"), reader, MANIFEST);
++    const general = categories.find((c) => c.key === "general")!;
++    expect(general.status).toBe("not_configured");
++    expect(general.hasDraft).toBe(false);
++    expect(general.hasScheduledChange).toBe(false);
++  });
++
++  it("reports draft as an additive flag on a not_configured category (draft coexists, does not replace)", async () => {
++    const store = new ConfigurationStore();
++    const { write, def } = await seedGeneral(store, "t1");
++    await write.createDraftVersion({ definitionId: def.id, tenantId: "t1", versionNumber: 1, payload: { displayName: "A" }, schemaVersion: 1, createdBy: "actor-1" });
++    const reader = new InMemoryConfigurationReadRepository(store);
++    const general = (await describeConfigurationCategories(contextFor("t1"), reader, MANIFEST)).find((c) => c.key === "general")!;
++    expect(general.status).toBe("not_configured");
++    expect(general.hasDraft).toBe(true);
++  });
++
++  it("reports configured once an effective version is in force", async () => {
++    const store = new ConfigurationStore();
++    const { write, def } = await seedGeneral(store, "t1");
++    const draft = await write.createDraftVersion({ definitionId: def.id, tenantId: "t1", versionNumber: 1, payload: { displayName: "A" }, schemaVersion: 1, createdBy: "actor-1" });
++    await write.publishVersion({ versionId: draft.id, tenantId: "t1", expectedUpdatedAt: draft.updatedAt, effectiveFrom: "2020-01-01T00:00:00.000Z", publishedBy: "actor-1" });
++    const general = (await describeConfigurationCategories(contextFor("t1"), reader(store), MANIFEST)).find((c) => c.key === "general")!;
++    expect(general.status).toBe("configured");
++    expect(general.effectiveSince).toBe("2020-01-01T00:00:00.000Z");
++  });
++
++  it("reports a scheduled change as an additive flag without hiding the effective state", async () => {
++    const store = new ConfigurationStore();
++    const { write, def } = await seedGeneral(store, "t1");
++    const v1 = await write.createDraftVersion({ definitionId: def.id, tenantId: "t1", versionNumber: 1, payload: {}, schemaVersion: 1, createdBy: "actor-1" });
++    await write.publishVersion({ versionId: v1.id, tenantId: "t1", expectedUpdatedAt: v1.updatedAt, effectiveFrom: "2020-01-01T00:00:00.000Z", publishedBy: "actor-1" });
++    const v2 = await write.createDraftVersion({ definitionId: def.id, tenantId: "t1", versionNumber: 2, payload: {}, schemaVersion: 1, createdBy: "actor-1" });
++    await write.publishVersion({ versionId: v2.id, tenantId: "t1", expectedUpdatedAt: v2.updatedAt, effectiveFrom: "2999-01-01T00:00:00.000Z", publishedBy: "actor-1" });
++    const general = (await describeConfigurationCategories(contextFor("t1"), reader(store), MANIFEST)).find((c) => c.key === "general")!;
++    expect(general.status).toBe("configured");
++    expect(general.hasScheduledChange).toBe(true);
++    expect(general.scheduledFor).toBe("2999-01-01T00:00:00.000Z");
++  });
++
++  it("reports coming_soon for an unimplemented category and performs no state derivation", async () => {
++    const org = (await describeConfigurationCategories(contextFor("t1"), reader(new ConfigurationStore()), MANIFEST)).find((c) => c.key === "organization")!;
++    expect(org.status).toBe("coming_soon");
++    expect(org.implemented).toBe(false);
++    expect(org.route).toBeUndefined();
++  });
++
++  it("reports available for an implemented non-configuration surface (audit has no config type)", async () => {
++    const audit = (await describeConfigurationCategories(contextFor("t1", ["hr_admin"]), reader(new ConfigurationStore()), MANIFEST)).find((c) => c.key === "audit")!;
++    expect(audit.status).toBe("available");
++    expect(audit.route).toBe("/settings/audit");
++  });
++});
++
++describe("describeConfigurationCategories — permission visibility", () => {
++  it("excludes categories the caller cannot view", async () => {
++    // payroll role has settings.view but NOT settings.audit.view → audit hidden.
++    const categories = await describeConfigurationCategories(contextFor("t1", ["payroll"]), reader(new ConfigurationStore()), MANIFEST);
++    expect(categories.map((c) => c.key)).toContain("general");
++    expect(categories.map((c) => c.key)).not.toContain("audit");
++  });
++
++  it("returns nothing for a caller with no settings permissions at all", async () => {
++    const categories = await describeConfigurationCategories(contextFor("t1", ["employee"]), reader(new ConfigurationStore()), MANIFEST);
++    expect(categories).toHaveLength(0);
++  });
++
++  it("shows the audit category to an auditor", async () => {
++    const categories = await describeConfigurationCategories(contextFor("t1", ["auditor"]), reader(new ConfigurationStore()), MANIFEST);
++    expect(categories.map((c) => c.key)).toContain("audit");
++  });
++});
++
++describe("describeConfigurationCategories — tenant isolation", () => {
++  it("does not observe another tenant's configured status", async () => {
++    const store = new ConfigurationStore();
++    const { write, def } = await seedGeneral(store, "tenant-a");
++    const draft = await write.createDraftVersion({ definitionId: def.id, tenantId: "tenant-a", versionNumber: 1, payload: {}, schemaVersion: 1, createdBy: "actor-1" });
++    await write.publishVersion({ versionId: draft.id, tenantId: "tenant-a", expectedUpdatedAt: draft.updatedAt, effectiveFrom: "2020-01-01T00:00:00.000Z", publishedBy: "actor-1" });
++
++    const asA = (await describeConfigurationCategories(contextFor("tenant-a"), reader(store), MANIFEST)).find((c) => c.key === "general")!;
++    const asB = (await describeConfigurationCategories(contextFor("tenant-b"), reader(store), MANIFEST)).find((c) => c.key === "general")!;
++    expect(asA.status).toBe("configured");
++    expect(asB.status).toBe("not_configured");
++  });
++
++  it("does not leak another tenant's draft or scheduled state", async () => {
++    const store = new ConfigurationStore();
++    const { write, def } = await seedGeneral(store, "tenant-a");
++    await write.createDraftVersion({ definitionId: def.id, tenantId: "tenant-a", versionNumber: 1, payload: {}, schemaVersion: 1, createdBy: "actor-1" });
++    const asB = (await describeConfigurationCategories(contextFor("tenant-b"), reader(store), MANIFEST)).find((c) => c.key === "general")!;
++    expect(asB.hasDraft).toBe(false);
++    expect(asB.hasScheduledChange).toBe(false);
++  });
++});
++
++describe("describeConfigurationCategories — ordering and payload safety", () => {
++  it("returns categories in deterministic display order (group, then order)", async () => {
++    const categories = await describeConfigurationCategories(contextFor("t1"), reader(new ConfigurationStore()), MANIFEST);
++    expect(categories.map((c) => c.key)).toEqual(["general", "organization", "audit"]);
++  });
++
++  it("never exposes a configuration payload in the described category", async () => {
++    const store = new ConfigurationStore();
++    const { write, def } = await seedGeneral(store, "t1");
++    const draft = await write.createDraftVersion({ definitionId: def.id, tenantId: "t1", versionNumber: 1, payload: { displayName: "Secret Co", companyCode: "SECRET" }, schemaVersion: 1, createdBy: "actor-1" });
++    await write.publishVersion({ versionId: draft.id, tenantId: "t1", expectedUpdatedAt: draft.updatedAt, effectiveFrom: "2020-01-01T00:00:00.000Z", publishedBy: "actor-1" });
++    const categories = await describeConfigurationCategories(contextFor("t1"), reader(store), MANIFEST);
++    expect(JSON.stringify(categories)).not.toContain("Secret Co");
++    expect(JSON.stringify(categories)).not.toContain("SECRET");
++  });
++});
++
++function reader(store: ConfigurationStore): InMemoryConfigurationReadRepository {
++  return new InMemoryConfigurationReadRepository(store);
++}
+diff --git a/src/platform/configuration/registry/configuration-registry-service.ts b/src/platform/configuration/registry/configuration-registry-service.ts
+new file mode 100644
+index 0000000..91867f4
+--- /dev/null
++++ b/src/platform/configuration/registry/configuration-registry-service.ts
+@@ -0,0 +1,142 @@
++import { hasPermission, type TenantContext } from "@/platform/context";
++import type { ConfigurationReadRepository } from "@/platform/configuration/configuration-repository";
++import {
++  CONFIGURATION_MANIFEST,
++  CONFIGURATION_TYPE_TO_CODE,
++  NAVIGATION_GROUPS,
++  type ConfigurationCategoryManifestEntry,
++  type NavigationGroup,
++} from "@/platform/configuration/registry/configuration-manifest";
++
++/**
++ * ADR-011 Layer 2 — the per-tenant Runtime Read Model, and the one service
++ * that joins it to the static manifest (Layer 1).
++ *
++ * The primary status of a category, in truthful precedence:
++ * - "coming_soon": the category is not implemented in this build. (No query.)
++ * - "available":   implemented, but not a versioned configuration category
++ *                  (e.g. the audit trail) — nothing to configure, just usable.
++ * - "configured":  a configuration category with an effective version in force.
++ * - "not_configured": a configuration category with no effective version yet.
++ *
++ * `hasDraft` and `hasScheduledChange` are ADDITIVE flags, never a replacement
++ * for the primary status: a scheduled change or an in-progress draft is shown
++ * ALONGSIDE the current effective state, never hiding it (ADR-011 / ticket §5).
++ *
++ * "needs attention" is intentionally NOT produced here: there is no truthful
++ * read-side validation/warning source in this slice, and a fabricated one
++ * would violate the Constitution's "clear status, never arbitrary" rule.
++ */
++export type ConfigurationCategoryStatus = "coming_soon" | "available" | "not_configured" | "configured";
++
++/** The described category returned to consumers: static metadata + derived per-tenant state. */
++export interface DescribedConfigurationCategory {
++  readonly key: string;
++  readonly title: string;
++  readonly description: string;
++  readonly group: NavigationGroup;
++  readonly order: number;
++  readonly owner: string;
++  readonly implemented: boolean;
++  readonly route?: string;
++  readonly configurationType?: string;
++  readonly status: ConfigurationCategoryStatus;
++  /** An editable draft exists (may coexist with an effective version). */
++  readonly hasDraft: boolean;
++  /** A future-dated published version is scheduled (shown without hiding the effective state). */
++  readonly hasScheduledChange: boolean;
++  /** The effective version's start date, when configured. */
++  readonly effectiveSince?: string;
++  /** The scheduled version's start date, when one is scheduled. */
++  readonly scheduledFor?: string;
++  /** Advisory only (ADR-011 §7) — never enforced. */
++  readonly dependencies: readonly string[];
++  /** Advisory only (ADR-011 §7) — never enforced. */
++  readonly consumers: readonly string[];
++}
++
++const GROUP_ORDER: Readonly<Record<NavigationGroup, number>> = Object.freeze(
++  Object.fromEntries(NAVIGATION_GROUPS.map((group, index) => [group, index])) as Record<NavigationGroup, number>,
++);
++
++/** Deterministic display order: by group, then by the entry's order, then by key. */
++function byDisplayOrder(a: DescribedConfigurationCategory, b: DescribedConfigurationCategory): number {
++  if (GROUP_ORDER[a.group] !== GROUP_ORDER[b.group]) return GROUP_ORDER[a.group] - GROUP_ORDER[b.group];
++  if (a.order !== b.order) return a.order - b.order;
++  return a.key.localeCompare(b.key);
++}
++
++/**
++ * Server-only. Describes every configuration category the caller is permitted
++ * to see, joining static manifest metadata with derived per-tenant state.
++ *
++ * It is read-only and tenant-scoped: it never writes, publishes, authorizes a
++ * command, audits, or computes a business outcome. Tenant identity comes only
++ * from the verified context. Categories the caller cannot view are excluded
++ * (registry filtering is visibility, NOT a substitute for the route/command
++ * authorization that remains in place independently).
++ *
++ * Runtime state is fetched in one batched call (≤2 queries) for the visible,
++ * implemented, versioned categories — never one query per category.
++ */
++export async function describeConfigurationCategories(
++  context: TenantContext,
++  reader: ConfigurationReadRepository,
++  manifest: readonly ConfigurationCategoryManifestEntry[] = CONFIGURATION_MANIFEST,
++  asOf: Date = new Date(),
++): Promise<readonly DescribedConfigurationCategory[]> {
++  const visible = manifest.filter((entry) => hasPermission(context, entry.permission));
++
++  // Only implemented configuration categories (those with a configurationType)
++  // carry per-tenant state; fetch all of them in one batched read.
++  const codeByType = (type: string): string | undefined => CONFIGURATION_TYPE_TO_CODE[type];
++  const configCodes = visible
++    .filter((entry) => entry.status === "implemented" && entry.configurationType)
++    .map((entry) => codeByType(entry.configurationType!))
++    .filter((code): code is string => Boolean(code));
++
++  const summaries = configCodes.length > 0
++    ? await reader.getConfigurationSummaries(context, configCodes, asOf)
++    : new Map();
++
++  const described = visible.map((entry): DescribedConfigurationCategory => {
++    const base = {
++      key: entry.key,
++      title: entry.title,
++      description: entry.description,
++      group: entry.group,
++      order: entry.order,
++      owner: entry.owner,
++      implemented: entry.status === "implemented",
++      ...(entry.route ? { route: entry.route } : {}),
++      ...(entry.configurationType ? { configurationType: entry.configurationType } : {}),
++      dependencies: entry.dependencies,
++      consumers: entry.consumers,
++    };
++
++    // Not implemented → coming soon, no per-tenant state, no query performed.
++    if (entry.status !== "implemented") {
++      return Object.freeze({ ...base, status: "coming_soon" as const, hasDraft: false, hasScheduledChange: false });
++    }
++
++    // Implemented but not a versioned configuration category (e.g. audit) → available.
++    const code = entry.configurationType ? codeByType(entry.configurationType) : undefined;
++    if (!code) {
++      return Object.freeze({ ...base, status: "available" as const, hasDraft: false, hasScheduledChange: false });
++    }
++
++    // Implemented configuration category → derive from the batched summary.
++    const summary = summaries.get(code);
++    const configured = Boolean(summary?.configured);
++    return Object.freeze({
++      ...base,
++      status: configured ? ("configured" as const) : ("not_configured" as const),
++      hasDraft: Boolean(summary?.hasDraft),
++      hasScheduledChange: Boolean(summary?.scheduledFrom),
++      ...(summary?.effectiveFrom ? { effectiveSince: summary.effectiveFrom } : {}),
++      ...(summary?.scheduledFrom ? { scheduledFor: summary.scheduledFrom } : {}),
++    });
++  });
++
++  return Object.freeze([...described].sort(byDisplayOrder));
++}
+diff --git a/src/platform/configuration/registry/manifest-validation.ts b/src/platform/configuration/registry/manifest-validation.ts
+new file mode 100644
+index 0000000..54f9f66
+--- /dev/null
++++ b/src/platform/configuration/registry/manifest-validation.ts
+@@ -0,0 +1,90 @@
++import { isPermission } from "@/platform/context";
++import { NAVIGATION_GROUPS, type ConfigurationCategoryManifestEntry } from "@/platform/configuration/registry/configuration-manifest";
++
++export interface ManifestValidationIssue {
++  /** The category key the issue concerns, or "manifest" for whole-manifest issues. */
++  key: string;
++  code: string;
++  message: string;
++}
++
++/**
++ * Validates the static manifest's internal integrity. This guards the one
++ * place category metadata lives — a malformed manifest is a build-time defect,
++ * not a runtime surprise. It deliberately performs NO graph analysis: no cycle
++ * detection, no topological ordering, no dependency enforcement (ADR-011 §7).
++ * Dependencies and consumers are advisory; the only checks are referential
++ * sanity (they name real keys) and hygiene (no self/duplicate entries).
++ */
++export function validateConfigurationManifest(
++  entries: readonly ConfigurationCategoryManifestEntry[] = [],
++): ManifestValidationIssue[] {
++  const issues: ManifestValidationIssue[] = [];
++  const keys = new Set<string>();
++  const routes = new Set<string>();
++  const orderByGroup = new Map<string, Set<number>>();
++  const knownKeys = new Set(entries.map((entry) => entry.key));
++
++  for (const entry of entries) {
++    // Unique keys.
++    if (keys.has(entry.key)) issues.push({ key: entry.key, code: "DUPLICATE_KEY", message: `Category key "${entry.key}" is declared more than once.` });
++    keys.add(entry.key);
++
++    // Group is known.
++    if (!(NAVIGATION_GROUPS as readonly string[]).includes(entry.group)) {
++      issues.push({ key: entry.key, code: "UNKNOWN_GROUP", message: `Category "${entry.key}" uses unknown navigation group "${entry.group}".` });
++    }
++
++    // Deterministic ordering: unique order within a group.
++    const groupOrders = orderByGroup.get(entry.group) ?? new Set<number>();
++    if (groupOrders.has(entry.order)) {
++      issues.push({ key: entry.key, code: "DUPLICATE_ORDER", message: `Category "${entry.key}" reuses display order ${entry.order} within group "${entry.group}".` });
++    }
++    groupOrders.add(entry.order);
++    orderByGroup.set(entry.group, groupOrders);
++
++    // Permission is a real platform permission.
++    if (!isPermission(entry.permission)) {
++      issues.push({ key: entry.key, code: "INVALID_PERMISSION", message: `Category "${entry.key}" references unknown permission "${entry.permission}".` });
++    }
++
++    // Implemented categories must have a unique route.
++    if (entry.status === "implemented") {
++      if (!entry.route || entry.route.trim() === "") {
++        issues.push({ key: entry.key, code: "MISSING_ROUTE", message: `Implemented category "${entry.key}" must declare a route.` });
++      } else {
++        if (routes.has(entry.route)) issues.push({ key: entry.key, code: "DUPLICATE_ROUTE", message: `Route "${entry.route}" is used by more than one category.` });
++        routes.add(entry.route);
++      }
++    } else if (entry.route) {
++      issues.push({ key: entry.key, code: "UNEXPECTED_ROUTE", message: `Coming-soon category "${entry.key}" must not declare a route until it is implemented.` });
++    }
++
++    // An implemented *configuration* category (one that declares a configurationType) must name a recognized type.
++    // A configurationType is only meaningful for implemented categories.
++    if (entry.configurationType !== undefined && entry.status !== "implemented") {
++      issues.push({ key: entry.key, code: "TYPE_ON_UNIMPLEMENTED", message: `Category "${entry.key}" declares a configuration type but is not implemented.` });
++    }
++
++    // Dependency hygiene: reference known keys, no self-dependency, no duplicates.
++    const seenDeps = new Set<string>();
++    for (const dep of entry.dependencies) {
++      if (dep === entry.key) issues.push({ key: entry.key, code: "SELF_DEPENDENCY", message: `Category "${entry.key}" lists itself as a dependency.` });
++      if (!knownKeys.has(dep)) issues.push({ key: entry.key, code: "UNKNOWN_DEPENDENCY", message: `Category "${entry.key}" depends on unknown category "${dep}".` });
++      if (seenDeps.has(dep)) issues.push({ key: entry.key, code: "DUPLICATE_DEPENDENCY", message: `Category "${entry.key}" lists dependency "${dep}" more than once.` });
++      seenDeps.add(dep);
++    }
++
++    // Consumer hygiene: no duplicates, no self. Consumers are advisory and are
++    // deliberately NOT validated as enforced dependencies (unknown keys are
++    // permitted — a consumer may be a future module not yet in the manifest).
++    const seenConsumers = new Set<string>();
++    for (const consumer of entry.consumers) {
++      if (consumer === entry.key) issues.push({ key: entry.key, code: "SELF_CONSUMER", message: `Category "${entry.key}" lists itself as a consumer.` });
++      if (seenConsumers.has(consumer)) issues.push({ key: entry.key, code: "DUPLICATE_CONSUMER", message: `Category "${entry.key}" lists consumer "${consumer}" more than once.` });
++      seenConsumers.add(consumer);
++    }
++  }
++
++  return issues;
++}
+diff --git a/src/platform/configuration/registry/settings-home-structure.test.ts b/src/platform/configuration/registry/settings-home-structure.test.ts
+new file mode 100644
+index 0000000..6bbb2dc
+--- /dev/null
++++ b/src/platform/configuration/registry/settings-home-structure.test.ts
+@@ -0,0 +1,33 @@
++import { readFileSync } from "node:fs";
++import { resolve } from "node:path";
++import { describe, expect, it } from "vitest";
++
++/**
++ * Structural guard (ADR-011): the Settings Home must render from the registry,
++ * not carry its own category list. This is a focused structural check, not a
++ * formatting scan — it asserts the page renders categories via a single mapped
++ * component and sources them from the registry loader.
++ */
++describe("Settings Home is registry-driven, not hardcoded", () => {
++  const source = readFileSync(resolve(process.cwd(), "src/app/(app)/settings/page.tsx"), "utf8");
++
++  it("sources its categories from the registry loader", () => {
++    expect(source).toContain("loadSettingsHome");
++  });
++
++  it("renders exactly one SettingsCategoryCard element (a single mapped render, not N hardcoded cards)", () => {
++    const usages = source.match(/<SettingsCategoryCard\b/g) ?? [];
++    expect(usages).toHaveLength(1);
++  });
++
++  it("maps over the registry-provided categories rather than listing them inline", () => {
++    expect(source).toMatch(/categories\.map\(/);
++  });
++
++  it("does not re-declare category identity metadata that belongs to the manifest", () => {
++    // The old hardcoded titles/descriptions must be gone from the page; identity lives in the manifest.
++    for (const hardcodedTitle of ["\"Organization\"", "\"Access Control\"", "\"Timekeeping\"", "\"Payroll\""]) {
++      expect(source).not.toContain(hardcodedTitle);
++    }
++  });
++});
+diff --git a/src/platform/configuration/registry/settings-navigation.test.ts b/src/platform/configuration/registry/settings-navigation.test.ts
+new file mode 100644
+index 0000000..7f8e174
+--- /dev/null
++++ b/src/platform/configuration/registry/settings-navigation.test.ts
+@@ -0,0 +1,48 @@
++import { describe, expect, it } from "vitest";
++import { toGroupedSettingsNavigation, toSettingsNavigation } from "@/platform/configuration/registry/settings-navigation";
++import type { DescribedConfigurationCategory } from "@/platform/configuration/registry/configuration-registry-service";
++
++function described(overrides: Partial<DescribedConfigurationCategory>): DescribedConfigurationCategory {
++  return Object.freeze({
++    key: "general", title: "General", description: "d", group: "company", order: 10, owner: "P",
++    implemented: true, route: "/settings/general", status: "not_configured", hasDraft: false, hasScheduledChange: false,
++    dependencies: [], consumers: [], ...overrides,
++  });
++}
++
++const CATEGORIES: readonly DescribedConfigurationCategory[] = [
++  described({ key: "general", group: "company", order: 10, implemented: true, route: "/settings/general" }),
++  described({ key: "organization", group: "company", order: 20, implemented: false, route: undefined, status: "coming_soon" }),
++  described({ key: "audit", group: "governance", order: 10, implemented: true, route: "/settings/audit", status: "available" }),
++];
++
++describe("toSettingsNavigation", () => {
++  it("projects each described category into a nav item, preserving the registry's order", () => {
++    const nav = toSettingsNavigation(CATEGORIES);
++    expect(nav.map((i) => i.key)).toEqual(["general", "organization", "audit"]);
++  });
++
++  it("gives implemented categories an href and marks coming-soon items non-linkable", () => {
++    const nav = toSettingsNavigation(CATEGORIES);
++    expect(nav.find((i) => i.key === "general")!.href).toBe("/settings/general");
++    const org = nav.find((i) => i.key === "organization")!;
++    expect(org.href).toBeUndefined();
++    expect(org.comingSoon).toBe(true);
++  });
++
++  it("adds no category the registry did not already permission-filter (pure projection, no visibility logic)", () => {
++    // Only what is passed in comes out — the projection performs no filtering itself.
++    const nav = toSettingsNavigation([CATEGORIES[0]]);
++    expect(nav).toHaveLength(1);
++    expect(nav[0].key).toBe("general");
++  });
++});
++
++describe("toGroupedSettingsNavigation", () => {
++  it("buckets items by group while preserving order", () => {
++    const grouped = toGroupedSettingsNavigation(CATEGORIES);
++    expect(grouped.map((g) => g.group)).toEqual(["company", "governance"]);
++    expect(grouped[0].items.map((i) => i.key)).toEqual(["general", "organization"]);
++    expect(grouped[1].items.map((i) => i.key)).toEqual(["audit"]);
++  });
++});
+diff --git a/src/platform/configuration/registry/settings-navigation.ts b/src/platform/configuration/registry/settings-navigation.ts
+new file mode 100644
+index 0000000..1acc92c
+--- /dev/null
++++ b/src/platform/configuration/registry/settings-navigation.ts
+@@ -0,0 +1,51 @@
++import type { NavigationGroup } from "@/platform/configuration/registry/configuration-manifest";
++import type { DescribedConfigurationCategory } from "@/platform/configuration/registry/configuration-registry-service";
++
++/**
++ * The Settings navigation model, projected purely from the registry's described
++ * categories. The Settings Home grid renders this today; any future Settings
++ * sub-navigation renders the same model — so the two can never drift.
++ *
++ * This is a pure transform of already-permission-filtered, already-ordered
++ * described categories. It performs no permission check or data access of its
++ * own; visibility and ordering are the registry's responsibility (ADR-011).
++ */
++export interface SettingsNavigationItem {
++  readonly key: string;
++  readonly label: string;
++  readonly group: NavigationGroup;
++  /** Present only for implemented categories; coming-soon items are not linkable. */
++  readonly href?: string;
++  /** True for coming-soon categories — render as a labeled, non-interactive destination. */
++  readonly comingSoon: boolean;
++}
++
++export interface SettingsNavigationGroup {
++  readonly group: NavigationGroup;
++  readonly items: readonly SettingsNavigationItem[];
++}
++
++/** Flat navigation list, in the registry's deterministic display order. */
++export function toSettingsNavigation(categories: readonly DescribedConfigurationCategory[]): readonly SettingsNavigationItem[] {
++  return Object.freeze(categories.map((category) => Object.freeze({
++    key: category.key,
++    label: category.title,
++    group: category.group,
++    ...(category.implemented && category.route ? { href: category.route } : {}),
++    comingSoon: !category.implemented,
++  })));
++}
++
++/** The same navigation, bucketed by group while preserving order — for a grouped sub-nav. */
++export function toGroupedSettingsNavigation(categories: readonly DescribedConfigurationCategory[]): readonly SettingsNavigationGroup[] {
++  const groups: NavigationGroup[] = [];
++  const byGroup = new Map<NavigationGroup, SettingsNavigationItem[]>();
++  for (const item of toSettingsNavigation(categories)) {
++    if (!byGroup.has(item.group)) {
++      byGroup.set(item.group, []);
++      groups.push(item.group);
++    }
++    byGroup.get(item.group)!.push(item);
++  }
++  return Object.freeze(groups.map((group) => Object.freeze({ group, items: Object.freeze(byGroup.get(group)!) })));
++}
+diff --git a/src/platform/context.ts b/src/platform/context.ts
+index 070eb79..714e67f 100644
+--- a/src/platform/context.ts
++++ b/src/platform/context.ts
+@@ -9,6 +9,23 @@ export type Permission =
+   | "settings.publish"
+   | "settings.audit.view";
+ 
++/** The canonical runtime list of every platform permission, for validation and enumeration. */
++export const ALL_PERMISSIONS: readonly Permission[] = Object.freeze([
++  "people.read",
++  "people.write",
++  "people.government_ids.read",
++  "people.employee.hire",
++  "settings.view",
++  "settings.manage",
++  "settings.publish",
++  "settings.audit.view",
++]);
++
++/** Type guard: is an arbitrary string a recognized platform permission? */
++export function isPermission(value: string): value is Permission {
++  return (ALL_PERMISSIONS as readonly string[]).includes(value);
++}
++
+ /** Immutable representation resolved by a trusted server-side identity adapter. */
+ export class PermissionSet {
+   private readonly values: ReadonlySet<Permission>;
+-- 
+2.43.0
+
