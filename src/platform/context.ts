@@ -9,6 +9,23 @@ export type Permission =
   | "settings.publish"
   | "settings.audit.view";
 
+/** The canonical runtime list of every platform permission, for validation and enumeration. */
+export const ALL_PERMISSIONS: readonly Permission[] = Object.freeze([
+  "people.read",
+  "people.write",
+  "people.government_ids.read",
+  "people.employee.hire",
+  "settings.view",
+  "settings.manage",
+  "settings.publish",
+  "settings.audit.view",
+]);
+
+/** Type guard: is an arbitrary string a recognized platform permission? */
+export function isPermission(value: string): value is Permission {
+  return (ALL_PERMISSIONS as readonly string[]).includes(value);
+}
+
 /** Immutable representation resolved by a trusted server-side identity adapter. */
 export class PermissionSet {
   private readonly values: ReadonlySet<Permission>;

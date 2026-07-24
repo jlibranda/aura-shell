@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import { hasPermission, type TenantContext } from "@/platform/context";
 import { AuthorizationError } from "@/platform/errors";
 import type {
+  ConfigurationCategorySummary,
   ConfigurationReadRepository,
   ConfigurationWriteRepository,
   CreateDefinitionInput,
@@ -164,5 +165,35 @@ export class InMemoryConfigurationReadRepository implements ConfigurationReadRep
     );
     candidates.sort((a, b) => new Date(a.effectiveFrom!).getTime() - new Date(b.effectiveFrom!).getTime());
     return candidates[0];
+  }
+
+  async getConfigurationSummaries(context: TenantContext, codes: readonly string[], asOf: Date): Promise<ReadonlyMap<string, ConfigurationCategorySummary>> {
+    requireSettingsView(context);
+    const asOfMs = asOf.getTime();
+    const result = new Map<string, ConfigurationCategorySummary>();
+    for (const code of codes) {
+      const definition = this.store.definitions.find((d) => d.tenantId === context.tenantId && d.code === code);
+      if (!definition) {
+        result.set(code, Object.freeze({ code, configured: false, hasDraft: false }));
+        continue;
+      }
+      const own = this.store.versions.filter((v) => v.tenantId === context.tenantId && v.definitionId === definition.id);
+      const hasDraft = own.some((v) => v.status === "DRAFT");
+      const effective = own
+        .filter((v) => v.status === "PUBLISHED" && v.effectiveFrom && new Date(v.effectiveFrom).getTime() <= asOfMs && (!v.effectiveUntil || new Date(v.effectiveUntil).getTime() > asOfMs))
+        .sort((a, b) => new Date(b.effectiveFrom!).getTime() - new Date(a.effectiveFrom!).getTime())[0];
+      const scheduled = own
+        .filter((v) => v.status === "PUBLISHED" && v.effectiveFrom && new Date(v.effectiveFrom).getTime() > asOfMs)
+        .sort((a, b) => new Date(a.effectiveFrom!).getTime() - new Date(b.effectiveFrom!).getTime())[0];
+      result.set(code, Object.freeze({
+        code,
+        definitionId: definition.id,
+        configured: Boolean(effective),
+        ...(effective?.effectiveFrom ? { effectiveFrom: effective.effectiveFrom } : {}),
+        hasDraft,
+        ...(scheduled?.effectiveFrom ? { scheduledFrom: scheduled.effectiveFrom } : {}),
+      }));
+    }
+    return result;
   }
 }
