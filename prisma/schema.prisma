@@ -17,8 +17,67 @@ model Tenant {
   auditRecords                 AuditRecord[]
   submissionIdempotencyRecords SubmissionIdempotencyRecord[]
   outboxMessages               OutboxMessage[]
+  tenantMemberships            TenantMembership[]
+  sessions                     Session[]
 
   @@map("tenants")
+}
+
+/// The platform login identity (Epic 6 Slice 6M0.1). Deliberately separate
+/// from Employee: Employee is HR record data, not authentication data, and
+/// a User is not guaranteed to correspond to an Employee row.
+model User {
+  id                String             @id @default(uuid()) @map("user_id")
+  email             String             @unique @map("email")
+  passwordHash      String             @map("password_hash")
+  passwordSalt      String             @map("password_salt")
+  status            String             @default("active") @map("status")
+  createdAt         DateTime           @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt         DateTime           @updatedAt @map("updated_at") @db.Timestamptz(6)
+  tenantMemberships TenantMembership[]
+  sessions          Session[]
+
+  @@map("users")
+}
+
+/// Which tenant a User may access, and with which roles. Roles are the same
+/// flat PlatformRole[] shape TrustedRequestContext already carries — no
+/// separate RoleAssignment table, since roles have no independent lifecycle
+/// of their own here (see Slice 6M0.1 architecture analysis).
+model TenantMembership {
+  id        String   @id @default(uuid()) @map("membership_id")
+  userId    String   @map("user_id")
+  tenantId  String   @map("tenant_id")
+  roles     String[] @map("roles")
+  status    String   @default("active") @map("status")
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz(6)
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+  tenant    Tenant   @relation(fields: [tenantId], references: [id], onDelete: Restrict, onUpdate: Cascade)
+
+  @@unique([userId, tenantId])
+  @@index([tenantId])
+  @@map("tenant_memberships")
+}
+
+/// A server-verified session. The browser cookie carries only the opaque
+/// token; tokenHash (not the token) is what's stored, so a database read
+/// alone can never produce a usable session. tenantId is the tenant this
+/// session was authenticated into — resolved server-side at login from the
+/// user's memberships, never taken from the browser.
+model Session {
+  id        String   @id @default(uuid()) @map("session_id")
+  tokenHash String   @unique @map("token_hash")
+  userId    String   @map("user_id")
+  tenantId  String   @map("tenant_id")
+  expiresAt DateTime @map("expires_at") @db.Timestamptz(6)
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+  tenant    Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+
+  @@index([userId])
+  @@index([expiresAt])
+  @@map("sessions")
 }
 
 /// Transactional domain-event delivery record. Payloads are safe event

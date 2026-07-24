@@ -1,24 +1,63 @@
 "use client";
 
-import { useState } from "react";
+import { Suspense, useRef, useState } from "react";
 import Link from "next/link";
-import { useRouter } from "next/navigation";
+import { useRouter, useSearchParams } from "next/navigation";
 import { AuthCard } from "@/components/auth/auth-shell";
 import { Button } from "@/components/ui/button";
 import { FormField, Input, PasswordInput } from "@/components/ui/form";
 import { useAuthStore } from "@/stores/auth-store";
+import { loginAction } from "@/app/(auth)/login/actions";
 
+const IS_PRODUCTION = process.env.NODE_ENV === "production";
+
+// useSearchParams() (for the post-login returnTo target) requires a Suspense
+// boundary or Next.js can't statically prerender this route.
 export default function LoginPage() {
+  return (
+    <Suspense fallback={null}>
+      <LoginForm />
+    </Suspense>
+  );
+}
+
+function LoginForm() {
   const router = useRouter();
+  const searchParams = useSearchParams();
   const signIn = useAuthStore((s) => s.signIn);
   const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const emailRef = useRef<HTMLInputElement>(null);
+  const passwordRef = useRef<HTMLInputElement>(null);
 
-  const onSubmit = (e: React.FormEvent) => {
+  const onSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
+    setError(null);
     setLoading(true);
-    // UI-only: there is no real credential check in this build.
-    signIn();
-    router.push("/home");
+
+    if (!IS_PRODUCTION) {
+      // Development keeps the existing mock click-through experience —
+      // no server round trip, matching the shell's original design.
+      signIn();
+      router.push("/home");
+      return;
+    }
+
+    try {
+      const email = emailRef.current?.value ?? "";
+      const password = passwordRef.current?.value ?? "";
+      const returnTo = searchParams.get("returnTo") ?? undefined;
+      const result = await loginAction(email, password, returnTo);
+      // loginAction redirects on success (throwing Next's navigation signal),
+      // so reaching this line means it returned an error result.
+      if (result.kind === "error") setError(result.message);
+    } catch (err) {
+      // Next's redirect() throws to trigger navigation; let it propagate.
+      if (err && typeof err === "object" && "digest" in err && typeof (err as { digest?: unknown }).digest === "string" && (err as { digest: string }).digest.startsWith("NEXT_REDIRECT")) throw err;
+      setError("Something went wrong. Please try again.");
+    } finally {
+      setLoading(false);
+    }
   };
 
   return (
@@ -37,10 +76,11 @@ export default function LoginPage() {
           {({ id }) => (
             <Input
               id={id}
+              ref={emailRef}
               type="email"
               autoComplete="email"
               placeholder="maria.santos@northwind.ph"
-              defaultValue="maria.santos@northwind.ph"
+              defaultValue={IS_PRODUCTION ? undefined : "maria.santos@northwind.ph"}
               required
             />
           )}
@@ -53,13 +93,20 @@ export default function LoginPage() {
           {({ id }) => (
             <PasswordInput
               id={id}
+              ref={passwordRef}
               autoComplete="current-password"
               placeholder="••••••••"
-              defaultValue="demo-password"
+              defaultValue={IS_PRODUCTION ? undefined : "demo-password"}
               required
             />
           )}
         </FormField>
+
+        {error ? (
+          <p role="alert" className="rounded-md border border-danger/30 bg-danger/10 px-3 py-2 text-sm text-danger">
+            {error}
+          </p>
+        ) : null}
 
         <div className="flex items-center justify-between">
           <label className="flex items-center gap-2 text-sm text-muted-foreground">
@@ -83,9 +130,11 @@ export default function LoginPage() {
         </Button>
       </form>
 
-      <p className="mt-6 rounded-lg border border-border bg-surface-muted/50 px-3 py-2 text-center text-xs text-muted-foreground">
-        Demo build — authentication is not real. Any sign-in continues to the app.
-      </p>
+      {!IS_PRODUCTION ? (
+        <p className="mt-6 rounded-lg border border-border bg-surface-muted/50 px-3 py-2 text-center text-xs text-muted-foreground">
+          Demo build — authentication is not real. Any sign-in continues to the app.
+        </p>
+      ) : null}
     </AuthCard>
   );
 }

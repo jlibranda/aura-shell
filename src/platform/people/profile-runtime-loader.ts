@@ -1,5 +1,5 @@
 import type { TenantContext } from "@/platform/context";
-import { getDevelopmentSession } from "@/platform/development-session";
+import { resolveRequestContext } from "@/platform/auth/resolve-request-context";
 import { AuthorizationError } from "@/platform/errors";
 import { createPrismaPeopleReadRuntime, type PrismaPeopleReadRuntime } from "@/platform/people/prisma-people-read-runtime";
 import type { EmployeeContactReadModel, EmployeeProfileReadModel } from "@/platform/people/read-models/people-read-models";
@@ -183,9 +183,13 @@ export async function aggregateRuntimeProfile(
 export async function loadRuntimeProfile(
   employeeId: string,
 ): Promise<RuntimeProfilePageResult> {
+  // Resolved outside the try/catch below: an unauthenticated production
+  // request must redirect() to /login, and that redirect works by throwing —
+  // a catch-all here would otherwise swallow it into "unavailable".
+  const context = await resolveRequestContext();
   try {
     return await aggregateRuntimeProfile(
-      createPrismaPeopleReadRuntime(getDevelopmentSession()),
+      createPrismaPeopleReadRuntime(context),
       employeeId,
     );
   } catch {

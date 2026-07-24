@@ -6,6 +6,7 @@ import { DropdownMenu, MenuItem, Avatar } from "@/components/ui/overlay";
 import { Separator } from "@/components/ui/primitives";
 import { useAuthStore } from "@/stores/auth-store";
 import { CURRENT_USER } from "@/lib/mock-data";
+import { logoutAction } from "@/app/(auth)/logout/actions";
 
 export function UserMenu() {
   const router = useRouter();
@@ -60,10 +61,12 @@ export function UserMenu() {
           <MenuItem
             icon={LogOut}
             tone="danger"
-            onClick={() => {
+            onClick={async () => {
               close();
               signOut();
-              router.push("/login");
+              // logoutAction() always redirects to /login itself (a no-op
+              // session termination in development, a real one in production).
+              await logoutAction();
             }}
           >
             Sign out

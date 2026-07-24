@@ -38,6 +38,8 @@ const isReadRuntime = (file: SourceFile) =>
 const isPlatformCode = (file: SourceFile) => file.path.startsWith("src/platform/");
 const isDomainCommand = (file: SourceFile) =>
   file.path.startsWith("src/platform/people/commands/") || file.path.endsWith("employee-aggregate-root.ts");
+const isDevelopmentSessionAdapter = (file: SourceFile) => file.path === "src/platform/development-session.ts";
+const isAuthPlatformCode = (file: SourceFile) => file.path.startsWith("src/platform/auth/");
 
 const WRITE_RUNTIME_IMPORTS = [
   /^@prisma\/client/,
@@ -49,6 +51,26 @@ const WRITE_RUNTIME_IMPORTS = [
 
 const WRITE_RUNTIME_MODULE_IMPORTS = [/platform\/people\/commands\//, /platform\/submissions\//, /durable-application-runtime/];
 
+// Anything that lets a caller obtain or construct a TrustedRequestContext —
+// blocking these imports blocks constructing/supplying tenant, roles, or
+// permissions from the client just as effectively as blocking the fields.
+const TRUSTED_CONTEXT_CONSTRUCTION_IMPORTS = [
+  /platform\/runtime-context/,
+  /platform\/development-session/,
+  /platform\/auth\/production-request-context/,
+  /platform\/auth\/resolve-request-context/,
+  /platform\/context$/,
+];
+
+const AUTH_SECRET_IMPORTS = [
+  /platform\/auth\/password/,
+  /platform\/auth\/session-token/,
+  /platform\/env$/,
+  /platform\/auth\/production-auth-runtime/,
+  /platform\/auth\/prisma-user-repository/,
+  /platform\/auth\/prisma-session-repository/,
+];
+
 export const RULES: Rule[] = [
   {
     name: "client-components-must-not-import-write-runtime",
@@ -58,7 +80,7 @@ export const RULES: Rule[] = [
   {
     name: "server-actions-must-go-through-trusted-submission-gateway",
     appliesTo: isServerAction,
-    forbidden: WRITE_RUNTIME_IMPORTS,
+    forbidden: [...WRITE_RUNTIME_IMPORTS, /platform\/development-session/, /platform\/auth\/production-request-context/],
   },
   {
     name: "read-runtime-must-not-import-write-runtime",
@@ -73,12 +95,37 @@ export const RULES: Rule[] = [
   {
     name: "platform-must-not-import-nextjs-ui",
     appliesTo: isPlatformCode,
-    forbidden: [/^next\/(?!headers$|server$)/, /^src\/app\//, /^@\/app\//, /^@\/components\//],
+    forbidden: [/^next\/(?!headers$|server$|navigation$)/, /^src\/app\//, /^@\/app\//, /^@\/components\//],
   },
   {
     name: "domain-command-must-not-import-prisma",
     appliesTo: isDomainCommand,
     forbidden: [/^@prisma\/client/, /platform\/persistence\/prisma-client/],
+  },
+  {
+    name: "client-components-must-not-import-auth-secrets",
+    appliesTo: isClientComponent,
+    forbidden: AUTH_SECRET_IMPORTS,
+  },
+  {
+    name: "client-components-must-not-construct-trusted-context",
+    appliesTo: isClientComponent,
+    forbidden: TRUSTED_CONTEXT_CONSTRUCTION_IMPORTS,
+  },
+  {
+    name: "development-session-must-not-import-production-auth",
+    appliesTo: isDevelopmentSessionAdapter,
+    forbidden: [/platform\/auth\/production-/, /platform\/auth\/prisma-/, /platform\/auth\/login-service/],
+  },
+  {
+    name: "auth-code-must-not-import-people-ui",
+    appliesTo: isAuthPlatformCode,
+    forbidden: [/^@\/components\//, /^src\/app\/\(app\)\//, /^@\/app\/\(app\)\//],
+  },
+  {
+    name: "domain-command-must-not-import-session-apis",
+    appliesTo: isDomainCommand,
+    forbidden: [/^next-auth/, /^@auth\//, /^next\/headers$/, /^next\/navigation$/],
   },
 ];
 
