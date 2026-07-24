@@ -5,6 +5,7 @@
   "description": "AURA — Application Shell (Sprint 1 / Epic 1). UI-only enterprise shell.",
   "scripts": {
     "dev": "next dev",
+    "postinstall": "prisma generate",
     "build": "next build",
     "start": "next start",
     "lint": "next lint",
