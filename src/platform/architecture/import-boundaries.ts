@@ -51,8 +51,12 @@ const isOrganizationCode = (file: SourceFile) => file.path.startsWith("src/platf
 const ORGANIZATION_READ_REPOSITORY_FILES = new Set([
   "src/platform/organization/prisma-org-unit-read-repository.ts",
   "src/platform/organization/prisma-assignment-read-repository.ts",
+  "src/platform/organization/prisma-location-read-repository.ts",
 ]);
 const isOrganizationReadRepository = (file: SourceFile) => ORGANIZATION_READ_REPOSITORY_FILES.has(file.path);
+// Location is a dimension orthogonal to the OrgUnit tree (ADR-012 §5) — never
+// a node within it, never owned by it. OrgUnit code must never reach into it.
+const isOrgUnitCode = (file: SourceFile) => file.path.startsWith("src/platform/organization/org-unit");
 
 const WRITE_RUNTIME_IMPORTS = [
   /^@prisma\/client/,
@@ -103,8 +107,8 @@ const CONFIGURATION_PERSISTENCE_IMPORTS = [
 const WRITE_RUNTIME_MODULE_IMPORTS = [/platform\/people\/commands\//, /platform\/submissions\//, /durable-application-runtime/];
 
 // The Organization write side (ADR-012). The read repository — and any client —
-// must never reach these; writes go only through the OrgUnit/Assignment
-// services + their UnitOfWork.
+// must never reach these; writes go only through the OrgUnit/Assignment/
+// Location services + their UnitOfWork.
 const ORGANIZATION_WRITE_SIDE_IMPORTS = [
   /platform\/organization\/prisma-org-unit-write-repository/,
   /platform\/organization\/org-unit-write-transaction/,
@@ -116,6 +120,11 @@ const ORGANIZATION_WRITE_SIDE_IMPORTS = [
   /platform\/organization\/prisma-assignment-unit-of-work/,
   /platform\/organization\/in-memory-assignment-unit-of-work/,
   /platform\/organization\/assignment-service/,
+  /platform\/organization\/prisma-location-write-repository/,
+  /platform\/organization\/location-write-transaction/,
+  /platform\/organization\/prisma-location-unit-of-work/,
+  /platform\/organization\/in-memory-location-unit-of-work/,
+  /platform\/organization\/location-service/,
 ];
 
 // Server-only Organization composition a client component must never import.
@@ -123,6 +132,7 @@ const ORGANIZATION_SERVER_ONLY_IMPORTS = [
   ...ORGANIZATION_WRITE_SIDE_IMPORTS,
   /platform\/organization\/prisma-org-unit-read-repository/,
   /platform\/organization\/prisma-assignment-read-repository/,
+  /platform\/organization\/prisma-location-read-repository/,
 ];
 
 // Anything that lets a caller obtain or construct a TrustedRequestContext —
@@ -237,6 +247,13 @@ export const RULES: Rule[] = [
     name: "organization-must-not-import-configuration",
     appliesTo: isOrganizationCode,
     forbidden: [/platform\/configuration\//],
+  },
+  {
+    // ADR-012 §5: Location is orthogonal to the OrgUnit tree, not a node in
+    // it and never owned by it — OrgUnit must never reach into Location code.
+    name: "org-unit-must-not-import-location",
+    appliesTo: isOrgUnitCode,
+    forbidden: [/platform\/organization\/location/],
   },
 ];
 

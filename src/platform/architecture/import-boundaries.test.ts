@@ -226,6 +226,31 @@ describe("import boundary fitness rules (fixtures prove each rule actually catch
     const file: SourceFile = { path: "src/platform/organization/prisma-org-unit-read-repository.ts", content: `import type { PrismaClient } from "@prisma/client";\nimport { hasPermission } from "@/platform/context";\nimport type { OrgUnitReadRepository } from "@/platform/organization/org-unit-repository";\n` };
     expect(scanImportBoundaries([file])).toHaveLength(0);
   });
+
+  it("flags the location read repository importing the location write side (read model must stay read-only)", () => {
+    const file: SourceFile = { path: "src/platform/organization/prisma-location-read-repository.ts", content: `import { LocationService } from "@/platform/organization/location-service";\n` };
+    expect(scanImportBoundaries([file])).toContainEqual({ path: file.path, rule: "organization-read-repository-must-not-import-write-side", matchedImport: "@/platform/organization/location-service" });
+  });
+
+  it("flags a client component importing the location service (ADR-012 server composition)", () => {
+    const file: SourceFile = { path: "src/components/organization/bad-location-client.tsx", content: `"use client";\nimport { LocationService } from "@/platform/organization/location-service";\n` };
+    expect(scanImportBoundaries([file])).toContainEqual({ path: file.path, rule: "client-components-must-not-import-organization-server-composition", matchedImport: "@/platform/organization/location-service" });
+  });
+
+  it("does not flag the legitimate location read repository reading through Prisma with a permission gate", () => {
+    const file: SourceFile = { path: "src/platform/organization/prisma-location-read-repository.ts", content: `import type { PrismaClient } from "@prisma/client";\nimport { hasPermission } from "@/platform/context";\nimport type { LocationReadRepository } from "@/platform/organization/location-repository";\n` };
+    expect(scanImportBoundaries([file])).toHaveLength(0);
+  });
+
+  it("flags OrgUnit code importing Location (Location is orthogonal to the tree, never owned by OrgUnit)", () => {
+    const file: SourceFile = { path: "src/platform/organization/org-unit-service.ts", content: `import type { LocationRecord } from "@/platform/organization/location";\n` };
+    expect(scanImportBoundaries([file])).toContainEqual({ path: file.path, rule: "org-unit-must-not-import-location", matchedImport: "@/platform/organization/location" });
+  });
+
+  it("does not flag Location code importing OrgUnit-unrelated organization utilities (Location may stand alone)", () => {
+    const file: SourceFile = { path: "src/platform/organization/location-service.ts", content: `import { hasPermission } from "@/platform/context";\nimport { validateCreateLocationDraft } from "@/platform/organization/location";\n` };
+    expect(scanImportBoundaries([file])).toHaveLength(0);
+  });
 });
 
 describe("import boundary fitness rules — real codebase scan", () => {
