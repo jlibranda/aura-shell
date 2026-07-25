@@ -1,5 +1,6 @@
 import type { Metadata } from "next";
 import { AccessDenied } from "@/components/shared/access-denied";
+import { PageHeader } from "@/components/shared/page-header";
 import { LocationAdminView } from "@/components/settings/organization/location-admin-view";
 import { loadLocationsAdmin } from "@/platform/organization/admin/locations-admin-loader";
 
@@ -12,10 +13,7 @@ export default async function LocationsAdminPage() {
 
   return (
     <div className="mx-auto max-w-4xl">
-      <div className="mb-6">
-        <h1 className="text-xl font-semibold tracking-tight text-foreground">Locations</h1>
-        <p className="mt-0.5 text-sm text-muted-foreground">Physical and recognized work sites, orthogonal to the organization unit tree.</p>
-      </div>
+      <PageHeader title="Locations" description="Physical and recognized work sites, orthogonal to the organization unit tree." backHref="/settings/organization" />
       <LocationAdminView locations={result.locations} canManage={result.canManage} />
     </div>
   );

@@ -1,16 +1,13 @@
-import Link from "next/link";
-import { ArrowLeft, Briefcase } from "lucide-react";
+import { Briefcase } from "lucide-react";
+import { BackButton } from "@/components/shared/back-button";
 import { Avatar } from "@/components/ui/overlay";
 import { EmployeeStatusBadge } from "@/components/people/shared/employee-status-badge";
 import type { ProfileOverviewViewModel } from "@/platform/people/profile-runtime-loader";
 
-export function ProfileHeader({ overview }: { overview: ProfileOverviewViewModel }) {
+export function ProfileHeader({ overview, backHref }: { overview: ProfileOverviewViewModel; backHref: string }) {
   return (
     <div className="space-y-4">
-      <Link href="/people" className="inline-flex items-center gap-1.5 text-sm font-medium text-muted-foreground hover:text-foreground">
-        <ArrowLeft className="h-4 w-4" />
-        Back to directory
-      </Link>
+      <BackButton fallbackHref={backHref} />
       <div className="flex items-start gap-4">
         <Avatar name={overview.displayName} size="lg" className="h-16 w-16 text-lg" />
         <div className="min-w-0">

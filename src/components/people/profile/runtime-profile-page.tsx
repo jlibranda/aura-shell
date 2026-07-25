@@ -34,8 +34,9 @@ export function RuntimeProfilePage({
   organizationPath?: OrganizationPathSegment[];
 }) {
   if (result.kind !== "ready") return <ProfilePageState kind={result.kind} />;
+  const backHref = activeTab === "overview" ? "/people" : `/people/${result.overview.employeeId}`;
   return (
-    <ProfileShell overview={result.overview}>
+    <ProfileShell overview={result.overview} backHref={backHref}>
       {activeTab === "overview" ? <RuntimeProfileOverview overview={result.overview} /> : null}
       {activeTab === "employment" && employmentActions ? (
         <RuntimeProfileEmployment employment={result.employment} employeeId={result.overview.employeeId} employeeName={result.overview.displayName} employmentActions={employmentActions} />

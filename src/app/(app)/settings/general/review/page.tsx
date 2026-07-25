@@ -1,6 +1,7 @@
 import type { Metadata } from "next";
 import Link from "next/link";
 import { AccessDenied } from "@/components/shared/access-denied";
+import { PageHeader } from "@/components/shared/page-header";
 import { Card, EmptyState } from "@/components/ui/primitives";
 import { FileEdit } from "lucide-react";
 import { GeneralSettingsReviewActions } from "@/components/settings/general-settings-review-actions";
@@ -18,6 +19,7 @@ export default async function GeneralSettingsReviewPage() {
   if (!draft) {
     return (
       <div className="mx-auto max-w-3xl">
+        <PageHeader title="Review and publish" backHref="/settings/general" />
         <EmptyState icon={FileEdit} title="No draft to review" description="There are no unpublished changes right now." action={<Link href="/settings/general" className="text-sm font-medium text-primary hover:underline">Back to General settings</Link>} />
       </div>
     );
@@ -29,10 +31,7 @@ export default async function GeneralSettingsReviewPage() {
 
   return (
     <div className="mx-auto max-w-3xl">
-      <div className="mb-6">
-        <h1 className="text-xl font-semibold tracking-tight text-foreground">Review and publish</h1>
-        <p className="mt-0.5 text-sm text-muted-foreground">Choose when these changes take effect. Publishing does not affect anything until the effective date arrives.</p>
-      </div>
+      <PageHeader title="Review and publish" description="Choose when these changes take effect. Publishing does not affect anything until the effective date arrives." backHref="/settings/general" />
 
       {warnings.length > 0 ? (
         <Card className="mb-4 space-y-1.5 border-warning/30 bg-warning/5 p-4">

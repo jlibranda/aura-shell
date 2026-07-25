@@ -1,6 +1,7 @@
 import type { Metadata } from "next";
 import { ClipboardList } from "lucide-react";
 import { AccessDenied } from "@/components/shared/access-denied";
+import { PageHeader } from "@/components/shared/page-header";
 import { Card, EmptyState } from "@/components/ui/primitives";
 import { loadConfigurationAuditTrail } from "@/platform/configuration/general-settings-loader";
 
@@ -21,10 +22,7 @@ export default async function ConfigurationAuditPage() {
 
   return (
     <div className="mx-auto max-w-3xl">
-      <div className="mb-6">
-        <h1 className="text-xl font-semibold tracking-tight text-foreground">Audit and Diagnostics</h1>
-        <p className="mt-0.5 text-sm text-muted-foreground">Every configuration change is recorded immutably, with who made it and when.</p>
-      </div>
+      <PageHeader title="Audit and Diagnostics" description="Every configuration change is recorded immutably, with who made it and when." backHref="/settings" />
 
       {result.records.length === 0 ? (
         <EmptyState icon={ClipboardList} title="No configuration activity yet" description="Once someone creates, publishes, or discards a settings draft, it will show up here." />

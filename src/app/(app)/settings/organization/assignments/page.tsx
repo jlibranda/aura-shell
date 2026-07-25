@@ -1,5 +1,6 @@
 import type { Metadata } from "next";
 import { AccessDenied } from "@/components/shared/access-denied";
+import { PageHeader } from "@/components/shared/page-header";
 import { AssignmentAdminView } from "@/components/settings/organization/assignment-admin-view";
 import { loadAssignmentsAdmin } from "@/platform/organization/admin/assignments-admin-loader";
 
@@ -12,12 +13,11 @@ export default async function AssignmentsAdminPage() {
 
   return (
     <div className="mx-auto max-w-4xl">
-      <div className="mb-6">
-        <h1 className="text-xl font-semibold tracking-tight text-foreground">Assignment Diagnostics</h1>
-        <p className="mt-0.5 text-sm text-muted-foreground">
-          Tenant-wide placement oversight and correction — unassigned employees, placement review, and recovery tools. Day-to-day transfers happen from an employee&apos;s own profile.
-        </p>
-      </div>
+      <PageHeader
+        title="Assignment Diagnostics"
+        description="Tenant-wide placement oversight and correction — unassigned employees, placement review, and recovery tools. Day-to-day transfers happen from an employee's own profile."
+        backHref="/settings/organization"
+      />
       <AssignmentAdminView assignments={result.assignments} unassigned={result.unassigned} employees={result.employees} orgUnits={result.orgUnits} canManage={result.canManage} />
     </div>
   );

@@ -3,6 +3,7 @@
 import { useMemo, useState } from "react";
 import { CornerDownLeft, Send, Sparkles } from "lucide-react";
 import { CopilotAnswerView } from "@/components/people/copilot/copilot-answer-view";
+import { BackButton } from "@/components/shared/back-button";
 import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/primitives";
 import { peopleCopilot } from "@/lib/people/copilot/people-copilot-service";
@@ -42,13 +43,16 @@ export function PeopleCopilotPanel() {
 
   return (
     <div className="mx-auto max-w-3xl">
-      <div className="mb-5 flex items-center gap-3">
-        <span className="flex h-10 w-10 items-center justify-center rounded-xl bg-primary text-primary-foreground shadow-aura">
-          <Sparkles className="h-5 w-5" />
-        </span>
-        <div>
-          <h1 className="text-xl font-semibold tracking-tight text-foreground">People Copilot</h1>
-          <p className="text-sm text-muted-foreground">Ask about your people. Answers come straight from your records.</p>
+      <div className="mb-5">
+        <BackButton fallbackHref="/people" className="mb-2" />
+        <div className="flex items-center gap-3">
+          <span className="flex h-10 w-10 items-center justify-center rounded-xl bg-primary text-primary-foreground shadow-aura">
+            <Sparkles className="h-5 w-5" />
+          </span>
+          <div>
+            <h1 className="text-xl font-semibold tracking-tight text-foreground">People Copilot</h1>
+            <p className="text-sm text-muted-foreground">Ask about your people. Answers come straight from your records.</p>
+          </div>
         </div>
       </div>
 

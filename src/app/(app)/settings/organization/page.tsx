@@ -2,6 +2,7 @@ import type { Metadata } from "next";
 import Link from "next/link";
 import { Building2, MapPin, UserCog } from "lucide-react";
 import { AccessDenied } from "@/components/shared/access-denied";
+import { PageHeader } from "@/components/shared/page-header";
 import { Card, StatTile } from "@/components/ui/primitives";
 import { loadOrganizationOverview } from "@/platform/organization/admin/organization-overview-loader";
 
@@ -22,10 +23,7 @@ export default async function OrganizationOverviewPage() {
 
   return (
     <div className="mx-auto max-w-4xl">
-      <div className="mb-6">
-        <h1 className="text-xl font-semibold tracking-tight text-foreground">Organization</h1>
-        <p className="mt-0.5 text-sm text-muted-foreground">Organization units, work locations, and who is placed where.</p>
-      </div>
+      <PageHeader title="Organization" description="Organization units, work locations, and who is placed where." backHref="/settings" />
 
       <Card className="mb-6 grid grid-cols-2 gap-6 p-5 sm:grid-cols-3">
         <StatTile label="Active org units" value={String(counts.activeOrgUnits)} />
