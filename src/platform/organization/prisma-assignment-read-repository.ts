@@ -11,7 +11,7 @@ function requireOrganizationView(context: TenantContext): void {
 }
 
 function toRecord(value: {
-  id: string; tenantId: string; personId: string; orgUnitId: string; managerId: string | null;
+  id: string; tenantId: string; personId: string; orgUnitId: string; managerId: string | null; locationId: string | null;
   isPrimary: boolean; effectiveFrom: Date; effectiveUntil: Date | null;
   createdAt: Date; createdBy: string; updatedAt: Date;
 }): AssignmentRecord {
@@ -21,6 +21,7 @@ function toRecord(value: {
     personId: value.personId,
     orgUnitId: value.orgUnitId,
     ...(value.managerId ? { managerId: value.managerId } : {}),
+    ...(value.locationId ? { locationId: value.locationId } : {}),
     isPrimary: value.isPrimary,
     effectiveFrom: value.effectiveFrom.toISOString(),
     ...(value.effectiveUntil ? { effectiveUntil: value.effectiveUntil.toISOString() } : {}),

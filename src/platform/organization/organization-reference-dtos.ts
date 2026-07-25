@@ -1,4 +1,4 @@
-export type OrganizationReferenceType = "department" | "team" | "manager";
+export type OrganizationReferenceType = "department" | "team" | "manager" | "location";
 
 /** A verified display reference safe for application UI consumption. */
 export interface OrganizationReferenceDto {
@@ -16,4 +16,5 @@ export interface OrganizationSummaryDto {
   department?: OrganizationReferenceDto;
   team?: OrganizationReferenceDto;
   manager?: OrganizationReferenceDto;
+  location?: OrganizationReferenceDto;
 }

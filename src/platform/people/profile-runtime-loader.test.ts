@@ -123,6 +123,29 @@ describe("runtime profile view models", () => {
     }
   });
 
+  it("Employment prefers the Assignment-resolved location over the legacy Employee.workLocation when both are present", () => {
+    const result = toProfileEmploymentViewModel(profile, { location: { id: "loc-1", displayName: "Manila HQ", type: "location" } });
+    expect(result.location).toBe("Manila HQ");
+    expect(result.location).not.toBe(profile.location);
+  });
+
+  it("Work Information prefers the Assignment-resolved location over the legacy Employee.workLocation when both are present", () => {
+    const result = toProfileWorkInformationViewModel(profile, { location: { id: "loc-1", displayName: "Manila HQ", type: "location" } });
+    expect(result.location).toBe("Manila HQ");
+    expect(result.location).not.toBe(profile.location);
+  });
+
+  it("falls back to the legacy Employee.workLocation on every tab when there is no Assignment-resolved location yet", () => {
+    expect(toProfileOverviewViewModel(profile, {}).location).toBe(profile.location);
+    expect(toProfileWorkInformationViewModel(profile, {}).location).toBe(profile.location);
+    expect(toProfileEmploymentViewModel(profile, {}).location).toBe(profile.location);
+  });
+
+  it("Employment and Work Information never disagree about location — same source, same value, for the same organization summary", () => {
+    const organization = { location: { id: "loc-1", displayName: "Manila HQ", type: "location" as const } };
+    expect(toProfileEmploymentViewModel(profile, organization).location).toBe(toProfileWorkInformationViewModel(profile, organization).location);
+  });
+
   it("keeps tab boundaries narrow and non-overlapping", () => {
     expect(Object.keys(toProfileOverviewViewModel(profile))).toEqual([
       "employeeId", "employeeNumber", "displayName", "employmentStatus", "position", "location", "hireDate", "regularizationDate",
@@ -145,6 +168,22 @@ describe("runtime profile aggregation", () => {
     expect(app.profiles.findProfile).toHaveBeenCalledOnce();
     expect(app.profiles.findContact).toHaveBeenCalledOnce();
     expect(app.organizationPlacements.resolvePlacementSummary).toHaveBeenCalledOnce();
+  });
+
+  it("threads the Assignment-resolved location from organizationPlacements through to Overview, Work Information, and Employment alike", async () => {
+    const app = runtime({}, {
+      resolvePlacementSummary: vi.fn().mockResolvedValue({
+        manager: { id: "emp-2", displayName: "Maria Santos", type: "manager" },
+        location: { id: "loc-1", displayName: "Manila HQ", type: "location" },
+      }),
+    });
+    const result = await aggregateRuntimeProfile(app, "emp-1");
+    expect(result).toMatchObject({
+      kind: "ready",
+      overview: { location: "Manila HQ" },
+      workInformation: { location: "Manila HQ" },
+      employment: { location: "Manila HQ" },
+    });
   });
 
   it("keeps Work Information safe when organization resolution fails", async () => {

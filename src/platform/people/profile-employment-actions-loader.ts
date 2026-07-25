@@ -3,6 +3,7 @@ import { resolveRequestContext } from "@/platform/auth/resolve-request-context";
 import { createOrganizationAdminRuntime } from "@/platform/organization/organization-admin-runtime";
 import type { AssignmentRecord } from "@/platform/organization/assignment";
 import type { OrgUnitKind, OrgUnitRecord } from "@/platform/organization/org-unit";
+import type { LocationRecord } from "@/platform/organization/location";
 import type { OrganizationEmployeeDirectoryEntry } from "@/platform/organization/organization-employee-directory";
 
 /**
@@ -26,6 +27,9 @@ export interface EmploymentHistoryRow {
   assignmentId: string;
   orgUnitName: string;
   managerName?: string;
+  locationName?: string;
+  /** Set only when this placement's location differs from the immediately preceding one — the display name of that prior location. */
+  locationChangedFrom?: string;
   effectiveFrom: string;
   effectiveUntil?: string;
 }
@@ -37,8 +41,11 @@ export interface EmploymentActionsViewModel {
   canManage: boolean;
   currentOrgUnitId?: string;
   currentManagerId?: string;
+  currentLocationId?: string;
   orgUnitOptions: EmploymentPickerOption[];
   managerOptions: EmploymentPickerOption[];
+  /** Only ACTIVE locations — the Change Location picker's choices, sourced from Settings > Organization > Locations master data. */
+  locationOptions: EmploymentPickerOption[];
   history: EmploymentHistoryRow[];
   /** Root -> assigned unit, for the canonical OrganizationPath component. Empty when there's no current placement. */
   organizationPath: OrganizationPathSegment[];
@@ -48,6 +55,7 @@ const EMPTY_ACTIONS: EmploymentActionsViewModel = Object.freeze({
   canManage: false,
   orgUnitOptions: [],
   managerOptions: [],
+  locationOptions: [],
   history: [],
   organizationPath: [],
 });
@@ -57,32 +65,52 @@ export function toOrganizationPathSegments(path: readonly Pick<OrgUnitRecord, "i
   return path.map((unit) => ({ id: unit.id, name: unit.name, kind: unit.kind }));
 }
 
-/** Pure history-row shaping: assignment history -> display rows, most recent first. */
+/**
+ * Pure history-row shaping: assignment history -> display rows, most recent
+ * first. Location changes are computed by walking the history in
+ * chronological order first (each row compared against the placement
+ * immediately before it), then reversing for display — the same
+ * effective-dated Assignment history this always resolved from, no parallel
+ * change-tracking system.
+ */
 export function toEmploymentHistoryRows(
   history: readonly AssignmentRecord[],
   orgUnitNames: ReadonlyMap<string, string>,
   employeeNames: ReadonlyMap<string, string>,
+  locationNames: ReadonlyMap<string, string> = new Map(),
 ): EmploymentHistoryRow[] {
-  return [...history]
-    .sort((a, b) => b.effectiveFrom.localeCompare(a.effectiveFrom))
-    .map((assignment) => ({
+  const chronological = [...history].sort((a, b) => a.effectiveFrom.localeCompare(b.effectiveFrom));
+  const rows: EmploymentHistoryRow[] = [];
+  let previousLocationId: string | undefined;
+  let hasPrevious = false;
+  for (const assignment of chronological) {
+    const locationChanged = hasPrevious && assignment.locationId !== previousLocationId;
+    rows.push({
       assignmentId: assignment.id,
       orgUnitName: orgUnitNames.get(assignment.orgUnitId) ?? assignment.orgUnitId,
       ...(assignment.managerId ? { managerName: employeeNames.get(assignment.managerId) ?? assignment.managerId } : {}),
+      ...(assignment.locationId ? { locationName: locationNames.get(assignment.locationId) ?? assignment.locationId } : {}),
+      ...(locationChanged && previousLocationId ? { locationChangedFrom: locationNames.get(previousLocationId) ?? previousLocationId } : {}),
       effectiveFrom: assignment.effectiveFrom,
       ...(assignment.effectiveUntil ? { effectiveUntil: assignment.effectiveUntil } : {}),
-    }));
+    });
+    previousLocationId = assignment.locationId;
+    hasPrevious = true;
+  }
+  return rows.reverse();
 }
 
-/** Pure picker shaping: active org units become the Transfer picker, every other employee becomes a manager candidate. */
+/** Pure picker shaping: active org units become the Transfer picker, every other employee becomes a manager candidate, active locations become the Change Location picker. */
 export function toEmploymentPickerOptions(
   orgUnits: readonly Pick<OrgUnitRecord, "id" | "name" | "code" | "status">[],
   employees: readonly OrganizationEmployeeDirectoryEntry[],
   employeeId: string,
-): { orgUnitOptions: EmploymentPickerOption[]; managerOptions: EmploymentPickerOption[] } {
+  locations: readonly Pick<LocationRecord, "id" | "name" | "code" | "status">[] = [],
+): { orgUnitOptions: EmploymentPickerOption[]; managerOptions: EmploymentPickerOption[]; locationOptions: EmploymentPickerOption[] } {
   return {
     orgUnitOptions: orgUnits.filter((unit) => unit.status === "ACTIVE").map((unit) => ({ id: unit.id, label: `${unit.name} (${unit.code})` })),
     managerOptions: employees.filter((employee) => employee.id !== employeeId).map((employee) => ({ id: employee.id, label: employee.displayName })),
+    locationOptions: locations.filter((location) => location.status === "ACTIVE").map((location) => ({ id: location.id, label: `${location.name} (${location.code})` })),
   };
 }
 
@@ -103,15 +131,17 @@ export async function loadEmploymentActionsSurface(employeeId: string): Promise<
   const runtime = createOrganizationAdminRuntime(request);
   if (!hasPermission(runtime.context, "organization.view")) return EMPTY_ACTIONS;
 
-  const [currentPlacement, history, orgUnits, employees] = await Promise.all([
+  const [currentPlacement, history, orgUnits, employees, locations] = await Promise.all([
     runtime.queries.resolveCurrentPlacement(runtime.context, employeeId),
     runtime.queries.resolveAssignmentHistory(runtime.context, employeeId),
     runtime.orgUnits.read.listAll(runtime.context),
     runtime.employees.listAll(runtime.context.tenantId),
+    runtime.locations.read.listAll(runtime.context),
   ]);
 
   const orgUnitNames = new Map(orgUnits.map((unit) => [unit.id, unit.name]));
   const employeeNames = new Map(employees.map((employee) => [employee.id, employee.displayName]));
+  const locationNames = new Map(locations.map((location) => [location.id, location.name]));
   const organizationPath = currentPlacement
     ? toOrganizationPathSegments(await runtime.queries.resolveOrgPath(runtime.context, currentPlacement.assignment.orgUnitId))
     : [];
@@ -120,8 +150,9 @@ export async function loadEmploymentActionsSurface(employeeId: string): Promise<
     canManage: hasPermission(runtime.context, "organization.manage"),
     ...(currentPlacement ? { currentOrgUnitId: currentPlacement.assignment.orgUnitId } : {}),
     ...(currentPlacement?.assignment.managerId ? { currentManagerId: currentPlacement.assignment.managerId } : {}),
-    ...toEmploymentPickerOptions(orgUnits, employees, employeeId),
-    history: toEmploymentHistoryRows(history, orgUnitNames, employeeNames),
+    ...(currentPlacement?.assignment.locationId ? { currentLocationId: currentPlacement.assignment.locationId } : {}),
+    ...toEmploymentPickerOptions(orgUnits, employees, employeeId, locations),
+    history: toEmploymentHistoryRows(history, orgUnitNames, employeeNames, locationNames),
     organizationPath,
   };
 }

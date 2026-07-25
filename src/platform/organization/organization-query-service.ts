@@ -6,10 +6,11 @@ import { collectDescendantIds, type OrgUnitKind, type OrgUnitRecord } from "@/pl
 import { primaryAsOf, type AssignmentRecord } from "@/platform/organization/assignment";
 import type { LocationRecord } from "@/platform/organization/location";
 
-/** A person's current primary placement: the Assignment and the OrgUnit it names. */
+/** A person's current primary placement: the Assignment, the OrgUnit it names, and its Location, if any. */
 export interface CurrentPlacement {
   assignment: AssignmentRecord;
   orgUnit: OrgUnitRecord;
+  location?: LocationRecord;
 }
 
 /**
@@ -23,11 +24,10 @@ export interface CurrentPlacement {
  * names. Turning an id into a name for UI display is a People-domain concern
  * (see `@/platform/people/read-models/organization-placement-service.ts`).
  *
- * Location has no linkage to Assignment yet (Assignment carries no
- * `locationId` — that was explicitly deferred in Epic 7B.2/7B.3, and adding
- * it is a write-side aggregate change out of this slice's read-only scope).
- * `resolveLocationById`/`resolveLocationByCode` are therefore standalone
- * lookups, not part of `resolveCurrentPlacement`.
+ * `resolveLocationById`/`resolveLocationByCode` remain standalone lookups for
+ * callers that only have a Location id (e.g. a picker); `resolveCurrentPlacement`
+ * additionally resolves the placement's own Location, via Assignment.locationId,
+ * when one is set.
  */
 export class OrganizationQueryService {
   constructor(
@@ -68,13 +68,14 @@ export class OrganizationQueryService {
     return this.assignments.listCurrentPrimary(context);
   }
 
-  /** A person's current assignment together with the OrgUnit it names, or undefined if the person has none. */
+  /** A person's current assignment together with the OrgUnit (and, if set, the Location) it names, or undefined if the person has none. */
   async resolveCurrentPlacement(context: TenantContext, personId: string): Promise<CurrentPlacement | undefined> {
     const assignment = await this.assignments.getCurrentForPerson(context, personId);
     if (!assignment) return undefined;
     const orgUnit = await this.orgUnits.getById(context, assignment.orgUnitId);
     if (!orgUnit) return undefined;
-    return Object.freeze({ assignment, orgUnit });
+    const location = assignment.locationId ? await this.locations.getById(context, assignment.locationId) : undefined;
+    return Object.freeze({ assignment, orgUnit, ...(location ? { location } : {}) });
   }
 
   /**

@@ -1,5 +1,6 @@
 import type { TenantContext } from "@/platform/context";
 import type { OrgUnitWriteRepository } from "@/platform/organization/org-unit-repository";
+import type { LocationWriteRepository } from "@/platform/organization/location-repository";
 import type { PersonExistenceRepository } from "@/platform/organization/person-existence-repository";
 import type { AssignmentRecord } from "@/platform/organization/assignment";
 
@@ -8,6 +9,7 @@ export interface AssignPrimaryInput {
   personId: string;
   orgUnitId: string;
   managerId?: string;
+  locationId?: string;
   effectiveFrom: string;
   createdBy: string;
 }
@@ -36,13 +38,14 @@ export interface AssignmentWriteRepository {
 
 /**
  * Transaction-scoped repositories exposed to the Assignment write service via
- * UnitOfWork.execute(). `orgUnits` and `people` are read-only existence checks
- * against the live tenant data inside the same transaction — the write
- * service never mutates either through this port.
+ * UnitOfWork.execute(). `orgUnits`, `locations`, and `people` are read-only
+ * existence checks against the live tenant data inside the same transaction —
+ * the write service never mutates any of them through this port.
  */
 export type AssignmentTransactionRepositories = Readonly<{
   assignments: AssignmentWriteRepository;
   orgUnits: OrgUnitWriteRepository;
+  locations: LocationWriteRepository;
   people: PersonExistenceRepository;
 }>;
 

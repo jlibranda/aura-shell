@@ -27,10 +27,20 @@ function harness(tenantId = "tenant-a") {
   const reader = new InMemoryAssignmentReadRepository(unitOfWork.getStore());
   const readContext = (t = tenantId) => ({ tenantId: t, actorId: "user-1", actorName: "A", roles: ["hr_admin"] as PlatformRole[], permissions: { has: () => true, toArray: () => [] } as never, correlationId: "c", authenticationMethod: "test", actorProvenance: "server_verified" as const });
 
-  // Seed a valid org unit and two known employees so create-side existence checks pass by default.
+  // Seed a valid org unit, an active location, and two known employees so create-side existence checks pass by default.
   unitOfWork.getOrgUnitStore().units.push(Object.freeze({
     id: "ou1", tenantId, code: "OU1", name: "Unit 1", kind: "TEAM" as const, status: "ACTIVE" as const,
     createdAt: "2026-01-01T00:00:00.000Z", createdBy: "actor", updatedAt: "2026-01-01T00:00:00.000Z",
+  }));
+  unitOfWork.getLocationStore().locations.push(Object.freeze({
+    id: "loc1", tenantId, code: "LOC1", name: "Location 1",
+    address: { line1: "1 Main St", city: "Manila" }, countryCode: "PH", timezone: "Asia/Manila",
+    status: "ACTIVE" as const, createdAt: "2026-01-01T00:00:00.000Z", createdBy: "actor", updatedAt: "2026-01-01T00:00:00.000Z",
+  }));
+  unitOfWork.getLocationStore().locations.push(Object.freeze({
+    id: "loc2", tenantId, code: "LOC2", name: "Location 2 (archived)",
+    address: { line1: "2 Main St", city: "Manila" }, countryCode: "PH", timezone: "Asia/Manila",
+    status: "ARCHIVED" as const, createdAt: "2026-01-01T00:00:00.000Z", createdBy: "actor", updatedAt: "2026-01-01T00:00:00.000Z",
   }));
   unitOfWork.getPeople().add(tenantId, "p1");
   unitOfWork.getPeople().add(tenantId, "p2");
@@ -97,15 +107,58 @@ describe("AssignmentService — assignPrimary", () => {
   });
 });
 
-describe("AssignmentService — transfer", () => {
-  async function seedCurrent() {
-    const h = harness();
-    const request = requestFor(["hr_admin"], MANAGE);
-    const first = await h.service.assignPrimary(request, { personId: "p1", orgUnitId: "ou1", effectiveFrom: "2026-01-01" });
-    if (first.kind !== "success") throw new Error("seed failed");
-    return { ...h, request, firstId: first.value.assignment.id };
-  }
+describe("AssignmentService — assignPrimary with locationId", () => {
+  it("accepts an assignment with a valid, active locationId", async () => {
+    const { service } = harness();
+    const result = await service.assignPrimary(requestFor(["hr_admin"], MANAGE), { personId: "p1", orgUnitId: "ou1", locationId: "loc1", effectiveFrom: "2026-01-01" });
+    expect(result.kind).toBe("success");
+    if (result.kind === "success") expect(result.value.assignment.locationId).toBe("loc1");
+  });
 
+  it("accepts an assignment without a locationId — location remains optional", async () => {
+    const { service } = harness();
+    const result = await service.assignPrimary(requestFor(["hr_admin"], MANAGE), { personId: "p1", orgUnitId: "ou1", effectiveFrom: "2026-01-01" });
+    expect(result.kind).toBe("success");
+    if (result.kind === "success") expect(result.value.assignment.locationId).toBeUndefined();
+  });
+
+  it("rejects a locationId that does not exist", async () => {
+    const { service } = harness();
+    const result = await service.assignPrimary(requestFor(["hr_admin"], MANAGE), { personId: "p1", orgUnitId: "ou1", locationId: "ghost-loc", effectiveFrom: "2026-01-01" });
+    expect(result.kind).toBe("validation_failure");
+    if (result.kind === "validation_failure") expect(result.issues.some((i) => i.path.join(".") === "locationId" && i.code === "not_found")).toBe(true);
+  });
+
+  it("rejects an archived location", async () => {
+    const { service } = harness();
+    const result = await service.assignPrimary(requestFor(["hr_admin"], MANAGE), { personId: "p1", orgUnitId: "ou1", locationId: "loc2", effectiveFrom: "2026-01-01" });
+    expect(result.kind).toBe("validation_failure");
+    if (result.kind === "validation_failure") expect(result.issues.some((i) => i.path.join(".") === "locationId" && i.code === "archived")).toBe(true);
+  });
+
+  it("does not let tenant B use tenant A's location", async () => {
+    const h = harness("tenant-a");
+    // Seed tenant B with its own person/org unit, but not tenant A's location.
+    h.unitOfWork.getOrgUnitStore().units.push(Object.freeze({
+      id: "ou-b", tenantId: "tenant-b", code: "OUB", name: "Unit B", kind: "TEAM" as const, status: "ACTIVE" as const,
+      createdAt: "2026-01-01T00:00:00.000Z", createdBy: "actor", updatedAt: "2026-01-01T00:00:00.000Z",
+    }));
+    h.unitOfWork.getPeople().add("tenant-b", "p1");
+    const result = await h.service.assignPrimary(requestFor(["hr_admin"], MANAGE, "tenant-b"), { personId: "p1", orgUnitId: "ou-b", locationId: "loc1", effectiveFrom: "2026-01-01" });
+    expect(result.kind).toBe("validation_failure");
+    if (result.kind === "validation_failure") expect(result.issues.some((i) => i.path.join(".") === "locationId" && i.code === "not_found")).toBe(true);
+  });
+});
+
+async function seedCurrent() {
+  const h = harness();
+  const request = requestFor(["hr_admin"], MANAGE);
+  const first = await h.service.assignPrimary(request, { personId: "p1", orgUnitId: "ou1", effectiveFrom: "2026-01-01" });
+  if (first.kind !== "success") throw new Error("seed failed");
+  return { ...h, request, firstId: first.value.assignment.id };
+}
+
+describe("AssignmentService — transfer", () => {
   it("ends the current placement and opens a new one, atomically", async () => {
     const { service, request, firstId, reader, readContext } = await seedCurrent();
     const result = await service.transfer(request, { personId: "p1", orgUnitId: "ou1", managerId: "p2", effectiveFrom: "2026-06-01" });
@@ -138,6 +191,48 @@ describe("AssignmentService — transfer", () => {
     const { service, request } = await seedCurrent();
     const result = await service.transfer(request, { personId: "p1", orgUnitId: "ou1", effectiveFrom: "2026-01-01" });
     expect(result.kind).toBe("validation_failure");
+  });
+});
+
+describe("AssignmentService — transfer changing only location (Change Location)", () => {
+  it("changes locationId while the org unit and manager are passed through unchanged", async () => {
+    const { service, request } = await seedCurrent();
+    await service.transfer(request, { personId: "p1", orgUnitId: "ou1", managerId: "p2", locationId: "loc1", effectiveFrom: "2026-03-01" });
+    const result = await service.transfer(request, { personId: "p1", orgUnitId: "ou1", managerId: "p2", locationId: "loc1", effectiveFrom: "2026-06-01" });
+    expect(result.kind).toBe("success");
+    if (result.kind === "success") {
+      expect(result.value.assignment.orgUnitId).toBe("ou1");
+      expect(result.value.assignment.managerId).toBe("p2");
+      expect(result.value.assignment.locationId).toBe("loc1");
+    }
+  });
+
+  it("rejects changing to a location that does not exist", async () => {
+    const { service, request } = await seedCurrent();
+    const result = await service.transfer(request, { personId: "p1", orgUnitId: "ou1", locationId: "ghost-loc", effectiveFrom: "2026-06-01" });
+    expect(result.kind).toBe("validation_failure");
+    if (result.kind === "validation_failure") expect(result.issues.some((i) => i.path.join(".") === "locationId")).toBe(true);
+  });
+});
+
+describe("AssignmentService — transfer preserves an unrelated field when only one field changes", () => {
+  it("an organization transfer that explicitly passes through the current locationId keeps it (org-unit-only change)", async () => {
+    const { service, request } = await seedCurrent();
+    await service.transfer(request, { personId: "p1", orgUnitId: "ou1", locationId: "loc1", effectiveFrom: "2026-03-01" });
+    const result = await service.transfer(request, { personId: "p1", orgUnitId: "ou1", locationId: "loc1", effectiveFrom: "2026-06-01" });
+    expect(result.kind).toBe("success");
+    if (result.kind === "success") expect(result.value.assignment.locationId).toBe("loc1");
+  });
+
+  it("a manager change that explicitly passes through the current locationId keeps it (manager-only change)", async () => {
+    const { service, request } = await seedCurrent();
+    await service.transfer(request, { personId: "p1", orgUnitId: "ou1", locationId: "loc1", effectiveFrom: "2026-03-01" });
+    const result = await service.transfer(request, { personId: "p1", orgUnitId: "ou1", managerId: "p2", locationId: "loc1", effectiveFrom: "2026-06-01" });
+    expect(result.kind).toBe("success");
+    if (result.kind === "success") {
+      expect(result.value.assignment.managerId).toBe("p2");
+      expect(result.value.assignment.locationId).toBe("loc1");
+    }
   });
 });
 

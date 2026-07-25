@@ -5,6 +5,7 @@ import { AuthorizationError } from "@/platform/errors";
 import { AssignmentStore, InMemoryAssignmentReadRepository } from "@/platform/organization/in-memory-assignment-repository";
 import { OrgUnitStore, InMemoryOrgUnitReadRepository } from "@/platform/organization/in-memory-org-unit-repository";
 import { LocationStore, InMemoryLocationReadRepository } from "@/platform/organization/in-memory-location-repository";
+import type { LocationRecord } from "@/platform/organization/location";
 import { OrganizationQueryService } from "@/platform/organization/organization-query-service";
 import type { AssignmentRecord } from "@/platform/organization/assignment";
 import type { OrgUnitRecord } from "@/platform/organization/org-unit";
@@ -49,7 +50,16 @@ function harness(employeeRecords: readonly { id: string; displayName: string }[]
   );
   const employees = fakeEmployeeLookup(employeeRecords);
   const service = new PrismaOrganizationPlacementService(query, employees);
-  return { service, assignmentStore, orgUnitStore, employees };
+  return { service, assignmentStore, orgUnitStore, locationStore, employees };
+}
+
+function location(overrides: Partial<LocationRecord> = {}): LocationRecord {
+  return Object.freeze({
+    id: "loc1", tenantId: "tenant-a", code: "MNL", name: "Manila HQ",
+    address: { line1: "1 Main St", city: "Manila" }, countryCode: "PH", timezone: "Asia/Manila", status: "ACTIVE",
+    createdAt: "2026-01-01T00:00:00.000Z", createdBy: "actor", updatedAt: "2026-01-01T00:00:00.000Z",
+    ...overrides,
+  });
 }
 
 describe("PrismaOrganizationPlacementService — resolvePlacementSummary", () => {
@@ -98,6 +108,23 @@ describe("PrismaOrganizationPlacementService — resolvePlacementSummary", () =>
   it("requires people.read", async () => {
     const { service } = harness();
     await expect(service.resolvePlacementSummary(context([]), "p1")).rejects.toBeInstanceOf(AuthorizationError);
+  });
+
+  it("resolves the assignment's Location when it has one", async () => {
+    const { service, assignmentStore, orgUnitStore, locationStore } = harness();
+    orgUnitStore.units.push(orgUnit({ id: "team", kind: "TEAM" }));
+    locationStore.locations.push(location({ id: "loc1", name: "Manila HQ" }));
+    assignmentStore.assignments.push(assignment({ orgUnitId: "team", locationId: "loc1" }));
+    const summary = await service.resolvePlacementSummary(context(), "p1");
+    expect(summary.location).toEqual({ id: "loc1", displayName: "Manila HQ", type: "location" });
+  });
+
+  it("omits location from the summary when the assignment has none", async () => {
+    const { service, assignmentStore, orgUnitStore } = harness();
+    orgUnitStore.units.push(orgUnit({ id: "team", kind: "TEAM" }));
+    assignmentStore.assignments.push(assignment({ orgUnitId: "team" }));
+    const summary = await service.resolvePlacementSummary(context(), "p1");
+    expect(summary.location).toBeUndefined();
   });
 });
 

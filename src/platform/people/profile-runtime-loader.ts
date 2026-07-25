@@ -67,8 +67,24 @@ export type RuntimeProfilePageResult =
   | { kind: "unauthorized" }
   | { kind: "unavailable" };
 
+/**
+ * The authoritative work Location for display: Assignment.locationId (via
+ * OrganizationPlacementService, resolved against real Location master data)
+ * when the placement has one, falling back to the profile's legacy
+ * free-text location field only when it doesn't. Every screen that
+ * displays a "Location" field must go through this — never read
+ * profile.location directly on its own — so Employment, Work Information,
+ * and Overview can never disagree about where an employee is located. The
+ * legacy fallback is isolated here so it can be deleted in one place once
+ * Location assignment is fully rolled out and the legacy field is retired.
+ */
+function resolveDisplayLocation(profile: EmployeeProfileReadModel, organization: OrganizationSummaryDto): string {
+  return organization.location?.displayName ?? profile.location;
+}
+
 export function toProfileOverviewViewModel(
   profile: EmployeeProfileReadModel,
+  organization: OrganizationSummaryDto = {},
 ): ProfileOverviewViewModel {
   return {
     employeeId: profile.id,
@@ -76,7 +92,7 @@ export function toProfileOverviewViewModel(
     displayName: profile.displayName,
     employmentStatus: profile.status,
     position: profile.position,
-    location: profile.location,
+    location: resolveDisplayLocation(profile, organization),
     hireDate: profile.hireDate,
     regularizationDate: profile.regularizationDate,
   };
@@ -93,7 +109,7 @@ export function toProfileWorkInformationViewModel(
     department: organization.department?.displayName,
     team: organization.team?.displayName,
     manager: organization.manager?.displayName,
-    location: profile.location,
+    location: resolveDisplayLocation(profile, organization),
     hireDate: profile.hireDate,
     regularizationDate: profile.regularizationDate,
   };
@@ -110,7 +126,7 @@ export function toProfileEmploymentViewModel(
     department: organization.department?.displayName,
     team: organization.team?.displayName,
     manager: organization.manager?.displayName,
-    location: profile.location,
+    location: resolveDisplayLocation(profile, organization),
     hireDate: profile.hireDate,
     regularizationDate: profile.regularizationDate,
   };
@@ -165,7 +181,7 @@ export async function aggregateRuntimeProfile(
     ]);
     return {
       kind: "ready",
-      overview: toProfileOverviewViewModel(profile),
+      overview: toProfileOverviewViewModel(profile, organization),
       workInformation: toProfileWorkInformationViewModel(profile, organization),
       employment: toProfileEmploymentViewModel(profile, organization),
       contactInformation,

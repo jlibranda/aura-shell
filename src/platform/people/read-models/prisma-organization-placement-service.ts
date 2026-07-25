@@ -70,6 +70,7 @@ export class PrismaOrganizationPlacementService implements OrganizationPlacement
       ...(department ? { department: Object.freeze({ id: department.id, displayName: department.name, type: "department" as const }) } : {}),
       ...(team ? { team: Object.freeze({ id: team.id, displayName: team.name, type: "team" as const }) } : {}),
       ...(managerId && managerName ? { manager: Object.freeze({ id: managerId, displayName: managerName, type: "manager" as const }) } : {}),
+      ...(placement.location ? { location: Object.freeze({ id: placement.location.id, displayName: placement.location.name, type: "location" as const }) } : {}),
     });
   }
 
