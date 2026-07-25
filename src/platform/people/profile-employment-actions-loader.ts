@@ -5,6 +5,17 @@ import type { AssignmentRecord } from "@/platform/organization/assignment";
 import type { OrgUnitRecord } from "@/platform/organization/org-unit";
 import type { OrganizationEmployeeDirectoryEntry } from "@/platform/organization/organization-employee-directory";
 
+/**
+ * Deliberately not imported from the OrganizationPath component — platform
+ * code must not depend on @/components (see the
+ * platform-must-not-import-nextjs-ui architecture-fitness rule). The two
+ * declarations are kept structurally identical rather than shared.
+ */
+export interface OrganizationPathSegment {
+  id: string;
+  name: string;
+}
+
 export interface EmploymentPickerOption {
   id: string;
   label: string;
@@ -28,6 +39,8 @@ export interface EmploymentActionsViewModel {
   orgUnitOptions: EmploymentPickerOption[];
   managerOptions: EmploymentPickerOption[];
   history: EmploymentHistoryRow[];
+  /** Root -> assigned unit, for the canonical OrganizationPath component. Empty when there's no current placement. */
+  organizationPath: OrganizationPathSegment[];
 }
 
 const EMPTY_ACTIONS: EmploymentActionsViewModel = Object.freeze({
@@ -35,7 +48,13 @@ const EMPTY_ACTIONS: EmploymentActionsViewModel = Object.freeze({
   orgUnitOptions: [],
   managerOptions: [],
   history: [],
+  organizationPath: [],
 });
+
+/** Pure: OrgUnitRecord path -> the minimal shape OrganizationPath renders. */
+export function toOrganizationPathSegments(path: readonly Pick<OrgUnitRecord, "id" | "name">[]): OrganizationPathSegment[] {
+  return path.map((unit) => ({ id: unit.id, name: unit.name }));
+}
 
 /** Pure history-row shaping: assignment history -> display rows, most recent first. */
 export function toEmploymentHistoryRows(
@@ -92,6 +111,9 @@ export async function loadEmploymentActionsSurface(employeeId: string): Promise<
 
   const orgUnitNames = new Map(orgUnits.map((unit) => [unit.id, unit.name]));
   const employeeNames = new Map(employees.map((employee) => [employee.id, employee.displayName]));
+  const organizationPath = currentPlacement
+    ? toOrganizationPathSegments(await runtime.queries.resolveOrgPath(runtime.context, currentPlacement.assignment.orgUnitId))
+    : [];
 
   return {
     canManage: hasPermission(runtime.context, "organization.manage"),
@@ -99,5 +121,24 @@ export async function loadEmploymentActionsSurface(employeeId: string): Promise<
     ...(currentPlacement?.assignment.managerId ? { currentManagerId: currentPlacement.assignment.managerId } : {}),
     ...toEmploymentPickerOptions(orgUnits, employees, employeeId),
     history: toEmploymentHistoryRows(history, orgUnitNames, employeeNames),
+    organizationPath,
   };
+}
+
+/**
+ * Lightweight sibling of loadEmploymentActionsSurface for screens that only
+ * need the organization path (e.g. Work Information) — skips the picker
+ * options and history payload loadEmploymentActionsSurface also computes.
+ * Same OrganizationQueryService, same graceful degradation.
+ */
+export async function loadOrganizationPathForEmployee(employeeId: string): Promise<OrganizationPathSegment[]> {
+  const request = await resolveRequestContext();
+  const runtime = createOrganizationAdminRuntime(request);
+  if (!hasPermission(runtime.context, "organization.view")) return [];
+
+  const currentPlacement = await runtime.queries.resolveCurrentPlacement(runtime.context, employeeId);
+  if (!currentPlacement) return [];
+
+  const path = await runtime.queries.resolveOrgPath(runtime.context, currentPlacement.assignment.orgUnitId);
+  return toOrganizationPathSegments(path);
 }
