@@ -75,6 +75,40 @@ const isOrganizationAdminRuntime = (file: SourceFile) => file.path === "src/plat
 // directly — so there is exactly one place that composes the runtime.
 const isSettingsOrganizationAdminUiCode = (file: SourceFile) =>
   file.path.startsWith("src/platform/organization/admin/") || file.path.startsWith("src/app/(app)/settings/organization/");
+// UX refinement: the Employee Profile > Employment tab's Transfer / Change
+// Manager / End Placement actions and their supporting read loader. Same
+// "must go through the runtime" rule as Settings — a second entry point to
+// the same AssignmentService, not a second write path.
+const isPeopleEmploymentWriteSurfaceCode = (file: SourceFile) =>
+  file.path === "src/platform/people/profile-employment-actions-loader.ts" ||
+  file.path.startsWith("src/app/(app)/people/[employeeId]/employment/");
+
+// Everything a Settings-organization-admin-UI file (or the People employment
+// write surface) must reach only through createOrganizationAdminRuntime,
+// never directly. Importing a *-service.ts module for its exported result
+// *types* is not forbidden — both callers use the service only via
+// runtime.orgUnits.service etc., never by constructing the service class
+// themselves, which is what this list actually guards against.
+const ORGANIZATION_RUNTIME_BYPASS_IMPORTS = [
+  /^@prisma\/client/,
+  /platform\/persistence\/prisma-client/,
+  /platform\/organization\/prisma-org-unit-write-repository/,
+  /platform\/organization\/org-unit-write-transaction/,
+  /platform\/organization\/prisma-org-unit-unit-of-work/,
+  /platform\/organization\/in-memory-org-unit-unit-of-work/,
+  /platform\/organization\/prisma-assignment-write-repository/,
+  /platform\/organization\/assignment-write-transaction/,
+  /platform\/organization\/prisma-assignment-unit-of-work/,
+  /platform\/organization\/in-memory-assignment-unit-of-work/,
+  /platform\/organization\/prisma-location-write-repository/,
+  /platform\/organization\/location-write-transaction/,
+  /platform\/organization\/prisma-location-unit-of-work/,
+  /platform\/organization\/in-memory-location-unit-of-work/,
+  /platform\/organization\/prisma-org-unit-read-repository/,
+  /platform\/organization\/prisma-assignment-read-repository/,
+  /platform\/organization\/prisma-location-read-repository/,
+  /platform\/organization\/prisma-organization-employee-directory/,
+];
 
 const WRITE_RUNTIME_IMPORTS = [
   /^@prisma\/client/,
@@ -321,26 +355,12 @@ export const RULES: Rule[] = [
     // themselves, which is what this rule actually guards against.
     name: "settings-organization-admin-ui-must-not-bypass-runtime",
     appliesTo: (file) => isSettingsOrganizationAdminUiCode(file) && !isOrganizationAdminRuntime(file),
-    forbidden: [
-      /^@prisma\/client/,
-      /platform\/persistence\/prisma-client/,
-      /platform\/organization\/prisma-org-unit-write-repository/,
-      /platform\/organization\/org-unit-write-transaction/,
-      /platform\/organization\/prisma-org-unit-unit-of-work/,
-      /platform\/organization\/in-memory-org-unit-unit-of-work/,
-      /platform\/organization\/prisma-assignment-write-repository/,
-      /platform\/organization\/assignment-write-transaction/,
-      /platform\/organization\/prisma-assignment-unit-of-work/,
-      /platform\/organization\/in-memory-assignment-unit-of-work/,
-      /platform\/organization\/prisma-location-write-repository/,
-      /platform\/organization\/location-write-transaction/,
-      /platform\/organization\/prisma-location-unit-of-work/,
-      /platform\/organization\/in-memory-location-unit-of-work/,
-      /platform\/organization\/prisma-org-unit-read-repository/,
-      /platform\/organization\/prisma-assignment-read-repository/,
-      /platform\/organization\/prisma-location-read-repository/,
-      /platform\/organization\/prisma-organization-employee-directory/,
-    ],
+    forbidden: ORGANIZATION_RUNTIME_BYPASS_IMPORTS,
+  },
+  {
+    name: "people-employment-write-surface-must-not-bypass-runtime",
+    appliesTo: isPeopleEmploymentWriteSurfaceCode,
+    forbidden: ORGANIZATION_RUNTIME_BYPASS_IMPORTS,
   },
 ];
 

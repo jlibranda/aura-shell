@@ -10,7 +10,7 @@ import { Drawer, DrawerFooterActions } from "@/components/ui/drawer";
 import { ConfirmDialog } from "@/components/ui/confirm-dialog";
 import { FormField, Input } from "@/components/ui/form";
 import { toast } from "@/components/ui/toast";
-import { commandErrorMessage, fieldErrorsFrom } from "@/components/settings/organization/command-result-helpers";
+import { commandErrorMessage, fieldErrorsFrom } from "@/components/shared/command-result-helpers";
 import { createLocationAction, updateLocationAction, archiveLocationAction } from "@/app/(app)/settings/organization/locations/actions";
 import type { AddressInput, LocationRecord } from "@/platform/organization/location";
 

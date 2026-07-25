@@ -11,7 +11,7 @@ import { FormField } from "@/components/ui/form";
 import { Select } from "@/components/ui/combobox";
 import { DatePicker } from "@/components/ui/date-picker";
 import { toast } from "@/components/ui/toast";
-import { fieldErrorsFrom } from "@/components/settings/organization/command-result-helpers";
+import { fieldErrorsFrom } from "@/components/shared/command-result-helpers";
 import { assignOrTransferAction, endAssignmentAction } from "@/app/(app)/settings/organization/assignments/actions";
 import type { AssignmentAdminRow } from "@/platform/organization/organization-admin-dtos";
 import type { OrgUnitRecord } from "@/platform/organization/org-unit";

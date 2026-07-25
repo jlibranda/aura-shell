@@ -5,6 +5,7 @@ import { RuntimeProfileWorkInformation } from "@/components/people/profile/runti
 import { RuntimeProfileEmployment } from "@/components/people/profile/runtime-profile-employment";
 import { RuntimeProfileDeferredTab } from "@/components/people/profile/runtime-profile-deferred-tab";
 import type { RuntimeProfilePageResult } from "@/platform/people/profile-runtime-loader";
+import type { EmploymentActionsViewModel } from "@/platform/people/profile-employment-actions-loader";
 
 export type RuntimeProfileActiveTab =
   | "overview"
@@ -22,15 +23,20 @@ export type RuntimeProfileActiveTab =
 export function RuntimeProfilePage({
   result,
   activeTab,
+  employmentActions,
 }: {
   result: RuntimeProfilePageResult;
   activeTab: RuntimeProfileActiveTab;
+  /** Only meaningful (and only fetched) when activeTab is "employment". */
+  employmentActions?: EmploymentActionsViewModel;
 }) {
   if (result.kind !== "ready") return <ProfilePageState kind={result.kind} />;
   return (
     <ProfileShell overview={result.overview}>
       {activeTab === "overview" ? <RuntimeProfileOverview overview={result.overview} /> : null}
-      {activeTab === "employment" ? <RuntimeProfileEmployment employment={result.employment} /> : null}
+      {activeTab === "employment" && employmentActions ? (
+        <RuntimeProfileEmployment employment={result.employment} employeeId={result.overview.employeeId} employeeName={result.overview.displayName} employmentActions={employmentActions} />
+      ) : null}
       {activeTab === "work-information" ? <RuntimeProfileWorkInformation workInformation={result.workInformation} /> : null}
       {activeTab === "contact-information" ? <RuntimeProfileContactInformation contactInformation={result.contactInformation} /> : null}
       {isDeferredTab(activeTab) ? <RuntimeProfileDeferredTab title={deferredTabTitle(activeTab)} /> : null}

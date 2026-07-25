@@ -2,8 +2,8 @@ import type { CommandResult } from "@/platform/commands/command-result";
 
 /**
  * A single, generic translation of any non-success CommandResult into a
- * user-safe message — used by every Organization admin drawer/dialog so a
- * validation issue, conflict, permission denial, or infrastructure failure
+ * user-safe message — used by every drawer/dialog that submits a command so
+ * a validation issue, conflict, permission denial, or infrastructure failure
  * never surfaces a raw Prisma/SQL error, stack trace, or internal name.
  */
 export function commandErrorMessage(result: CommandResult<unknown>): string {
