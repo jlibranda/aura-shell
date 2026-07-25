@@ -39,6 +39,7 @@ export class InMemoryOrgUnitWriteRepository implements OrgUnitWriteRepository {
     const unit: OrgUnitRecord = Object.freeze({
       id: randomUUID(),
       tenantId: input.tenantId,
+      legalEntityId: input.legalEntityId,
       code: input.code,
       name: input.name,
       kind: input.kind,

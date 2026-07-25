@@ -41,6 +41,7 @@ export class InMemoryAssignmentWriteRepository implements AssignmentWriteReposit
       id: randomUUID(),
       tenantId: input.tenantId,
       personId: input.personId,
+      legalEntityId: input.legalEntityId,
       orgUnitId: input.orgUnitId,
       ...(input.managerId ? { managerId: input.managerId } : {}),
       ...(input.locationId ? { locationId: input.locationId } : {}),

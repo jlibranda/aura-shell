@@ -1,6 +1,6 @@
 import type { Metadata } from "next";
 import Link from "next/link";
-import { Building2, MapPin, UserCog } from "lucide-react";
+import { Building2, Landmark, MapPin, UserCog } from "lucide-react";
 import { AccessDenied } from "@/components/shared/access-denied";
 import { PageHeader } from "@/components/shared/page-header";
 import { Card, StatTile } from "@/components/ui/primitives";
@@ -10,6 +10,7 @@ export const metadata: Metadata = { title: "Organization" };
 export const dynamic = "force-dynamic";
 
 const SECTIONS = [
+  { href: "/settings/organization/legal-entities", title: "Legal Entities", description: "Registered employers of record. Every organization unit belongs to exactly one.", icon: Landmark },
   { href: "/settings/organization/org-units", title: "Organization Units", description: "Divisions, business units, departments, branches, and teams.", icon: Building2 },
   { href: "/settings/organization/locations", title: "Locations", description: "Physical and recognized work sites.", icon: MapPin },
   { href: "/settings/organization/assignments", title: "Assignment Diagnostics", description: "Tenant-wide placement oversight and correction — everyday transfers happen from an employee's profile.", icon: UserCog },
@@ -26,6 +27,8 @@ export default async function OrganizationOverviewPage() {
       <PageHeader title="Organization" description="Organization units, work locations, and who is placed where." backHref="/settings" />
 
       <Card className="mb-6 grid grid-cols-2 gap-6 p-5 sm:grid-cols-3">
+        <StatTile label="Active legal entities" value={String(counts.activeLegalEntities)} />
+        <StatTile label="Archived legal entities" value={String(counts.archivedLegalEntities)} />
         <StatTile label="Active org units" value={String(counts.activeOrgUnits)} />
         <StatTile label="Archived org units" value={String(counts.archivedOrgUnits)} />
         <StatTile label="Active locations" value={String(counts.activeLocations)} />

@@ -6,9 +6,9 @@ import { loadOrganizationPathForEmployee } from "@/platform/people/profile-emplo
 export const metadata: Metadata = { title: "Work Information" };
 
 export default async function WorkInformationRoute({ params }: { params: { employeeId: string } }) {
-  const [result, organizationPath] = await Promise.all([
+  const [result, organization] = await Promise.all([
     loadRuntimeProfile(params.employeeId),
     loadOrganizationPathForEmployee(params.employeeId),
   ]);
-  return <RuntimeProfilePage result={result} activeTab="work-information" organizationPath={organizationPath} />;
+  return <RuntimeProfilePage result={result} activeTab="work-information" organizationPath={organization.organizationPath} legalEntity={organization.legalEntity} />;
 }

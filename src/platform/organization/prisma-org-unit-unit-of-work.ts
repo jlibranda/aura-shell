@@ -12,6 +12,7 @@ import { toOutboxMessage } from "@/platform/outbox/outbox-message";
 import { PrismaOrgUnitWriteRepository } from "@/platform/organization/prisma-org-unit-write-repository";
 import { OrgUnitWriteTransaction } from "@/platform/organization/org-unit-write-transaction";
 import type { OrgUnitTransactionRepositories } from "@/platform/organization/org-unit-repository";
+import { PrismaLegalEntityWriteRepository } from "@/platform/organization/prisma-legal-entity-write-repository";
 import type { UnitOfWork, UnitOfWorkContext, UnitOfWorkTransaction } from "@/platform/transactions/unit-of-work";
 import type { DomainEvent } from "@/platform/events/domain-event";
 
@@ -44,7 +45,8 @@ export class PrismaOrgUnitUnitOfWork implements UnitOfWork<OrgUnitTransactionRep
     const transactionContext = Object.freeze({ ...context, transactionId: this.transactionIds.next() });
     const committed = await this.prisma.$transaction(async (client) => {
       const orgUnits = new OrgUnitWriteTransaction(new PrismaOrgUnitWriteRepository(client), transactionContext);
-      const transaction = Object.freeze({ context: transactionContext, repositories: Object.freeze({ orgUnits }) });
+      const legalEntities = new PrismaLegalEntityWriteRepository(client);
+      const transaction = Object.freeze({ context: transactionContext, repositories: Object.freeze({ orgUnits, legalEntities }) });
       const result = await operation(transaction);
       const events = orgUnits.pullEvents();
       const records = this.createAuditRecords(transactionContext, events);

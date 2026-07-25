@@ -6,13 +6,13 @@ import { createCreateEmployeeCommand } from "@/platform/people/commands/create-e
 import { emptyRuntimeHireDraft, emptyRuntimeHireReferences, toRuntimeHireViewModel, validateRuntimeHireStep } from "@/platform/people/runtime-hire-view-model";
 
 function validDraft() {
-  return { ...emptyRuntimeHireDraft(), personal: { firstName: "Ana", middleName: "", lastName: "Domingo", preferredName: "", dateOfBirth: "1994-02-01", gender: "female", maritalStatus: "single", nationality: "Filipino" }, contact: { personalEmail: "", workEmail: "ana@work.example", mobileNumber: "+63 917 000 0000", homeAddress: "" }, employment: { departmentId: "dep-1", teamId: "", position: "Analyst", managerId: "", employmentType: "regular", hireDate: "2024-02-01", workLocation: "Manila" }, emergency: { name: "", relationship: "", mobileNumber: "", email: "", address: "" } };
+  return { ...emptyRuntimeHireDraft(), personal: { firstName: "Ana", middleName: "", lastName: "Domingo", preferredName: "", dateOfBirth: "1994-02-01", gender: "female", maritalStatus: "single", nationality: "Filipino" }, contact: { personalEmail: "", workEmail: "ana@work.example", mobileNumber: "+63 917 000 0000", homeAddress: "" }, employment: { legalEntityId: "le-1", orgUnitId: "dep-1", locationId: "loc-1", position: "Analyst", managerId: "", employmentType: "regular", hireDate: "2024-02-01" }, emergency: { name: "", relationship: "", mobileNumber: "", email: "", address: "" } };
 }
 
 describe("runtime hire parity boundary", () => {
-  it("registers all 31 legacy editable fields with controlled dispositions", () => {
-    expect(RUNTIME_HIRE_FIELD_MANIFEST).toHaveLength(31);
-    expect(new Set(RUNTIME_HIRE_FIELD_MANIFEST.map((field) => field.id)).size).toBe(31);
+  it("registers all 33 legacy + current editable fields with controlled dispositions", () => {
+    expect(RUNTIME_HIRE_FIELD_MANIFEST).toHaveLength(33);
+    expect(new Set(RUNTIME_HIRE_FIELD_MANIFEST.map((field) => field.id)).size).toBe(33);
     for (const field of RUNTIME_HIRE_FIELD_MANIFEST) expect(RUNTIME_HIRE_FIELD_DISPOSITIONS).toContain(field.disposition);
   });
 

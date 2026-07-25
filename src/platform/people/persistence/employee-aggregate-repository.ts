@@ -5,7 +5,16 @@ export type EmployeeAggregateDraft = Readonly<{
   displayName: string;
   personal: Readonly<{ firstName: string; middleName: string; lastName: string; preferredName: string; dateOfBirth: string; gender: string; maritalStatus: string; nationality: string }>;
   contact: Readonly<{ personalEmail: string; workEmail: string; mobileNumber: string; homeAddress: string }>;
-  employment: Readonly<{ departmentId: string; teamId: string; position: string; managerId: string; employmentType: string; hireDate: string; workLocation: string }>;
+  /**
+   * departmentId/teamId/workLocation are LEGACY placement fields (ADR-012 §7)
+   * — retained only for backward compatibility with the pre-Assignment
+   * schema. The command layer no longer treats them as authoritative; the
+   * durable hire handler derives them from the selected OrgUnit/Location
+   * purely to keep these still-NOT-NULL-except-workLocation columns
+   * populated. workLocation specifically is never written for new hires —
+   * pass null.
+   */
+  employment: Readonly<{ departmentId: string; teamId: string; position: string; managerId: string; employmentType: string; hireDate: string; workLocation: string | null }>;
   emergencyContact: Readonly<{ name: string; relationship: string; mobileNumber: string; email: string; address: string }>;
 }>;
 

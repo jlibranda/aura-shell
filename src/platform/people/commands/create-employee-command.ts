@@ -3,7 +3,18 @@ import { invalid, issue, valid, type ValidationResult } from "@/platform/validat
 
 type HirePersonal = Readonly<{ firstName: string; middleName: string; lastName: string; preferredName: string; dateOfBirth: string | null; gender: string; maritalStatus: string; nationality: string }>;
 type HireContact = Readonly<{ personalEmail: string; workEmail: string; mobileNumber: string; homeAddress: string }>;
-type HireEmployment = Readonly<{ departmentId: string; teamId: string; position: string; managerId: string; employmentType: string; hireDate: string | null; workLocation: string }>;
+/**
+ * Placement fields resolve through the Organization domain (ADR-012/ADR-013),
+ * not legacy denormalized strings: legalEntityId names the employer of record
+ * (a real LegalEntity), orgUnitId names a real OrgUnit belonging to that
+ * legal entity (any kind — Business Unit, Division, Department, Branch, or
+ * Team; the hierarchy is recursive, not a fixed set of levels), locationId
+ * names a real Location. All three become the employee's initial primary
+ * Assignment, not Employee.departmentId/teamId/workLocation. legalEntityId is
+ * fixed at Hire and is not editable afterward in this slice (ADR-013 §3) —
+ * an inter-entity transfer workflow is a future, explicitly-triggered slice.
+ */
+type HireEmployment = Readonly<{ legalEntityId: string; orgUnitId: string; locationId: string; position: string; managerId: string; employmentType: string; hireDate: string | null }>;
 type HireEmergencyContact = Readonly<{ name: string; relationship: string; mobileNumber: string; email: string; address: string }>;
 
 export type CreateEmployeeCommand = Readonly<ApplicationCommand<"people.employee.create"> & {
@@ -56,11 +67,12 @@ export function validateCreateEmployeeCommand(command: CreateEmployeeCommand): V
   if (!emailPattern.test(contact.workEmail.trim())) issues.push(issue("contact.workEmail", "invalid_email", "A valid work email is required."));
   if (contact.personalEmail && !emailPattern.test(contact.personalEmail.trim())) issues.push(issue("contact.personalEmail", "invalid_email", "Personal email is invalid."));
   if (!phonePattern.test(contact.mobileNumber.trim())) issues.push(issue("contact.mobileNumber", "invalid_phone", "A valid mobile number is required."));
-  if (!required(employment.departmentId)) issues.push(issue("employment.departmentId", "required", "Department is required."));
+  if (!required(employment.legalEntityId)) issues.push(issue("employment.legalEntityId", "required", "Legal entity is required."));
+  if (!required(employment.orgUnitId)) issues.push(issue("employment.orgUnitId", "required", "Organization unit is required."));
   if (!required(employment.position)) issues.push(issue("employment.position", "required", "Position is required."));
   if (!employmentTypes.has(employment.employmentType)) issues.push(issue("employment.employmentType", "invalid_enum", "Employment type is invalid."));
   if (!dateIsValid(employment.hireDate)) issues.push(issue("employment.hireDate", "invalid_date", "A valid hire date is required."));
-  if (!required(employment.workLocation)) issues.push(issue("employment.workLocation", "required", "Work location is required."));
+  if (!required(employment.locationId)) issues.push(issue("employment.locationId", "required", "Location is required."));
   if (dateIsValid(personal.dateOfBirth) && dateIsValid(employment.hireDate) && employment.hireDate! < personal.dateOfBirth!) issues.push(issue("employment.hireDate", "inconsistent_dates", "Hire date cannot be before birth date."));
   if (Object.values(emergencyContact).some(Boolean)) {
     if (!required(emergencyContact.name)) issues.push(issue("emergencyContact.name", "required", "Emergency contact name is required."));

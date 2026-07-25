@@ -11,12 +11,13 @@ function requireOrganizationView(context: TenantContext): void {
 }
 
 function toRecord(value: {
-  id: string; tenantId: string; code: string; name: string; kind: string; parentId: string | null;
+  id: string; tenantId: string; legalEntityId: string; code: string; name: string; kind: string; parentId: string | null;
   status: string; createdAt: Date; createdBy: string; updatedAt: Date;
 }): OrgUnitRecord {
   return Object.freeze({
     id: value.id,
     tenantId: value.tenantId,
+    legalEntityId: value.legalEntityId,
     code: value.code,
     name: value.name,
     kind: value.kind as OrgUnitKind,

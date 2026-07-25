@@ -114,7 +114,14 @@ reference, or a derived view — not an aggregate. Reporting lines are derived
 from Assignment; cost centers and position titles are attributes until a
 consumer earns them.
 
-### Legal Entity is intentionally deferred
+### Legal Entity is intentionally deferred (superseded — see ADR-013)
+
+> **Status update, 2026-07-25:** The deferral below is historical. ADR-013
+> supersedes it: Legal Entity is now adopted as a first-class aggregate,
+> triggered by a real single-tenant, multiple-employers-of-record requirement
+> arriving one slice ahead of Payroll/multi-country. The reasoning below is
+> preserved as the record of why the deferral was correct at the time it was
+> made; it is no longer the current rule. See ADR-013 for the current design.
 
 The review treated Legal Entity as an aggregate. **This ADR defers it.** There
 is no concrete consumer today: Payroll (which runs per statutory entity) and
@@ -268,7 +275,9 @@ denormalized status persisted ahead of a demonstrated need.
   typed OrgUnit instead.
 - **Premature Legal Entity** — no consumer until Payroll or multi-country;
   adopting it now is speculative structure. Deferred with an explicit trigger and
-  a non-breaking introduction path (§5).
+  a non-breaking introduction path (§5). *(Historical — superseded by ADR-013:
+  the trigger fired, one slice ahead of Payroll/multi-country, when a real
+  single-tenant, multiple-employers-of-record requirement emerged.)*
 
 ## 12. Architectural invariants
 

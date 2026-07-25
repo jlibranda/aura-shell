@@ -79,7 +79,7 @@ export type RuntimeProfilePageResult =
  * Location assignment is fully rolled out and the legacy field is retired.
  */
 function resolveDisplayLocation(profile: EmployeeProfileReadModel, organization: OrganizationSummaryDto): string {
-  return organization.location?.displayName ?? profile.location;
+  return organization.location?.displayName ?? profile.location ?? "Not available";
 }
 
 export function toProfileOverviewViewModel(

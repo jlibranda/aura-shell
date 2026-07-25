@@ -6,6 +6,7 @@ import { InMemoryDomainEventCollector } from "@/platform/events/domain-event-col
 import { InMemoryAssignmentUnitOfWork } from "@/platform/organization/in-memory-assignment-unit-of-work";
 import { InMemoryAssignmentReadRepository } from "@/platform/organization/in-memory-assignment-repository";
 import { AssignmentService } from "@/platform/organization/assignment-service";
+import type { LegalEntityRecord } from "@/platform/organization/legal-entity";
 
 function requestFor(roles: readonly PlatformRole[], permissions: readonly Permission[] = [], tenantId = "tenant-a"): TrustedRequestContext {
   return createTrustedRequestContext({
@@ -19,6 +20,14 @@ function requestFor(roles: readonly PlatformRole[], permissions: readonly Permis
 
 const MANAGE: Permission[] = ["organization.view", "organization.manage"];
 
+function legalEntity(overrides: Partial<LegalEntityRecord> = {}): LegalEntityRecord {
+  return Object.freeze({
+    id: "le1", tenantId: "tenant-a", code: "LE1", legalName: "Acme Corp", countryCode: "PH", status: "ACTIVE" as const,
+    createdAt: "2026-01-01T00:00:00.000Z", createdBy: "actor", updatedAt: "2026-01-01T00:00:00.000Z",
+    ...overrides,
+  });
+}
+
 function harness(tenantId = "tenant-a") {
   const audit = new InMemoryAuditCollector();
   const events = new InMemoryDomainEventCollector();
@@ -27,9 +36,10 @@ function harness(tenantId = "tenant-a") {
   const reader = new InMemoryAssignmentReadRepository(unitOfWork.getStore());
   const readContext = (t = tenantId) => ({ tenantId: t, actorId: "user-1", actorName: "A", roles: ["hr_admin"] as PlatformRole[], permissions: { has: () => true, toArray: () => [] } as never, correlationId: "c", authenticationMethod: "test", actorProvenance: "server_verified" as const });
 
-  // Seed a valid org unit, an active location, and two known employees so create-side existence checks pass by default.
+  // Seed an active legal entity, a valid org unit belonging to it, an active location, and two known employees so create-side existence checks pass by default.
+  unitOfWork.getLegalEntityStore().legalEntities.push(legalEntity({ tenantId }));
   unitOfWork.getOrgUnitStore().units.push(Object.freeze({
-    id: "ou1", tenantId, code: "OU1", name: "Unit 1", kind: "TEAM" as const, status: "ACTIVE" as const,
+    id: "ou1", tenantId, legalEntityId: "le1", code: "OU1", name: "Unit 1", kind: "TEAM" as const, status: "ACTIVE" as const,
     createdAt: "2026-01-01T00:00:00.000Z", createdBy: "actor", updatedAt: "2026-01-01T00:00:00.000Z",
   }));
   unitOfWork.getLocationStore().locations.push(Object.freeze({
@@ -138,9 +148,10 @@ describe("AssignmentService — assignPrimary with locationId", () => {
 
   it("does not let tenant B use tenant A's location", async () => {
     const h = harness("tenant-a");
-    // Seed tenant B with its own person/org unit, but not tenant A's location.
+    // Seed tenant B with its own legal entity, person, and org unit, but not tenant A's location.
+    h.unitOfWork.getLegalEntityStore().legalEntities.push(legalEntity({ id: "le-b", tenantId: "tenant-b", code: "LEB" }));
     h.unitOfWork.getOrgUnitStore().units.push(Object.freeze({
-      id: "ou-b", tenantId: "tenant-b", code: "OUB", name: "Unit B", kind: "TEAM" as const, status: "ACTIVE" as const,
+      id: "ou-b", tenantId: "tenant-b", legalEntityId: "le-b", code: "OUB", name: "Unit B", kind: "TEAM" as const, status: "ACTIVE" as const,
       createdAt: "2026-01-01T00:00:00.000Z", createdBy: "actor", updatedAt: "2026-01-01T00:00:00.000Z",
     }));
     h.unitOfWork.getPeople().add("tenant-b", "p1");
@@ -283,5 +294,69 @@ describe("AssignmentService — transaction rollback", () => {
     await service.assignPrimary(requestFor(["hr_admin"], MANAGE), { personId: "p1", orgUnitId: "ou1", managerId: "p1", effectiveFrom: "2026-01-01" });
     expect(events.list()).toHaveLength(0);
     expect(audit.list()).toHaveLength(0);
+  });
+});
+
+describe("AssignmentService — Legal Entity (ADR-013 §3)", () => {
+  it("assignPrimary stamps the new Assignment with the chosen OrgUnit's Legal Entity", async () => {
+    const { service } = harness();
+    const result = await service.assignPrimary(requestFor(["hr_admin"], MANAGE), { personId: "p1", orgUnitId: "ou1", effectiveFrom: "2026-01-01" });
+    expect(result.kind).toBe("success");
+    if (result.kind === "success") expect(result.value.assignment.legalEntityId).toBe("le1");
+  });
+
+  it("accepts a caller-asserted legalEntityId that matches the OrgUnit's actual Legal Entity", async () => {
+    const { service } = harness();
+    const result = await service.assignPrimary(requestFor(["hr_admin"], MANAGE), { personId: "p1", orgUnitId: "ou1", legalEntityId: "le1", effectiveFrom: "2026-01-01" });
+    expect(result.kind).toBe("success");
+  });
+
+  it("rejects a caller-asserted legalEntityId that does not match the OrgUnit's actual Legal Entity (cross-entity OrgUnit rejected server-side)", async () => {
+    const { service, unitOfWork } = harness();
+    unitOfWork.getLegalEntityStore().legalEntities.push(legalEntity({ id: "le2", code: "LE2" }));
+    const result = await service.assignPrimary(requestFor(["hr_admin"], MANAGE), { personId: "p1", orgUnitId: "ou1", legalEntityId: "le2", effectiveFrom: "2026-01-01" });
+    expect(result.kind).toBe("validation_failure");
+    if (result.kind === "validation_failure") expect(result.issues.some((i) => i.path.join(".") === "orgUnitId" && i.code === "cross_entity")).toBe(true);
+  });
+
+  it("rejects placement into an OrgUnit whose Legal Entity is archived", async () => {
+    const { service, unitOfWork } = harness();
+    unitOfWork.getLegalEntityStore().legalEntities[0] = legalEntity({ status: "ARCHIVED" });
+    const result = await service.assignPrimary(requestFor(["hr_admin"], MANAGE), { personId: "p1", orgUnitId: "ou1", effectiveFrom: "2026-01-01" });
+    expect(result.kind).toBe("validation_failure");
+    if (result.kind === "validation_failure") expect(result.issues.some((i) => i.path.join(".") === "legalEntityId" && i.code === "archived")).toBe(true);
+  });
+
+  it("an ordinary transfer preserves the current placement's Legal Entity", async () => {
+    const { service, request } = await seedCurrent();
+    const result = await service.transfer(request, { personId: "p1", orgUnitId: "ou1", effectiveFrom: "2026-06-01" });
+    expect(result.kind).toBe("success");
+    if (result.kind === "success") expect(result.value.assignment.legalEntityId).toBe("le1");
+  });
+
+  it("rejects transferring into an OrgUnit owned by a different Legal Entity (no inter-entity transfer in this slice)", async () => {
+    const { service, request, unitOfWork } = await seedCurrent();
+    unitOfWork.getLegalEntityStore().legalEntities.push(legalEntity({ id: "le2", code: "LE2" }));
+    unitOfWork.getOrgUnitStore().units.push(Object.freeze({
+      id: "ou2", tenantId: "tenant-a", legalEntityId: "le2", code: "OU2", name: "Unit 2", kind: "TEAM" as const, status: "ACTIVE" as const,
+      createdAt: "2026-01-01T00:00:00.000Z", createdBy: "actor", updatedAt: "2026-01-01T00:00:00.000Z",
+    }));
+    const result = await service.transfer(request, { personId: "p1", orgUnitId: "ou2", effectiveFrom: "2026-06-01" });
+    expect(result.kind).toBe("validation_failure");
+    if (result.kind === "validation_failure") expect(result.issues.some((i) => i.path.join(".") === "orgUnitId" && i.code === "cross_entity")).toBe(true);
+  });
+
+  it("a manager-only change (transfer with the same org unit) preserves Legal Entity", async () => {
+    const { service, request } = await seedCurrent();
+    const result = await service.transfer(request, { personId: "p1", orgUnitId: "ou1", managerId: "p2", effectiveFrom: "2026-06-01" });
+    expect(result.kind).toBe("success");
+    if (result.kind === "success") expect(result.value.assignment.legalEntityId).toBe("le1");
+  });
+
+  it("a location-only change (transfer with the same org unit) preserves Legal Entity", async () => {
+    const { service, request } = await seedCurrent();
+    const result = await service.transfer(request, { personId: "p1", orgUnitId: "ou1", locationId: "loc1", effectiveFrom: "2026-06-01" });
+    expect(result.kind).toBe("success");
+    if (result.kind === "success") expect(result.value.assignment.legalEntityId).toBe("le1");
   });
 });

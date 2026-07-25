@@ -11,7 +11,7 @@ function revalidateOrgUnits() {
   revalidatePath("/settings/organization/org-units");
 }
 
-export async function createOrgUnitAction(input: { code: string; name: string; kind: string; parentId?: string }): Promise<CommandResult<OrgUnitCreated>> {
+export async function createOrgUnitAction(input: { legalEntityId: string; code: string; name: string; kind: string; parentId?: string }): Promise<CommandResult<OrgUnitCreated>> {
   const request = await resolveRequestContext();
   const runtime = createOrganizationAdminRuntime(request);
   const result = await runtime.orgUnits.service.createOrgUnit(request, input);

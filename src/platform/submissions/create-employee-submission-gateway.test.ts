@@ -7,7 +7,7 @@ import type { SubmissionIdempotencyRepository } from "@/platform/submissions/sub
 const command = createCreateEmployeeCommand({
   personal: { firstName: "Gateway", middleName: "", lastName: "Employee", preferredName: "", dateOfBirth: "1994-02-01", gender: "female", maritalStatus: "single", nationality: "Filipino" },
   contact: { personalEmail: "", workEmail: "gateway.employee@example.test", mobileNumber: "+63 917 000 0000", homeAddress: "" },
-  employment: { departmentId: "dep-fin", teamId: "", position: "Analyst", managerId: "", employmentType: "regular", hireDate: "2024-02-01", workLocation: "Manila" },
+  employment: { legalEntityId: "le-1", orgUnitId: "dep-fin", locationId: "loc-1", position: "Analyst", managerId: "", employmentType: "regular", hireDate: "2024-02-01" },
   emergencyContact: { name: "", relationship: "", mobileNumber: "", email: "", address: "" },
 });
 const authenticated = () => createTrustedRequestContext({ principal: { subjectId: "gateway-subject", userId: "gateway-user", tenantId: "nw-ph", authenticationMethod: "server-test", authenticatedAt: "2026-07-23T00:00:00.000Z" }, roles: ["hr_admin"], permissions: ["people.employee.hire"], actorProvenance: "server_verified", correlationId: "gateway-correlation" });
