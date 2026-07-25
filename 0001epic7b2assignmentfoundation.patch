@@ -1,0 +1,1905 @@
+From 2c5529c57cd232c44eaf5016773ca51fe1dee4c4 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Fri, 24 Jul 2026 14:04:01 +0000
+Subject: [PATCH] Epic 7B.2: Assignment Foundation (ADR-012)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Adds Assignment as the authoritative, effective-dated placement of a person
+into the organization — the source of truth for org unit and primary manager
+over time, superseding the denormalized Employee.department/team/manager/
+workLocation fields (retained as legacy, not removed).
+
+- Assignment aggregate + validation + pure effective-date helpers
+  (half-open [effectiveFrom, effectiveUntil) windows, overlap detection)
+- Schema + migration: composite tenant-scoped FKs to Employee (person,
+  manager) and OrgUnit; CHECK constraints (no self-manager, valid window);
+  a GIST exclusion constraint enforcing at most one primary assignment in
+  force per person at any instant — verified against real Postgres
+- Write/read repositories (Prisma + in-memory), event-buffering write
+  transaction, and a UnitOfWork committing assignment + audit + outbox
+  atomically, mirroring the OrgUnit platform pattern
+- AssignmentService: assignPrimary, transfer (end + create, atomically),
+  and endAssignment, each validating person/manager/org-unit existence
+  in-transaction before hitting the database guards; organization.manage
+  gated
+- Architecture fitness rules extended for the Assignment write/read
+  boundary; a structural test guards a single Assignment aggregate, a
+  single overlap implementation, and a single service
+- 37 unit tests + 6 real-Postgres integration tests (atomicity, DB-level
+  guards, GIST exclusion, tenant isolation, cross-tenant FK rejection)
+
+Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_012xkyMKxXWptQtBxJmKLszv
+---
+ .../migration.sql                             |  57 ++++++
+ prisma/schema.prisma                          | 150 +++++++++-----
+ .../architecture/import-boundaries.test.ts    |  15 ++
+ .../architecture/import-boundaries.ts         |  15 +-
+ .../organization/assignment-events.ts         |  49 +++++
+ .../assignment-platform.integration.test.ts   | 168 +++++++++++++++
+ .../organization/assignment-repository.ts     |  58 ++++++
+ .../organization/assignment-service.test.ts   | 192 ++++++++++++++++++
+ .../organization/assignment-service.ts        | 164 +++++++++++++++
+ .../organization/assignment-structure.test.ts |  50 +++++
+ .../assignment-write-transaction.ts           |  74 +++++++
+ src/platform/organization/assignment.test.ts  | 131 ++++++++++++
+ src/platform/organization/assignment.ts       | 106 ++++++++++
+ .../in-memory-assignment-repository.ts        |  83 ++++++++
+ .../in-memory-assignment-unit-of-work.ts      |  67 ++++++
+ .../in-memory-person-existence-repository.ts  |  14 ++
+ .../person-existence-repository.ts            |  12 ++
+ .../prisma-assignment-read-repository.ts      |  53 +++++
+ .../prisma-assignment-unit-of-work.ts         |  80 ++++++++
+ .../prisma-assignment-write-repository.ts     |  83 ++++++++
+ .../prisma-person-existence-repository.ts     |  14 ++
+ 21 files changed, 1578 insertions(+), 57 deletions(-)
+ create mode 100644 prisma/migrations/20260724135035_organization_assignment/migration.sql
+ create mode 100644 src/platform/organization/assignment-events.ts
+ create mode 100644 src/platform/organization/assignment-platform.integration.test.ts
+ create mode 100644 src/platform/organization/assignment-repository.ts
+ create mode 100644 src/platform/organization/assignment-service.test.ts
+ create mode 100644 src/platform/organization/assignment-service.ts
+ create mode 100644 src/platform/organization/assignment-structure.test.ts
+ create mode 100644 src/platform/organization/assignment-write-transaction.ts
+ create mode 100644 src/platform/organization/assignment.test.ts
+ create mode 100644 src/platform/organization/assignment.ts
+ create mode 100644 src/platform/organization/in-memory-assignment-repository.ts
+ create mode 100644 src/platform/organization/in-memory-assignment-unit-of-work.ts
+ create mode 100644 src/platform/organization/in-memory-person-existence-repository.ts
+ create mode 100644 src/platform/organization/person-existence-repository.ts
+ create mode 100644 src/platform/organization/prisma-assignment-read-repository.ts
+ create mode 100644 src/platform/organization/prisma-assignment-unit-of-work.ts
+ create mode 100644 src/platform/organization/prisma-assignment-write-repository.ts
+ create mode 100644 src/platform/organization/prisma-person-existence-repository.ts
+
+diff --git a/prisma/migrations/20260724135035_organization_assignment/migration.sql b/prisma/migrations/20260724135035_organization_assignment/migration.sql
+new file mode 100644
+index 0000000..f7042c3
+--- /dev/null
++++ b/prisma/migrations/20260724135035_organization_assignment/migration.sql
+@@ -0,0 +1,57 @@
++-- CreateTable
++CREATE TABLE "assignments" (
++    "assignment_id" TEXT NOT NULL,
++    "tenant_id" TEXT NOT NULL,
++    "person_id" TEXT NOT NULL,
++    "org_unit_id" TEXT NOT NULL,
++    "manager_id" TEXT,
++    "is_primary" BOOLEAN NOT NULL DEFAULT true,
++    "effective_from" TIMESTAMPTZ(6) NOT NULL,
++    "effective_until" TIMESTAMPTZ(6),
++    "created_at" TIMESTAMPTZ(6) NOT NULL DEFAULT CURRENT_TIMESTAMP,
++    "created_by" TEXT NOT NULL,
++    "updated_at" TIMESTAMPTZ(6) NOT NULL,
++
++    CONSTRAINT "assignments_pkey" PRIMARY KEY ("assignment_id")
++);
++
++-- CreateIndex
++CREATE INDEX "assignments_tenant_id_person_id_effective_from_idx" ON "assignments"("tenant_id", "person_id", "effective_from");
++
++-- CreateIndex
++CREATE INDEX "assignments_tenant_id_org_unit_id_idx" ON "assignments"("tenant_id", "org_unit_id");
++
++-- AddForeignKey
++ALTER TABLE "assignments" ADD CONSTRAINT "assignments_tenant_id_fkey" FOREIGN KEY ("tenant_id") REFERENCES "tenants"("tenant_id") ON DELETE RESTRICT ON UPDATE CASCADE;
++
++-- AddForeignKey
++ALTER TABLE "assignments" ADD CONSTRAINT "assignments_tenant_id_person_id_fkey" FOREIGN KEY ("tenant_id", "person_id") REFERENCES "employees"("tenant_id", "employee_id") ON DELETE RESTRICT ON UPDATE CASCADE;
++
++-- AddForeignKey
++ALTER TABLE "assignments" ADD CONSTRAINT "assignments_tenant_id_manager_id_fkey" FOREIGN KEY ("tenant_id", "manager_id") REFERENCES "employees"("tenant_id", "employee_id") ON DELETE RESTRICT ON UPDATE CASCADE;
++
++-- AddForeignKey
++ALTER TABLE "assignments" ADD CONSTRAINT "assignments_tenant_id_org_unit_id_fkey" FOREIGN KEY ("tenant_id", "org_unit_id") REFERENCES "org_units"("tenant_id", "org_unit_id") ON DELETE RESTRICT ON UPDATE CASCADE;
++
++-- CheckConstraint: a person can never be their own manager.
++ALTER TABLE "assignments" ADD CONSTRAINT "assignments_manager_not_self_check" CHECK ("manager_id" IS NULL OR "manager_id" <> "person_id");
++
++-- CheckConstraint: the placement window must be non-empty (end strictly after start).
++ALTER TABLE "assignments" ADD CONSTRAINT "assignments_valid_window_check" CHECK ("effective_until" IS NULL OR "effective_until" > "effective_from");
++
++-- Required for the exclusion constraint below: GIST support for equality (=) operators on scalar types.
++CREATE EXTENSION IF NOT EXISTS btree_gist;
++
++-- ExclusionConstraint: at most one PRIMARY assignment may be in force for a
++-- given (tenant, person) at any instant. Windows are half-open
++-- [effective_from, effective_until) so a transfer that starts the instant the
++-- prior placement ends is not treated as an overlap. Applies only to primary
++-- rows; secondary/acting placements (out of scope this slice) are unaffected.
++ALTER TABLE "assignments" ADD CONSTRAINT "assignments_one_primary_in_force_excl" EXCLUDE USING gist (
++    "tenant_id" WITH =,
++    "person_id" WITH =,
++    tstzrange("effective_from", "effective_until", '[)') WITH &&
++) WHERE ("is_primary");
++
++-- Index: fast lookup of each person's current (still-open) placement.
++CREATE INDEX "assignments_tenant_id_person_id_current_idx" ON "assignments"("tenant_id", "person_id") WHERE "effective_until" IS NULL;
+diff --git a/prisma/schema.prisma b/prisma/schema.prisma
+index 9f95a27..5855239 100644
+--- a/prisma/schema.prisma
++++ b/prisma/schema.prisma
+@@ -22,6 +22,7 @@ model Tenant {
+   configurationDefinitions     ConfigurationDefinition[]
+   configurationVersions        ConfigurationVersion[]
+   orgUnits                     OrgUnit[]
++  assignments                  Assignment[]
+ 
+   @@map("tenants")
+ }
+@@ -32,19 +33,19 @@ model Tenant {
+ /// department tables exist yet to attach a real assignment to — the field
+ /// exists so the resolver contract doesn't have to change shape later.
+ model ConfigurationDefinition {
+-  id           String                  @id @default(uuid()) @map("definition_id")
+-  tenantId     String                  @map("tenant_id")
+-  type         String                  @map("type")
+-  code         String                  @map("code")
+-  name         String                  @map("name")
+-  description  String?                 @map("description")
+-  scopeType    String                  @default("TENANT") @map("scope_type")
+-  scopeRef     String                  @map("scope_ref")
+-  createdAt    DateTime                @default(now()) @map("created_at") @db.Timestamptz(6)
+-  createdBy    String                  @map("created_by")
+-  updatedAt    DateTime                @updatedAt @map("updated_at") @db.Timestamptz(6)
+-  tenant       Tenant                  @relation(fields: [tenantId], references: [id], onDelete: Restrict, onUpdate: Cascade)
+-  versions     ConfigurationVersion[]
++  id          String                 @id @default(uuid()) @map("definition_id")
++  tenantId    String                 @map("tenant_id")
++  type        String                 @map("type")
++  code        String                 @map("code")
++  name        String                 @map("name")
++  description String?                @map("description")
++  scopeType   String                 @default("TENANT") @map("scope_type")
++  scopeRef    String                 @map("scope_ref")
++  createdAt   DateTime               @default(now()) @map("created_at") @db.Timestamptz(6)
++  createdBy   String                 @map("created_by")
++  updatedAt   DateTime               @updatedAt @map("updated_at") @db.Timestamptz(6)
++  tenant      Tenant                 @relation(fields: [tenantId], references: [id], onDelete: Restrict, onUpdate: Cascade)
++  versions    ConfigurationVersion[]
+ 
+   @@unique([tenantId, code])
+   @@index([tenantId, type])
+@@ -90,19 +91,20 @@ model ConfigurationVersion {
+ /// entity: it is mutable structural master data (rename, move, archive), with
+ /// history captured in the immutable audit trail, not in per-row versions.
+ model OrgUnit {
+-  id        String    @id @default(uuid()) @map("org_unit_id")
+-  tenantId  String    @map("tenant_id")
+-  code      String    @map("code")
+-  name      String    @map("name")
+-  kind      String    @map("kind")
+-  parentId  String?   @map("parent_id")
+-  status    String    @default("ACTIVE") @map("status")
+-  createdAt DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
+-  createdBy String    @map("created_by")
+-  updatedAt DateTime  @updatedAt @map("updated_at") @db.Timestamptz(6)
+-  tenant    Tenant    @relation(fields: [tenantId], references: [id], onDelete: Restrict, onUpdate: Cascade)
+-  parent    OrgUnit?  @relation("OrgUnitHierarchy", fields: [tenantId, parentId], references: [tenantId, id], onDelete: Restrict, onUpdate: Cascade)
+-  children  OrgUnit[] @relation("OrgUnitHierarchy")
++  id          String       @id @default(uuid()) @map("org_unit_id")
++  tenantId    String       @map("tenant_id")
++  code        String       @map("code")
++  name        String       @map("name")
++  kind        String       @map("kind")
++  parentId    String?      @map("parent_id")
++  status      String       @default("ACTIVE") @map("status")
++  createdAt   DateTime     @default(now()) @map("created_at") @db.Timestamptz(6)
++  createdBy   String       @map("created_by")
++  updatedAt   DateTime     @updatedAt @map("updated_at") @db.Timestamptz(6)
++  tenant      Tenant       @relation(fields: [tenantId], references: [id], onDelete: Restrict, onUpdate: Cascade)
++  parent      OrgUnit?     @relation("OrgUnitHierarchy", fields: [tenantId, parentId], references: [tenantId, id], onDelete: Restrict, onUpdate: Cascade)
++  children    OrgUnit[]    @relation("OrgUnitHierarchy")
++  assignments Assignment[] @relation("OrgUnitAssignments")
+ 
+   @@unique([tenantId, id])
+   @@unique([tenantId, code])
+@@ -111,6 +113,37 @@ model OrgUnit {
+   @@map("org_units")
+ }
+ 
++/// Assignment — the authoritative, effective-dated placement of a person into
++/// the organization (ADR-012 §5, §7). This is the source of truth for a
++/// person's org unit and primary manager over time; the Employee.department/
++/// team/manager/workLocation columns are legacy. A placement is never edited
++/// in place: a transfer ends the current window and opens a new one, so
++/// historical placement is always resolvable. Composite tenant-scoped foreign
++/// keys make a cross-tenant person/manager/org-unit reference impossible at the
++/// database. "At most one PRIMARY in force per person at any instant" is
++/// enforced by a GIST exclusion constraint installed in the migration.
++model Assignment {
++  id             String    @id @default(uuid()) @map("assignment_id")
++  tenantId       String    @map("tenant_id")
++  personId       String    @map("person_id")
++  orgUnitId      String    @map("org_unit_id")
++  managerId      String?   @map("manager_id")
++  isPrimary      Boolean   @default(true) @map("is_primary")
++  effectiveFrom  DateTime  @map("effective_from") @db.Timestamptz(6)
++  effectiveUntil DateTime? @map("effective_until") @db.Timestamptz(6)
++  createdAt      DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
++  createdBy      String    @map("created_by")
++  updatedAt      DateTime  @updatedAt @map("updated_at") @db.Timestamptz(6)
++  tenant         Tenant    @relation(fields: [tenantId], references: [id], onDelete: Restrict, onUpdate: Cascade)
++  person         Employee  @relation("AssignmentPerson", fields: [tenantId, personId], references: [tenantId, employeeId], onDelete: Restrict, onUpdate: Cascade)
++  manager        Employee? @relation("AssignmentManager", fields: [tenantId, managerId], references: [tenantId, employeeId], onDelete: Restrict, onUpdate: Cascade)
++  orgUnit        OrgUnit   @relation("OrgUnitAssignments", fields: [tenantId, orgUnitId], references: [tenantId, id], onDelete: Restrict, onUpdate: Cascade)
++
++  @@index([tenantId, personId, effectiveFrom])
++  @@index([tenantId, orgUnitId])
++  @@map("assignments")
++}
++
+ /// The platform login identity (Epic 6 Slice 6M0.1). Deliberately separate
+ /// from Employee: Employee is HR record data, not authentication data, and
+ /// a User is not guaranteed to correspond to an Employee row.
+@@ -220,38 +253,45 @@ model SubmissionIdempotencyRecord {
+ /// aggregate. Government identifiers, payroll, compensation, tax, and banking
+ /// data are deliberately not part of this model.
+ model Employee {
+-  tenantId              String   @map("tenant_id")
+-  employeeId            String   @map("employee_id")
+-  employeeNumber        String   @map("employee_number")
+-  displayName           String   @map("display_name")
+-  firstName             String   @map("first_name")
+-  middleName            String?  @map("middle_name")
+-  lastName              String   @map("last_name")
+-  preferredName         String?  @map("preferred_name")
+-  dateOfBirth           DateTime @map("date_of_birth") @db.Date
++  tenantId              String       @map("tenant_id")
++  employeeId            String       @map("employee_id")
++  employeeNumber        String       @map("employee_number")
++  displayName           String       @map("display_name")
++  firstName             String       @map("first_name")
++  middleName            String?      @map("middle_name")
++  lastName              String       @map("last_name")
++  preferredName         String?      @map("preferred_name")
++  dateOfBirth           DateTime     @map("date_of_birth") @db.Date
+   gender                String
+-  maritalStatus         String   @map("marital_status")
++  maritalStatus         String       @map("marital_status")
+   nationality           String
+-  workEmail             String   @map("work_email")
+-  personalEmail         String?  @map("personal_email")
+-  mobileNumber          String   @map("mobile_number")
+-  homeAddress           String   @map("home_address")
+-  departmentId          String   @map("department_id")
+-  teamId                String?  @map("team_id")
++  workEmail             String       @map("work_email")
++  personalEmail         String?      @map("personal_email")
++  mobileNumber          String       @map("mobile_number")
++  homeAddress           String       @map("home_address")
++  /// LEGACY placement fields (ADR-012 §7). Superseded by the Assignment
++  /// aggregate, which is the authoritative, effective-dated source of a
++  /// person's org unit and manager. These columns are retained (not removed)
++  /// for backward compatibility and are no longer the source of truth for
++  /// placement; new placement reads/writes go through Assignment.
++  departmentId          String       @map("department_id")
++  teamId                String?      @map("team_id")
+   position              String
+-  managerId             String?  @map("manager_id")
+-  employmentType        String   @map("employment_type")
+-  employmentStatus      String?  @map("employment_status")
+-  hireDate              DateTime @map("hire_date") @db.Date
+-  workLocation          String   @map("work_location")
+-  emergencyContactName  String?  @map("emergency_contact_name")
+-  emergencyRelationship String?  @map("emergency_relationship")
+-  emergencyMobileNumber String?  @map("emergency_mobile_number")
+-  emergencyEmail        String?  @map("emergency_email")
+-  emergencyAddress      String?  @map("emergency_address")
+-  createdAt             DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+-  updatedAt             DateTime @updatedAt @map("updated_at") @db.Timestamptz(6)
+-  tenant                Tenant   @relation(fields: [tenantId], references: [id], onDelete: Restrict, onUpdate: Cascade)
++  managerId             String?      @map("manager_id")
++  employmentType        String       @map("employment_type")
++  employmentStatus      String?      @map("employment_status")
++  hireDate              DateTime     @map("hire_date") @db.Date
++  workLocation          String       @map("work_location")
++  emergencyContactName  String?      @map("emergency_contact_name")
++  emergencyRelationship String?      @map("emergency_relationship")
++  emergencyMobileNumber String?      @map("emergency_mobile_number")
++  emergencyEmail        String?      @map("emergency_email")
++  emergencyAddress      String?      @map("emergency_address")
++  createdAt             DateTime     @default(now()) @map("created_at") @db.Timestamptz(6)
++  updatedAt             DateTime     @updatedAt @map("updated_at") @db.Timestamptz(6)
++  tenant                Tenant       @relation(fields: [tenantId], references: [id], onDelete: Restrict, onUpdate: Cascade)
++  assignmentsAsPerson   Assignment[] @relation("AssignmentPerson")
++  assignmentsAsManager  Assignment[] @relation("AssignmentManager")
+ 
+   @@id([tenantId, employeeId])
+   @@unique([tenantId, employeeNumber])
+diff --git a/src/platform/architecture/import-boundaries.test.ts b/src/platform/architecture/import-boundaries.test.ts
+index a8d4bd1..2e20f57 100644
+--- a/src/platform/architecture/import-boundaries.test.ts
++++ b/src/platform/architecture/import-boundaries.test.ts
+@@ -200,6 +200,21 @@ describe("import boundary fitness rules (fixtures prove each rule actually catch
+     expect(scanImportBoundaries([file])).toContainEqual({ path: file.path, rule: "client-components-must-not-import-organization-server-composition", matchedImport: "@/platform/organization/org-unit-service" });
+   });
+ 
++  it("flags the assignment read repository importing the assignment write side (read model must stay read-only)", () => {
++    const file: SourceFile = { path: "src/platform/organization/prisma-assignment-read-repository.ts", content: `import { AssignmentService } from "@/platform/organization/assignment-service";\n` };
++    expect(scanImportBoundaries([file])).toContainEqual({ path: file.path, rule: "organization-read-repository-must-not-import-write-side", matchedImport: "@/platform/organization/assignment-service" });
++  });
++
++  it("flags a client component importing the assignment service (ADR-012 server composition)", () => {
++    const file: SourceFile = { path: "src/components/organization/bad-assignment-client.tsx", content: `"use client";\nimport { AssignmentService } from "@/platform/organization/assignment-service";\n` };
++    expect(scanImportBoundaries([file])).toContainEqual({ path: file.path, rule: "client-components-must-not-import-organization-server-composition", matchedImport: "@/platform/organization/assignment-service" });
++  });
++
++  it("does not flag the legitimate assignment read repository reading through Prisma with a permission gate", () => {
++    const file: SourceFile = { path: "src/platform/organization/prisma-assignment-read-repository.ts", content: `import type { PrismaClient } from "@prisma/client";\nimport { hasPermission } from "@/platform/context";\nimport type { AssignmentReadRepository } from "@/platform/organization/assignment-repository";\n` };
++    expect(scanImportBoundaries([file])).toHaveLength(0);
++  });
++
+   it("flags Configuration importing Organization, and Organization importing Configuration (peer domains must not couple)", () => {
+     const configToOrg: SourceFile = { path: "src/platform/configuration/bad.ts", content: `import { buildOrgUnitTree } from "@/platform/organization/org-unit";\n` };
+     const orgToConfig: SourceFile = { path: "src/platform/organization/bad.ts", content: `import { CONFIGURATION_MANIFEST } from "@/platform/configuration/registry/configuration-manifest";\n` };
+diff --git a/src/platform/architecture/import-boundaries.ts b/src/platform/architecture/import-boundaries.ts
+index 7eb2517..e367733 100644
+--- a/src/platform/architecture/import-boundaries.ts
++++ b/src/platform/architecture/import-boundaries.ts
+@@ -48,7 +48,11 @@ const isConfigurationManifest = (file: SourceFile) => file.path === "src/platfor
+ // The Organization domain (ADR-012) is a peer domain — never coupled to Configuration.
+ const isConfigurationCode = (file: SourceFile) => file.path.startsWith("src/platform/configuration/");
+ const isOrganizationCode = (file: SourceFile) => file.path.startsWith("src/platform/organization/");
+-const isOrganizationReadRepository = (file: SourceFile) => file.path === "src/platform/organization/prisma-org-unit-read-repository.ts";
++const ORGANIZATION_READ_REPOSITORY_FILES = new Set([
++  "src/platform/organization/prisma-org-unit-read-repository.ts",
++  "src/platform/organization/prisma-assignment-read-repository.ts",
++]);
++const isOrganizationReadRepository = (file: SourceFile) => ORGANIZATION_READ_REPOSITORY_FILES.has(file.path);
+ 
+ const WRITE_RUNTIME_IMPORTS = [
+   /^@prisma\/client/,
+@@ -99,19 +103,26 @@ const CONFIGURATION_PERSISTENCE_IMPORTS = [
+ const WRITE_RUNTIME_MODULE_IMPORTS = [/platform\/people\/commands\//, /platform\/submissions\//, /durable-application-runtime/];
+ 
+ // The Organization write side (ADR-012). The read repository — and any client —
+-// must never reach these; writes go only through the OrgUnit service + UnitOfWork.
++// must never reach these; writes go only through the OrgUnit/Assignment
++// services + their UnitOfWork.
+ const ORGANIZATION_WRITE_SIDE_IMPORTS = [
+   /platform\/organization\/prisma-org-unit-write-repository/,
+   /platform\/organization\/org-unit-write-transaction/,
+   /platform\/organization\/prisma-org-unit-unit-of-work/,
+   /platform\/organization\/in-memory-org-unit-unit-of-work/,
+   /platform\/organization\/org-unit-service/,
++  /platform\/organization\/prisma-assignment-write-repository/,
++  /platform\/organization\/assignment-write-transaction/,
++  /platform\/organization\/prisma-assignment-unit-of-work/,
++  /platform\/organization\/in-memory-assignment-unit-of-work/,
++  /platform\/organization\/assignment-service/,
+ ];
+ 
+ // Server-only Organization composition a client component must never import.
+ const ORGANIZATION_SERVER_ONLY_IMPORTS = [
+   ...ORGANIZATION_WRITE_SIDE_IMPORTS,
+   /platform\/organization\/prisma-org-unit-read-repository/,
++  /platform\/organization\/prisma-assignment-read-repository/,
+ ];
+ 
+ // Anything that lets a caller obtain or construct a TrustedRequestContext —
+diff --git a/src/platform/organization/assignment-events.ts b/src/platform/organization/assignment-events.ts
+new file mode 100644
+index 0000000..762ca8f
+--- /dev/null
++++ b/src/platform/organization/assignment-events.ts
+@@ -0,0 +1,49 @@
++import { createDomainEvent, type DomainEvent, type DomainEventClock, type EventIdGenerator } from "@/platform/events/domain-event";
++import type { AssignmentRecord } from "@/platform/organization/assignment";
++
++type EventContext = Readonly<{ tenantId: string; correlationId: string }>;
++
++function assignmentEvent(
++  eventName: string,
++  assignment: AssignmentRecord,
++  context: EventContext,
++  ids: EventIdGenerator,
++  clock: DomainEventClock,
++): DomainEvent {
++  return createDomainEvent({
++    eventName,
++    aggregateType: "assignment",
++    aggregateId: assignment.id,
++    tenantId: context.tenantId,
++    correlationId: context.correlationId,
++    requestId: context.correlationId,
++    version: 1,
++    payload: {
++      assignmentId: assignment.id,
++      personId: assignment.personId,
++      orgUnitId: assignment.orgUnitId,
++      ...(assignment.managerId ? { managerId: assignment.managerId } : {}),
++      isPrimary: assignment.isPrimary,
++      effectiveFrom: assignment.effectiveFrom,
++      ...(assignment.effectiveUntil ? { effectiveUntil: assignment.effectiveUntil } : {}),
++    },
++  }, ids, clock);
++}
++
++/**
++ * Emitted whenever a primary placement is created — a person's first
++ * assignment, or the new record opened by a transfer (ADR-012 §7).
++ */
++export function createAssignmentAssignedEvent(assignment: AssignmentRecord, context: EventContext, ids: EventIdGenerator, clock: DomainEventClock): DomainEvent {
++  return assignmentEvent("organization.assignment.assigned", assignment, context, ids, clock);
++}
++
++/**
++ * Emitted whenever a placement's window is closed — an offboarding, or the
++ * old record closed by a transfer. A transfer therefore produces both an
++ * `ended` event (the superseded record) and an `assigned` event (the new
++ * one) inside the same transaction.
++ */
++export function createAssignmentEndedEvent(assignment: AssignmentRecord, context: EventContext, ids: EventIdGenerator, clock: DomainEventClock): DomainEvent {
++  return assignmentEvent("organization.assignment.ended", assignment, context, ids, clock);
++}
+diff --git a/src/platform/organization/assignment-platform.integration.test.ts b/src/platform/organization/assignment-platform.integration.test.ts
+new file mode 100644
+index 0000000..b213484
+--- /dev/null
++++ b/src/platform/organization/assignment-platform.integration.test.ts
+@@ -0,0 +1,168 @@
++import { randomUUID } from "node:crypto";
++import { afterAll, describe, expect, it } from "vitest";
++import { getPrismaClient } from "@/platform/persistence/prisma-client";
++import { PrismaAssignmentUnitOfWork } from "@/platform/organization/prisma-assignment-unit-of-work";
++import { PrismaAssignmentReadRepository } from "@/platform/organization/prisma-assignment-read-repository";
++import { InMemoryDomainEventCollector } from "@/platform/events/domain-event-collector";
++import { InMemoryAuditCollector } from "@/platform/auditing/audit-collector";
++import { AssignmentService } from "@/platform/organization/assignment-service";
++import { createTrustedRequestContext } from "@/platform/runtime-context";
++import { PermissionSet, type TenantContext } from "@/platform/context";
++
++/**
++ * Real-Postgres coverage for what an in-memory suite cannot verify: actual
++ * $transaction atomicity (assignment + audit + outbox commit together), the
++ * DB-level guards (self-manager CHECK, valid-window CHECK, the GIST exclusion
++ * constraint preventing two overlapping primary assignments, the composite
++ * tenant-scoped foreign keys), and real tenant-isolated queries.
++ */
++describe("assignment platform (integration)", () => {
++  const prisma = getPrismaClient();
++  const tenantA = `test-tenant-7b2-${randomUUID()}`;
++  const tenantB = `test-tenant-7b2-${randomUUID()}`;
++
++  afterAll(async () => {
++    await prisma.assignment.deleteMany({ where: { tenantId: { in: [tenantA, tenantB] } } }).catch(() => undefined);
++    await prisma.orgUnit.deleteMany({ where: { tenantId: { in: [tenantA, tenantB] } } }).catch(() => undefined);
++    await prisma.employee.deleteMany({ where: { tenantId: { in: [tenantA, tenantB] } } }).catch(() => undefined);
++    await prisma.tenant.deleteMany({ where: { id: { in: [tenantA, tenantB] } } }).catch(() => undefined);
++  });
++
++  async function seedTenant(tenantId: string) {
++    await prisma.tenant.upsert({ where: { id: tenantId }, create: { id: tenantId }, update: {} });
++  }
++
++  async function seedEmployee(tenantId: string, employeeId: string) {
++    await prisma.employee.create({
++      data: {
++        tenantId, employeeId, employeeNumber: `E-${employeeId}`, displayName: "A A", firstName: "A", lastName: "A",
++        dateOfBirth: new Date("2000-01-01"), gender: "M", maritalStatus: "single", nationality: "PH",
++        workEmail: `${employeeId}@x.com`, mobileNumber: "1", homeAddress: "addr",
++        departmentId: "dept", position: "role", employmentType: "FULL_TIME", hireDate: new Date("2020-01-01"), workLocation: "remote",
++      },
++    });
++  }
++
++  async function seedOrgUnit(tenantId: string, id: string, code: string) {
++    return prisma.orgUnit.create({ data: { id, tenantId, code, name: code, kind: "TEAM", createdBy: "tester" } });
++  }
++
++  function request(tenantId: string) {
++    return createTrustedRequestContext({
++      principal: { subjectId: "s", userId: "user-1", tenantId, authenticationMethod: "test", authenticatedAt: "2026-01-01T00:00:00.000Z" },
++      roles: ["hr_admin"],
++      permissions: ["organization.view", "organization.manage"],
++      actorProvenance: "server_verified",
++      correlationId: "corr-1",
++    });
++  }
++
++  function readContext(tenantId: string): TenantContext {
++    return { tenantId, actorId: "user-1", actorName: "A", roles: ["hr_admin"], permissions: new PermissionSet(["organization.view"]), correlationId: "c", authenticationMethod: "test", actorProvenance: "server_verified" };
++  }
++
++  it("commits the assignment, audit record, and outbox message atomically on assignPrimary", async () => {
++    await seedTenant(tenantA);
++    const personId = `emp-${randomUUID().slice(0, 8)}`;
++    await seedEmployee(tenantA, personId);
++    const orgUnit = await seedOrgUnit(tenantA, randomUUID(), `OU-${randomUUID().slice(0, 8)}`.toUpperCase());
++
++    const events = new InMemoryDomainEventCollector();
++    const audit = new InMemoryAuditCollector();
++    const service = new AssignmentService(new PrismaAssignmentUnitOfWork(prisma, events, audit));
++
++    const result = await service.assignPrimary(request(tenantA), { personId, orgUnitId: orgUnit.id, effectiveFrom: "2026-01-01T00:00:00.000Z" });
++    expect(result.kind).toBe("success");
++    if (result.kind !== "success") return;
++
++    const dbAssignment = await prisma.assignment.findUniqueOrThrow({ where: { id: result.value.assignment.id } });
++    expect(dbAssignment.personId).toBe(personId);
++    const dbAudit = await prisma.auditRecord.findFirst({ where: { aggregateId: result.value.assignment.id, eventName: "organization.assignment.assigned" } });
++    expect(dbAudit).not.toBeNull();
++    const dbOutbox = await prisma.outboxMessage.findFirst({ where: { aggregateId: result.value.assignment.id, eventName: "organization.assignment.assigned" } });
++    expect(dbOutbox).not.toBeNull();
++    expect(dbOutbox?.tenantId).toBe(tenantA);
++  });
++
++  it("the database rejects a self-manager and an invalid window (DB-level guards)", async () => {
++    await seedTenant(tenantA);
++    const personId = `emp-${randomUUID().slice(0, 8)}`;
++    await seedEmployee(tenantA, personId);
++    const orgUnit = await seedOrgUnit(tenantA, randomUUID(), `OU-${randomUUID().slice(0, 8)}`.toUpperCase());
++
++    await expect(prisma.assignment.create({
++      data: { tenantId: tenantA, personId, orgUnitId: orgUnit.id, managerId: personId, effectiveFrom: new Date("2026-01-01"), createdBy: "tester" },
++    })).rejects.toThrow();
++
++    await expect(prisma.assignment.create({
++      data: { tenantId: tenantA, personId, orgUnitId: orgUnit.id, effectiveFrom: new Date("2026-06-01"), effectiveUntil: new Date("2026-01-01"), createdBy: "tester" },
++    })).rejects.toThrow();
++  });
++
++  it("the database's GIST exclusion constraint rejects two overlapping primary assignments for the same person", async () => {
++    await seedTenant(tenantA);
++    const personId = `emp-${randomUUID().slice(0, 8)}`;
++    await seedEmployee(tenantA, personId);
++    const orgUnit = await seedOrgUnit(tenantA, randomUUID(), `OU-${randomUUID().slice(0, 8)}`.toUpperCase());
++
++    await prisma.assignment.create({ data: { tenantId: tenantA, personId, orgUnitId: orgUnit.id, effectiveFrom: new Date("2026-01-01"), createdBy: "tester" } });
++    await expect(prisma.assignment.create({
++      data: { tenantId: tenantA, personId, orgUnitId: orgUnit.id, effectiveFrom: new Date("2026-06-01"), createdBy: "tester" },
++    })).rejects.toThrow();
++  });
++
++  it("performs a real transfer: ends the current placement and opens a new one in one transaction", async () => {
++    await seedTenant(tenantA);
++    const personId = `emp-${randomUUID().slice(0, 8)}`;
++    const managerId = `emp-${randomUUID().slice(0, 8)}`;
++    await seedEmployee(tenantA, personId);
++    await seedEmployee(tenantA, managerId);
++    const orgUnitA = await seedOrgUnit(tenantA, randomUUID(), `OU-${randomUUID().slice(0, 8)}`.toUpperCase());
++    const orgUnitB = await seedOrgUnit(tenantA, randomUUID(), `OU-${randomUUID().slice(0, 8)}`.toUpperCase());
++
++    const service = new AssignmentService(new PrismaAssignmentUnitOfWork(prisma, new InMemoryDomainEventCollector(), new InMemoryAuditCollector()));
++    const first = await service.assignPrimary(request(tenantA), { personId, orgUnitId: orgUnitA.id, effectiveFrom: "2026-01-01T00:00:00.000Z" });
++    if (first.kind !== "success") throw new Error("seed assignment failed");
++
++    const transferred = await service.transfer(request(tenantA), { personId, orgUnitId: orgUnitB.id, managerId, effectiveFrom: "2026-06-01T00:00:00.000Z" });
++    expect(transferred.kind).toBe("success");
++    if (transferred.kind !== "success") return;
++    expect(transferred.value.previous.id).toBe(first.value.assignment.id);
++
++    const reader = new PrismaAssignmentReadRepository(prisma);
++    const current = await reader.getCurrentForPerson(readContext(tenantA), personId);
++    expect(current?.orgUnitId).toBe(orgUnitB.id);
++    expect(current?.managerId).toBe(managerId);
++    const history = await reader.listHistoryForPerson(readContext(tenantA), personId);
++    expect(history).toHaveLength(2);
++    expect(history[0].effectiveUntil).not.toBeUndefined();
++  });
++
++  it("keeps assignments strictly tenant-isolated in reads", async () => {
++    await seedTenant(tenantA);
++    await seedTenant(tenantB);
++    const personId = `emp-${randomUUID().slice(0, 8)}`;
++    await seedEmployee(tenantA, personId);
++    const orgUnit = await seedOrgUnit(tenantA, randomUUID(), `OU-${randomUUID().slice(0, 8)}`.toUpperCase());
++
++    const service = new AssignmentService(new PrismaAssignmentUnitOfWork(prisma, new InMemoryDomainEventCollector(), new InMemoryAuditCollector()));
++    const created = await service.assignPrimary(request(tenantA), { personId, orgUnitId: orgUnit.id, effectiveFrom: "2026-01-01T00:00:00.000Z" });
++    if (created.kind !== "success") throw new Error("create failed");
++
++    const reader = new PrismaAssignmentReadRepository(prisma);
++    expect(await reader.getCurrentForPerson(readContext(tenantA), personId)).toBeDefined();
++    expect(await reader.getCurrentForPerson(readContext(tenantB), personId)).toBeUndefined();
++  });
++
++  it("rejects a cross-tenant org unit reference at the database (composite tenant-scoped foreign key)", async () => {
++    await seedTenant(tenantA);
++    await seedTenant(tenantB);
++    const personId = `emp-${randomUUID().slice(0, 8)}`;
++    await seedEmployee(tenantA, personId);
++    const foreignOrgUnit = await seedOrgUnit(tenantB, randomUUID(), `OU-${randomUUID().slice(0, 8)}`.toUpperCase());
++
++    await expect(prisma.assignment.create({
++      data: { tenantId: tenantA, personId, orgUnitId: foreignOrgUnit.id, effectiveFrom: new Date("2026-01-01"), createdBy: "tester" },
++    })).rejects.toThrow();
++  });
++});
+diff --git a/src/platform/organization/assignment-repository.ts b/src/platform/organization/assignment-repository.ts
+new file mode 100644
+index 0000000..b9e949c
+--- /dev/null
++++ b/src/platform/organization/assignment-repository.ts
+@@ -0,0 +1,58 @@
++import type { TenantContext } from "@/platform/context";
++import type { OrgUnitWriteRepository } from "@/platform/organization/org-unit-repository";
++import type { PersonExistenceRepository } from "@/platform/organization/person-existence-repository";
++import type { AssignmentRecord } from "@/platform/organization/assignment";
++
++export interface AssignPrimaryInput {
++  tenantId: string;
++  personId: string;
++  orgUnitId: string;
++  managerId?: string;
++  effectiveFrom: string;
++  createdBy: string;
++}
++
++export interface EndAssignmentInput {
++  tenantId: string;
++  id: string;
++  effectiveUntil: string;
++}
++
++/**
++ * Server-only write port for assignments. Used only inside a tenant-scoped
++ * write transaction. There is no update-in-place for placement fields and no
++ * delete — a placement is superseded (ended, then a new one created) so
++ * history is always resolvable (ADR-012 §7, §12).
++ */
++export interface AssignmentWriteRepository {
++  findById(tenantId: string, id: string): Promise<AssignmentRecord | undefined>;
++  /** Every assignment for a person, ascending by effectiveFrom — the write service's in-transaction overlap check uses this. */
++  listForPerson(tenantId: string, personId: string): Promise<AssignmentRecord[]>;
++  /** The currently open (effectiveUntil absent) primary assignment for a person, if any. */
++  findCurrentPrimaryForPerson(tenantId: string, personId: string): Promise<AssignmentRecord | undefined>;
++  create(input: AssignPrimaryInput): Promise<AssignmentRecord>;
++  end(input: EndAssignmentInput): Promise<AssignmentRecord>;
++}
++
++/**
++ * Transaction-scoped repositories exposed to the Assignment write service via
++ * UnitOfWork.execute(). `orgUnits` and `people` are read-only existence checks
++ * against the live tenant data inside the same transaction — the write
++ * service never mutates either through this port.
++ */
++export type AssignmentTransactionRepositories = Readonly<{
++  assignments: AssignmentWriteRepository;
++  orgUnits: OrgUnitWriteRepository;
++  people: PersonExistenceRepository;
++}>;
++
++/**
++ * Server-only read port. Read-only, tenant-scoped, used outside any write
++ * transaction. Every method requires organization.view.
++ */
++export interface AssignmentReadRepository {
++  /** The currently open primary assignment for a person, if any. */
++  getCurrentForPerson(context: TenantContext, personId: string): Promise<AssignmentRecord | undefined>;
++  /** Full placement history for a person, ascending by effectiveFrom. */
++  listHistoryForPerson(context: TenantContext, personId: string): Promise<AssignmentRecord[]>;
++}
+diff --git a/src/platform/organization/assignment-service.test.ts b/src/platform/organization/assignment-service.test.ts
+new file mode 100644
+index 0000000..b77f1ff
+--- /dev/null
++++ b/src/platform/organization/assignment-service.test.ts
+@@ -0,0 +1,192 @@
++import { describe, expect, it } from "vitest";
++import { createTrustedRequestContext, type TrustedRequestContext } from "@/platform/runtime-context";
++import type { Permission, PlatformRole } from "@/platform/context";
++import { InMemoryAuditCollector } from "@/platform/auditing/audit-collector";
++import { InMemoryDomainEventCollector } from "@/platform/events/domain-event-collector";
++import { InMemoryAssignmentUnitOfWork } from "@/platform/organization/in-memory-assignment-unit-of-work";
++import { InMemoryAssignmentReadRepository } from "@/platform/organization/in-memory-assignment-repository";
++import { AssignmentService } from "@/platform/organization/assignment-service";
++
++function requestFor(roles: readonly PlatformRole[], permissions: readonly Permission[] = [], tenantId = "tenant-a"): TrustedRequestContext {
++  return createTrustedRequestContext({
++    principal: { subjectId: "s-1", userId: "user-1", tenantId, authenticationMethod: "test", authenticatedAt: "2026-01-01T00:00:00.000Z" },
++    roles,
++    permissions,
++    actorProvenance: "server_verified",
++    correlationId: "corr-1",
++  });
++}
++
++const MANAGE: Permission[] = ["organization.view", "organization.manage"];
++
++function harness(tenantId = "tenant-a") {
++  const audit = new InMemoryAuditCollector();
++  const events = new InMemoryDomainEventCollector();
++  const unitOfWork = new InMemoryAssignmentUnitOfWork(undefined, undefined, undefined, events, audit);
++  const service = new AssignmentService(unitOfWork);
++  const reader = new InMemoryAssignmentReadRepository(unitOfWork.getStore());
++  const readContext = (t = tenantId) => ({ tenantId: t, actorId: "user-1", actorName: "A", roles: ["hr_admin"] as PlatformRole[], permissions: { has: () => true, toArray: () => [] } as never, correlationId: "c", authenticationMethod: "test", actorProvenance: "server_verified" as const });
++
++  // Seed a valid org unit and two known employees so create-side existence checks pass by default.
++  unitOfWork.getOrgUnitStore().units.push(Object.freeze({
++    id: "ou1", tenantId, code: "OU1", name: "Unit 1", kind: "TEAM" as const, status: "ACTIVE" as const,
++    createdAt: "2026-01-01T00:00:00.000Z", createdBy: "actor", updatedAt: "2026-01-01T00:00:00.000Z",
++  }));
++  unitOfWork.getPeople().add(tenantId, "p1");
++  unitOfWork.getPeople().add(tenantId, "p2");
++
++  return { service, audit, events, unitOfWork, reader, readContext };
++}
++
++describe("AssignmentService — authorization", () => {
++  it("denies assignPrimary, transfer, and endAssignment without organization.manage", async () => {
++    const { service } = harness();
++    const request = requestFor(["employee"], ["organization.view"]);
++    expect((await service.assignPrimary(request, { personId: "p1", orgUnitId: "ou1", effectiveFrom: "2026-01-01" })).kind).toBe("authorization_failure");
++    expect((await service.transfer(request, { personId: "p1", orgUnitId: "ou1", effectiveFrom: "2026-01-01" })).kind).toBe("authorization_failure");
++    expect((await service.endAssignment(request, { personId: "p1", effectiveUntil: "2026-06-01" })).kind).toBe("authorization_failure");
++  });
++});
++
++describe("AssignmentService — assignPrimary", () => {
++  it("assigns a person's first primary placement and audits + emits an outbox-eligible event", async () => {
++    const { service, audit, events } = harness();
++    const result = await service.assignPrimary(requestFor(["hr_admin"], MANAGE), { personId: "p1", orgUnitId: "ou1", managerId: "p2", effectiveFrom: "2026-01-01" });
++    expect(result.kind).toBe("success");
++    if (result.kind === "success") {
++      expect(result.value.assignment.orgUnitId).toBe("ou1");
++      expect(result.value.assignment.managerId).toBe("p2");
++      expect(result.value.assignment.isPrimary).toBe(true);
++    }
++    expect(events.list().map((e) => e.eventName)).toEqual(["organization.assignment.assigned"]);
++    expect(audit.list()).toHaveLength(1);
++    expect(audit.list()[0].metadata).toHaveProperty("personId", "p1");
++  });
++
++  it("rejects a person who does not exist", async () => {
++    const { service } = harness();
++    const result = await service.assignPrimary(requestFor(["hr_admin"], MANAGE), { personId: "ghost", orgUnitId: "ou1", effectiveFrom: "2026-01-01" });
++    expect(result.kind).toBe("validation_failure");
++  });
++
++  it("rejects a manager who does not exist", async () => {
++    const { service } = harness();
++    const result = await service.assignPrimary(requestFor(["hr_admin"], MANAGE), { personId: "p1", orgUnitId: "ou1", managerId: "ghost", effectiveFrom: "2026-01-01" });
++    expect(result.kind).toBe("validation_failure");
++  });
++
++  it("rejects an org unit that does not exist", async () => {
++    const { service } = harness();
++    const result = await service.assignPrimary(requestFor(["hr_admin"], MANAGE), { personId: "p1", orgUnitId: "ghost", effectiveFrom: "2026-01-01" });
++    expect(result.kind).toBe("validation_failure");
++  });
++
++  it("rejects a self-manager as a validation failure before touching the store", async () => {
++    const { service, unitOfWork } = harness();
++    const result = await service.assignPrimary(requestFor(["hr_admin"], MANAGE), { personId: "p1", orgUnitId: "ou1", managerId: "p1", effectiveFrom: "2026-01-01" });
++    expect(result.kind).toBe("validation_failure");
++    expect(unitOfWork.getStore().assignments).toHaveLength(0);
++  });
++
++  it("rejects a second primary assignment that overlaps the person's current one as a conflict", async () => {
++    const { service } = harness();
++    const request = requestFor(["hr_admin"], MANAGE);
++    await service.assignPrimary(request, { personId: "p1", orgUnitId: "ou1", effectiveFrom: "2026-01-01" });
++    const overlapping = await service.assignPrimary(request, { personId: "p1", orgUnitId: "ou1", effectiveFrom: "2026-03-01" });
++    expect(overlapping.kind).toBe("conflict");
++  });
++});
++
++describe("AssignmentService — transfer", () => {
++  async function seedCurrent() {
++    const h = harness();
++    const request = requestFor(["hr_admin"], MANAGE);
++    const first = await h.service.assignPrimary(request, { personId: "p1", orgUnitId: "ou1", effectiveFrom: "2026-01-01" });
++    if (first.kind !== "success") throw new Error("seed failed");
++    return { ...h, request, firstId: first.value.assignment.id };
++  }
++
++  it("ends the current placement and opens a new one, atomically", async () => {
++    const { service, request, firstId, reader, readContext } = await seedCurrent();
++    const result = await service.transfer(request, { personId: "p1", orgUnitId: "ou1", managerId: "p2", effectiveFrom: "2026-06-01" });
++    expect(result.kind).toBe("success");
++    if (result.kind === "success") {
++      expect(result.value.previous.id).toBe(firstId);
++      expect(result.value.previous.effectiveUntil).toBe("2026-06-01");
++      expect(result.value.assignment.managerId).toBe("p2");
++      expect(result.value.assignment.effectiveFrom).toBe("2026-06-01");
++    }
++    const current = await reader.getCurrentForPerson(readContext(), "p1");
++    expect(current?.managerId).toBe("p2");
++  });
++
++  it("emits an ended event for the superseded record and an assigned event for the new one", async () => {
++    const { service, request, events } = await seedCurrent();
++    const before = events.list().length;
++    await service.transfer(request, { personId: "p1", orgUnitId: "ou1", effectiveFrom: "2026-06-01" });
++    const names = events.list().slice(before).map((e) => e.eventName);
++    expect(names).toEqual(["organization.assignment.ended", "organization.assignment.assigned"]);
++  });
++
++  it("rejects a transfer with no current placement to transfer from", async () => {
++    const { service } = harness();
++    const result = await service.transfer(requestFor(["hr_admin"], MANAGE), { personId: "p1", orgUnitId: "ou1", effectiveFrom: "2026-01-01" });
++    expect(result.kind).toBe("validation_failure");
++  });
++
++  it("rejects a transfer whose effectiveFrom is not after the current placement's start", async () => {
++    const { service, request } = await seedCurrent();
++    const result = await service.transfer(request, { personId: "p1", orgUnitId: "ou1", effectiveFrom: "2026-01-01" });
++    expect(result.kind).toBe("validation_failure");
++  });
++});
++
++describe("AssignmentService — endAssignment", () => {
++  it("closes the current primary placement", async () => {
++    const h = harness();
++    const request = requestFor(["hr_admin"], MANAGE);
++    await h.service.assignPrimary(request, { personId: "p1", orgUnitId: "ou1", effectiveFrom: "2026-01-01" });
++    const result = await h.service.endAssignment(request, { personId: "p1", effectiveUntil: "2026-12-01" });
++    expect(result.kind).toBe("success");
++    if (result.kind === "success") expect(result.value.assignment.effectiveUntil).toBe("2026-12-01");
++  });
++
++  it("rejects ending a person with no current placement", async () => {
++    const { service } = harness();
++    const result = await service.endAssignment(requestFor(["hr_admin"], MANAGE), { personId: "p1", effectiveUntil: "2026-06-01" });
++    expect(result.kind).toBe("validation_failure");
++  });
++
++  it("rejects an end date that is not after the placement's start", async () => {
++    const h = harness();
++    const request = requestFor(["hr_admin"], MANAGE);
++    await h.service.assignPrimary(request, { personId: "p1", orgUnitId: "ou1", effectiveFrom: "2026-06-01" });
++    const result = await h.service.endAssignment(request, { personId: "p1", effectiveUntil: "2026-01-01" });
++    expect(result.kind).toBe("validation_failure");
++  });
++});
++
++describe("AssignmentService — tenant isolation", () => {
++  it("does not let tenant B see or end tenant A's current placement", async () => {
++    const h = harness("tenant-a");
++    const requestA = requestFor(["hr_admin"], MANAGE, "tenant-a");
++    await h.service.assignPrimary(requestA, { personId: "p1", orgUnitId: "ou1", effectiveFrom: "2026-01-01" });
++
++    // Tenant B has no seeded person/org unit -> ending is a clean not-found, never leaks tenant A data.
++    const requestB = requestFor(["hr_admin"], MANAGE, "tenant-b");
++    const end = await h.service.endAssignment(requestB, { personId: "p1", effectiveUntil: "2026-06-01" });
++    expect(end.kind).toBe("validation_failure");
++
++    const bContext = { tenantId: "tenant-b", actorId: "u", actorName: "u", roles: ["hr_admin"] as PlatformRole[], permissions: { has: () => true, toArray: () => [] } as never, correlationId: "c", authenticationMethod: "test", actorProvenance: "server_verified" as const };
++    expect(await h.reader.getCurrentForPerson(bContext, "p1")).toBeUndefined();
++  });
++});
++
++describe("AssignmentService — transaction rollback", () => {
++  it("releases no events/audit when rejected before writing (self-manager)", async () => {
++    const { service, audit, events } = harness();
++    await service.assignPrimary(requestFor(["hr_admin"], MANAGE), { personId: "p1", orgUnitId: "ou1", managerId: "p1", effectiveFrom: "2026-01-01" });
++    expect(events.list()).toHaveLength(0);
++    expect(audit.list()).toHaveLength(0);
++  });
++});
+diff --git a/src/platform/organization/assignment-service.ts b/src/platform/organization/assignment-service.ts
+new file mode 100644
+index 0000000..e541540
+--- /dev/null
++++ b/src/platform/organization/assignment-service.ts
+@@ -0,0 +1,164 @@
++import { hasPermission } from "@/platform/context";
++import { commandAuthorizationFailure, commandConflict, commandSuccess, commandValidationFailure, type CommandResult } from "@/platform/commands/command-result";
++import { issue } from "@/platform/validation";
++import { createTenantContext, type TrustedRequestContext } from "@/platform/runtime-context";
++import type { UnitOfWork, UnitOfWorkContext } from "@/platform/transactions/unit-of-work";
++import type { AssignmentTransactionRepositories } from "@/platform/organization/assignment-repository";
++import {
++  validateAssignPrimary,
++  validateEndAssignment,
++  validateTransfer,
++  windowsOverlap,
++  type AssignmentRecord,
++} from "@/platform/organization/assignment";
++
++export type AssignmentAssigned = Readonly<{ state: "assigned"; assignment: AssignmentRecord }>;
++export type AssignmentTransferred = Readonly<{ state: "transferred"; previous: AssignmentRecord; assignment: AssignmentRecord }>;
++export type AssignmentEnded = Readonly<{ state: "ended"; assignment: AssignmentRecord }>;
++
++type PlacementInputCheck = "person_not_found" | "manager_not_found" | "org_unit_not_found" | undefined;
++
++/**
++ * The single write entry point for placement. It owns the invariants that
++ * must be enforced against live data *inside the write transaction* — person,
++ * manager, and org unit existence, and "at most one primary assignment in
++ * force per person at any instant" (ADR-012 §7, §12) — and produces audit and
++ * outbox atomically through the UnitOfWork. A transfer is modeled as its own
++ * command (end the current placement, open a new one, same transaction), not
++ * an edit-in-place, so history is always resolvable. Every mutation requires
++ * organization.manage.
++ */
++export class AssignmentService {
++  constructor(private readonly unitOfWork: UnitOfWork<AssignmentTransactionRepositories>) {}
++
++  /** A person's first primary placement, or a future non-overlapping one. */
++  async assignPrimary(
++    request: TrustedRequestContext,
++    input: { personId: string; orgUnitId: string; managerId?: string; effectiveFrom: string },
++  ): Promise<CommandResult<AssignmentAssigned>> {
++    const denied = this.requireManage(request);
++    if (denied) return denied;
++    const validation = validateAssignPrimary(input);
++    if (!validation.success) return commandValidationFailure(validation.issues);
++
++    const tenantId = request.principal.tenantId;
++    const result = await this.unitOfWork.execute(this.context(request, "AssignPrimary"), async ({ repositories }) => {
++      const check = await this.checkPlacementInputs(repositories, tenantId, validation.data);
++      if (check) return check;
++      const existing = await repositories.assignments.listForPerson(tenantId, validation.data.personId);
++      const candidate = { effectiveFrom: validation.data.effectiveFrom, effectiveUntil: undefined };
++      if (existing.some((a) => a.isPrimary && windowsOverlap(a, candidate))) return "overlap" as const;
++      return repositories.assignments.create({
++        tenantId,
++        personId: validation.data.personId,
++        orgUnitId: validation.data.orgUnitId,
++        managerId: validation.data.managerId,
++        effectiveFrom: validation.data.effectiveFrom,
++        createdBy: request.principal.userId,
++      });
++    });
++
++    if (typeof result === "string") {
++      if (result === "person_not_found") return commandValidationFailure([issue("personId", "not_found", "This person does not exist.")]);
++      if (result === "manager_not_found") return commandValidationFailure([issue("managerId", "not_found", "The chosen manager does not exist.")]);
++      if (result === "org_unit_not_found") return commandValidationFailure([issue("orgUnitId", "not_found", "The chosen organization unit does not exist.")]);
++      return commandConflict("This person already has a primary placement in force for the given period."); // overlap
++    }
++    return commandSuccess(Object.freeze({ state: "assigned" as const, assignment: result }));
++  }
++
++  /** Ends the current primary placement and opens a new one, atomically. */
++  async transfer(
++    request: TrustedRequestContext,
++    input: { personId: string; orgUnitId: string; managerId?: string; effectiveFrom: string },
++  ): Promise<CommandResult<AssignmentTransferred>> {
++    const denied = this.requireManage(request);
++    if (denied) return denied;
++    const validation = validateTransfer(input);
++    if (!validation.success) return commandValidationFailure(validation.issues);
++
++    const tenantId = request.principal.tenantId;
++    const result = await this.unitOfWork.execute(this.context(request, "TransferAssignment"), async ({ repositories }) => {
++      const check = await this.checkPlacementInputs(repositories, tenantId, validation.data);
++      if (check) return check;
++      const current = await repositories.assignments.findCurrentPrimaryForPerson(tenantId, validation.data.personId);
++      if (!current) return "no_current_assignment" as const;
++      if (new Date(validation.data.effectiveFrom).getTime() <= new Date(current.effectiveFrom).getTime()) {
++        return "invalid_transfer_date" as const;
++      }
++      const others = (await repositories.assignments.listForPerson(tenantId, validation.data.personId)).filter((a) => a.id !== current.id);
++      const candidate = { effectiveFrom: validation.data.effectiveFrom, effectiveUntil: undefined };
++      if (others.some((a) => a.isPrimary && windowsOverlap(a, candidate))) return "overlap" as const;
++
++      const previous = await repositories.assignments.end({ tenantId, id: current.id, effectiveUntil: validation.data.effectiveFrom });
++      const assignment = await repositories.assignments.create({
++        tenantId,
++        personId: validation.data.personId,
++        orgUnitId: validation.data.orgUnitId,
++        managerId: validation.data.managerId,
++        effectiveFrom: validation.data.effectiveFrom,
++        createdBy: request.principal.userId,
++      });
++      return Object.freeze({ previous, assignment });
++    });
++
++    if (typeof result === "string") {
++      if (result === "person_not_found") return commandValidationFailure([issue("personId", "not_found", "This person does not exist.")]);
++      if (result === "manager_not_found") return commandValidationFailure([issue("managerId", "not_found", "The chosen manager does not exist.")]);
++      if (result === "org_unit_not_found") return commandValidationFailure([issue("orgUnitId", "not_found", "The chosen organization unit does not exist.")]);
++      if (result === "no_current_assignment") return commandValidationFailure([issue("personId", "no_current_assignment", "This person has no current placement to transfer from.")]);
++      if (result === "invalid_transfer_date") return commandValidationFailure([issue("effectiveFrom", "INVALID_DATE", "The transfer date must be after the current placement's start date.")]);
++      return commandConflict("This transfer would overlap another primary placement for this person."); // overlap
++    }
++    return commandSuccess(Object.freeze({ state: "transferred" as const, previous: result.previous, assignment: result.assignment }));
++  }
++
++  /** Closes a person's current primary placement without opening a new one (e.g. offboarding). */
++  async endAssignment(request: TrustedRequestContext, input: { personId: string; effectiveUntil: string }): Promise<CommandResult<AssignmentEnded>> {
++    const denied = this.requireManage(request);
++    if (denied) return denied;
++    const validation = validateEndAssignment(input);
++    if (!validation.success) return commandValidationFailure(validation.issues);
++
++    const tenantId = request.principal.tenantId;
++    const result = await this.unitOfWork.execute(this.context(request, "EndAssignment"), async ({ repositories }) => {
++      const current = await repositories.assignments.findCurrentPrimaryForPerson(tenantId, validation.data.personId);
++      if (!current) return "no_current_assignment" as const;
++      if (new Date(validation.data.effectiveUntil).getTime() <= new Date(current.effectiveFrom).getTime()) {
++        return "invalid_end_date" as const;
++      }
++      return repositories.assignments.end({ tenantId, id: current.id, effectiveUntil: validation.data.effectiveUntil });
++    });
++
++    if (result === "no_current_assignment") return commandValidationFailure([issue("personId", "no_current_assignment", "This person has no current placement to end.")]);
++    if (result === "invalid_end_date") return commandValidationFailure([issue("effectiveUntil", "INVALID_DATE", "The end date must be after the placement's start date.")]);
++    return commandSuccess(Object.freeze({ state: "ended" as const, assignment: result }));
++  }
++
++  private async checkPlacementInputs(
++    repositories: AssignmentTransactionRepositories,
++    tenantId: string,
++    data: { personId: string; orgUnitId: string; managerId?: string },
++  ): Promise<PlacementInputCheck> {
++    if (!(await repositories.people.existsById(tenantId, data.personId))) return "person_not_found";
++    if (data.managerId && !(await repositories.people.existsById(tenantId, data.managerId))) return "manager_not_found";
++    if (!(await repositories.orgUnits.findById(tenantId, data.orgUnitId))) return "org_unit_not_found";
++    return undefined;
++  }
++
++  private requireManage(request: TrustedRequestContext): CommandResult<never> | undefined {
++    return hasPermission(createTenantContext(request), "organization.manage")
++      ? undefined
++      : commandAuthorizationFailure("You are not authorized to manage placements.");
++  }
++
++  private context(request: TrustedRequestContext, commandName: string): UnitOfWorkContext {
++    return {
++      tenantId: request.principal.tenantId,
++      correlationId: request.correlationId,
++      requestId: request.correlationId,
++      actorUserId: request.principal.userId,
++      commandName,
++    };
++  }
++}
+diff --git a/src/platform/organization/assignment-structure.test.ts b/src/platform/organization/assignment-structure.test.ts
+new file mode 100644
+index 0000000..f89d91b
+--- /dev/null
++++ b/src/platform/organization/assignment-structure.test.ts
+@@ -0,0 +1,50 @@
++import { readFileSync, readdirSync } from "node:fs";
++import { join, relative } from "node:path";
++import { describe, expect, it } from "vitest";
++
++/**
++ * Structural guards (ADR-012 §7, §12): there is exactly ONE Assignment
++ * aggregate, ONE overlap-detection implementation, and ONE write entry point.
++ * These catch the specific failure mode the ADR rejects — a second placement
++ * record type, or a parallel overlap check drifting away from the one the
++ * GIST exclusion constraint mirrors.
++ */
++const REPO_ROOT = join(__dirname, "..", "..", "..");
++
++function sourceFiles(): { path: string; content: string }[] {
++  const walk = (dir: string): string[] =>
++    readdirSync(dir, { withFileTypes: true }).flatMap((entry) => {
++      const full = join(dir, entry.name);
++      if (entry.isDirectory()) return entry.name === "node_modules" || entry.name === ".next" ? [] : walk(full);
++      if (/\.(ts|tsx)$/.test(entry.name) && !/\.test\.tsx?$/.test(entry.name)) return [full];
++      return [];
++    });
++  return walk(join(REPO_ROOT, "src")).map((absolute) => ({
++    path: relative(REPO_ROOT, absolute).split("\\").join("/"),
++    content: readFileSync(absolute, "utf8"),
++  }));
++}
++
++describe("a single Assignment aggregate and a single overlap implementation", () => {
++  const files = sourceFiles();
++
++  it("declares the AssignmentRecord aggregate in exactly one file", () => {
++    const declarers = files.filter((f) => /(export\s+)?interface\s+AssignmentRecord\b/.test(f.content));
++    expect(declarers.map((f) => f.path)).toEqual(["src/platform/organization/assignment.ts"]);
++  });
++
++  it("declares the overlap-detection helper in exactly one file", () => {
++    const overlapCheckers = files.filter((f) => /export\s+function\s+windowsOverlap\b/.test(f.content));
++    expect(overlapCheckers.map((f) => f.path)).toEqual(["src/platform/organization/assignment.ts"]);
++  });
++
++  it("declares the single write entry point (AssignmentService) in exactly one file", () => {
++    const services = files.filter((f) => /(export\s+)?class\s+AssignmentService\b/.test(f.content));
++    expect(services.map((f) => f.path)).toEqual(["src/platform/organization/assignment-service.ts"]);
++  });
++
++  it("keeps all Assignment domain code within the organization domain (no Assignment aggregate leaks into other domains)", () => {
++    const foreign = files.filter((f) => /interface\s+AssignmentRecord\b/.test(f.content) && !f.path.startsWith("src/platform/organization/"));
++    expect(foreign).toEqual([]);
++  });
++});
+diff --git a/src/platform/organization/assignment-write-transaction.ts b/src/platform/organization/assignment-write-transaction.ts
+new file mode 100644
+index 0000000..b95b01f
+--- /dev/null
++++ b/src/platform/organization/assignment-write-transaction.ts
+@@ -0,0 +1,74 @@
++import { ServerEventIdGenerator, type DomainEvent, type DomainEventClock, type EventIdGenerator } from "@/platform/events/domain-event";
++import type { UnitOfWorkTransactionContext } from "@/platform/transactions/unit-of-work";
++import type {
++  AssignPrimaryInput,
++  AssignmentWriteRepository,
++  EndAssignmentInput,
++} from "@/platform/organization/assignment-repository";
++import type { AssignmentRecord } from "@/platform/organization/assignment";
++import { createAssignmentAssignedEvent, createAssignmentEndedEvent } from "@/platform/organization/assignment-events";
++
++const systemClock: DomainEventClock = { now: () => new Date().toISOString() };
++
++/**
++ * Transaction-scoped decorator around an AssignmentWriteRepository that
++ * buffers one DomainEvent per successful mutation, mirroring the OrgUnit
++ * pattern so the Assignment UnitOfWork can commit writes, audits, and outbox
++ * messages atomically and release events only after that commit succeeds. A
++ * transfer is two mutations (end + create) in the same transaction, so it
++ * naturally buffers an `ended` event followed by an `assigned` event. Read
++ * methods (findById/listForPerson/findCurrentPrimaryForPerson) pass through
++ * and emit no event.
++ */
++export class AssignmentWriteTransaction implements AssignmentWriteRepository {
++  private readonly events: DomainEvent[] = [];
++
++  constructor(
++    private readonly repository: AssignmentWriteRepository,
++    private readonly context: UnitOfWorkTransactionContext,
++    private readonly eventIds: EventIdGenerator = new ServerEventIdGenerator(),
++    private readonly eventClock: DomainEventClock = systemClock,
++  ) {}
++
++  findById(tenantId: string, id: string): Promise<AssignmentRecord | undefined> {
++    this.assertTenant(tenantId);
++    return this.repository.findById(tenantId, id);
++  }
++
++  listForPerson(tenantId: string, personId: string): Promise<AssignmentRecord[]> {
++    this.assertTenant(tenantId);
++    return this.repository.listForPerson(tenantId, personId);
++  }
++
++  findCurrentPrimaryForPerson(tenantId: string, personId: string): Promise<AssignmentRecord | undefined> {
++    this.assertTenant(tenantId);
++    return this.repository.findCurrentPrimaryForPerson(tenantId, personId);
++  }
++
++  async create(input: AssignPrimaryInput): Promise<AssignmentRecord> {
++    this.assertTenant(input.tenantId);
++    const assignment = await this.repository.create(input);
++    this.events.push(createAssignmentAssignedEvent(assignment, this.eventContext(), this.eventIds, this.eventClock));
++    return assignment;
++  }
++
++  async end(input: EndAssignmentInput): Promise<AssignmentRecord> {
++    this.assertTenant(input.tenantId);
++    const assignment = await this.repository.end(input);
++    this.events.push(createAssignmentEndedEvent(assignment, this.eventContext(), this.eventIds, this.eventClock));
++    return assignment;
++  }
++
++  pullEvents(): readonly DomainEvent[] { return this.events.splice(0, this.events.length); }
++  clearEvents(): void { this.events.length = 0; }
++
++  private eventContext(): Readonly<{ tenantId: string; correlationId: string }> {
++    return Object.freeze({ tenantId: this.context.tenantId, correlationId: this.context.correlationId });
++  }
++
++  private assertTenant(tenantId: string): void {
++    if (tenantId !== this.context.tenantId) {
++      throw Object.freeze({ code: "TENANT_MISMATCH", message: "Transaction access must use its trusted tenant." });
++    }
++  }
++}
+diff --git a/src/platform/organization/assignment.test.ts b/src/platform/organization/assignment.test.ts
+new file mode 100644
+index 0000000..201efb9
+--- /dev/null
++++ b/src/platform/organization/assignment.test.ts
+@@ -0,0 +1,131 @@
++import { describe, expect, it } from "vitest";
++import {
++  isEffectiveAsOf,
++  primaryAsOf,
++  validateAssignPrimary,
++  validateEndAssignment,
++  validateTransfer,
++  windowsOverlap,
++  type AssignmentRecord,
++} from "@/platform/organization/assignment";
++
++function assignment(overrides: Partial<AssignmentRecord> = {}): AssignmentRecord {
++  return Object.freeze({
++    id: "a1", tenantId: "t1", personId: "p1", orgUnitId: "ou1", isPrimary: true,
++    effectiveFrom: "2026-01-01T00:00:00.000Z", createdAt: "2026-01-01T00:00:00.000Z", createdBy: "actor", updatedAt: "2026-01-01T00:00:00.000Z",
++    ...overrides,
++  });
++}
++
++describe("validateAssignPrimary", () => {
++  it("accepts a valid draft", () => {
++    const result = validateAssignPrimary({ personId: "p1", orgUnitId: "ou1", effectiveFrom: "2026-01-01" });
++    expect(result.success).toBe(true);
++  });
++
++  it("rejects a missing person and org unit", () => {
++    const result = validateAssignPrimary({ personId: "", orgUnitId: "", effectiveFrom: "2026-01-01" });
++    expect(result.success).toBe(false);
++    if (!result.success) {
++      expect(result.issues.some((i) => i.path.join(".") === "personId" && i.code === "REQUIRED")).toBe(true);
++      expect(result.issues.some((i) => i.path.join(".") === "orgUnitId" && i.code === "REQUIRED")).toBe(true);
++    }
++  });
++
++  it("rejects an invalid effectiveFrom date", () => {
++    const result = validateAssignPrimary({ personId: "p1", orgUnitId: "ou1", effectiveFrom: "not-a-date" });
++    expect(result.success).toBe(false);
++    if (!result.success) expect(result.issues.some((i) => i.code === "INVALID_DATE")).toBe(true);
++  });
++
++  it("rejects a person who is their own manager", () => {
++    const result = validateAssignPrimary({ personId: "p1", orgUnitId: "ou1", managerId: "p1", effectiveFrom: "2026-01-01" });
++    expect(result.success).toBe(false);
++    if (!result.success) expect(result.issues.some((i) => i.code === "SELF_MANAGER")).toBe(true);
++  });
++
++  it("accepts a manager different from the person", () => {
++    const result = validateAssignPrimary({ personId: "p1", orgUnitId: "ou1", managerId: "p2", effectiveFrom: "2026-01-01" });
++    expect(result.success).toBe(true);
++  });
++});
++
++describe("validateTransfer", () => {
++  it("shares the same validation as validateAssignPrimary", () => {
++    expect(validateTransfer({ personId: "p1", orgUnitId: "ou1", effectiveFrom: "2026-01-01" }).success).toBe(true);
++    expect(validateTransfer({ personId: "", orgUnitId: "ou1", effectiveFrom: "2026-01-01" }).success).toBe(false);
++  });
++});
++
++describe("validateEndAssignment", () => {
++  it("accepts a valid end", () => {
++    expect(validateEndAssignment({ personId: "p1", effectiveUntil: "2026-06-01" }).success).toBe(true);
++  });
++
++  it("rejects a missing person or invalid date", () => {
++    expect(validateEndAssignment({ personId: "", effectiveUntil: "2026-06-01" }).success).toBe(false);
++    expect(validateEndAssignment({ personId: "p1", effectiveUntil: "nope" }).success).toBe(false);
++  });
++});
++
++describe("isEffectiveAsOf", () => {
++  it("is effective on and after effectiveFrom", () => {
++    const a = assignment({ effectiveFrom: "2026-01-01T00:00:00.000Z" });
++    expect(isEffectiveAsOf(a, new Date("2026-01-01T00:00:00.000Z"))).toBe(true);
++    expect(isEffectiveAsOf(a, new Date("2025-12-31T23:59:59.999Z"))).toBe(false);
++  });
++
++  it("is not effective at or after effectiveUntil (half-open window)", () => {
++    const a = assignment({ effectiveFrom: "2026-01-01T00:00:00.000Z", effectiveUntil: "2026-06-01T00:00:00.000Z" });
++    expect(isEffectiveAsOf(a, new Date("2026-05-31T23:59:59.999Z"))).toBe(true);
++    expect(isEffectiveAsOf(a, new Date("2026-06-01T00:00:00.000Z"))).toBe(false);
++    expect(isEffectiveAsOf(a, new Date("2026-06-02T00:00:00.000Z"))).toBe(false);
++  });
++
++  it("with no effectiveUntil, remains effective indefinitely", () => {
++    const a = assignment({ effectiveFrom: "2026-01-01T00:00:00.000Z" });
++    expect(isEffectiveAsOf(a, new Date("2099-01-01T00:00:00.000Z"))).toBe(true);
++  });
++});
++
++describe("windowsOverlap", () => {
++  it("detects overlapping windows", () => {
++    const a = { effectiveFrom: "2026-01-01T00:00:00.000Z", effectiveUntil: "2026-06-01T00:00:00.000Z" };
++    const b = { effectiveFrom: "2026-03-01T00:00:00.000Z", effectiveUntil: "2026-09-01T00:00:00.000Z" };
++    expect(windowsOverlap(a, b)).toBe(true);
++  });
++
++  it("treats adjacent windows (a.until === b.from) as non-overlapping", () => {
++    const a = { effectiveFrom: "2026-01-01T00:00:00.000Z", effectiveUntil: "2026-06-01T00:00:00.000Z" };
++    const b = { effectiveFrom: "2026-06-01T00:00:00.000Z", effectiveUntil: undefined };
++    expect(windowsOverlap(a, b)).toBe(false);
++  });
++
++  it("treats fully separate windows as non-overlapping", () => {
++    const a = { effectiveFrom: "2026-01-01T00:00:00.000Z", effectiveUntil: "2026-02-01T00:00:00.000Z" };
++    const b = { effectiveFrom: "2026-06-01T00:00:00.000Z", effectiveUntil: undefined };
++    expect(windowsOverlap(a, b)).toBe(false);
++  });
++
++  it("treats two open-ended windows as overlapping", () => {
++    const a = { effectiveFrom: "2026-01-01T00:00:00.000Z", effectiveUntil: undefined };
++    const b = { effectiveFrom: "2026-06-01T00:00:00.000Z", effectiveUntil: undefined };
++    expect(windowsOverlap(a, b)).toBe(true);
++  });
++});
++
++describe("primaryAsOf", () => {
++  it("finds the primary assignment in force at a given instant", () => {
++    const list = [
++      assignment({ id: "a1", effectiveFrom: "2026-01-01T00:00:00.000Z", effectiveUntil: "2026-06-01T00:00:00.000Z" }),
++      assignment({ id: "a2", effectiveFrom: "2026-06-01T00:00:00.000Z" }),
++    ];
++    expect(primaryAsOf(list, new Date("2026-03-01T00:00:00.000Z"))?.id).toBe("a1");
++    expect(primaryAsOf(list, new Date("2026-07-01T00:00:00.000Z"))?.id).toBe("a2");
++  });
++
++  it("returns undefined when nothing is effective yet or is non-primary", () => {
++    const list = [assignment({ isPrimary: false }), assignment({ effectiveFrom: "2099-01-01T00:00:00.000Z" })];
++    expect(primaryAsOf(list, new Date("2026-01-01T00:00:00.000Z"))).toBeUndefined();
++  });
++});
+diff --git a/src/platform/organization/assignment.ts b/src/platform/organization/assignment.ts
+new file mode 100644
+index 0000000..a28a354
+--- /dev/null
++++ b/src/platform/organization/assignment.ts
+@@ -0,0 +1,106 @@
++import { invalid, issue, valid, type ValidationResult } from "@/platform/validation";
++
++/**
++ * Assignment — the authoritative, effective-dated placement of a person into
++ * the organization (ADR-012 §5, §7). Employee is no longer the source of
++ * department / team / manager / work location; those live here, over time.
++ *
++ * This slice models the PRIMARY placement only (ADR-012 §12 invariant #3):
++ * at most one primary assignment may be in force for a person at any instant.
++ * Secondary / acting / dotted-line relationships are deferred. A placement is
++ * never edited in place — a transfer ends the current record and creates a new
++ * one, so historical placement is always resolvable.
++ */
++export interface AssignmentRecord {
++  id: string;
++  tenantId: string;
++  /** The employee this placement is for. */
++  personId: string;
++  orgUnitId: string;
++  /** The primary manager (an employee), when the person has one. */
++  managerId?: string;
++  /** Always true this slice; the column exists because "one PRIMARY at a time" is a permanent ADR-012 invariant. */
++  isPrimary: boolean;
++  /** Inclusive start of the placement window (ISO-8601). */
++  effectiveFrom: string;
++  /** Exclusive end; absent means the placement is still in force. */
++  effectiveUntil?: string;
++  createdAt: string;
++  createdBy: string;
++  updatedAt: string;
++}
++
++const isoDate = /^\d{4}-\d{2}-\d{2}(T\d{2}:\d{2}(:\d{2}(\.\d{3})?)?Z?)?$/;
++
++function validInstant(value: string | undefined): boolean {
++  return Boolean(value && isoDate.test(value) && !Number.isNaN(Date.parse(value)));
++}
++
++export interface AssignPrimaryInput {
++  personId: string;
++  orgUnitId: string;
++  managerId?: string;
++  effectiveFrom: string;
++}
++
++/** Validates a new primary assignment's own fields. Cross-aggregate checks (org unit / manager existence, overlap) are enforced by the service against live data. */
++export function validateAssignPrimary(input: AssignPrimaryInput): ValidationResult<AssignPrimaryInput> {
++  const issues = [];
++  if (!input.personId?.trim()) issues.push(issue("personId", "REQUIRED", "A person is required."));
++  if (!input.orgUnitId?.trim()) issues.push(issue("orgUnitId", "REQUIRED", "An organization unit is required."));
++  if (!validInstant(input.effectiveFrom)) issues.push(issue("effectiveFrom", "INVALID_DATE", "A valid effective-from date is required."));
++  if (input.managerId && input.personId && input.managerId === input.personId) issues.push(issue("managerId", "SELF_MANAGER", "A person cannot be their own manager."));
++  return issues.length ? invalid(issues) : valid(input);
++}
++
++export interface TransferInput {
++  personId: string;
++  orgUnitId: string;
++  managerId?: string;
++  effectiveFrom: string;
++}
++
++export function validateTransfer(input: TransferInput): ValidationResult<TransferInput> {
++  return validateAssignPrimary(input);
++}
++
++export interface EndAssignmentInput {
++  personId: string;
++  effectiveUntil: string;
++}
++
++export function validateEndAssignment(input: EndAssignmentInput): ValidationResult<EndAssignmentInput> {
++  const issues = [];
++  if (!input.personId?.trim()) issues.push(issue("personId", "REQUIRED", "A person is required."));
++  if (!validInstant(input.effectiveUntil)) issues.push(issue("effectiveUntil", "INVALID_DATE", "A valid end date is required."));
++  return issues.length ? invalid(issues) : valid(input);
++}
++
++/* -------------------------------------------------------------------------- */
++/* Pure effective-date helpers. No I/O.                                       */
++/* -------------------------------------------------------------------------- */
++
++/** Is this assignment in force at `asOf`? Half-open window: [effectiveFrom, effectiveUntil). */
++export function isEffectiveAsOf(assignment: Pick<AssignmentRecord, "effectiveFrom" | "effectiveUntil">, asOf: Date): boolean {
++  const at = asOf.getTime();
++  if (new Date(assignment.effectiveFrom).getTime() > at) return false;
++  if (assignment.effectiveUntil && new Date(assignment.effectiveUntil).getTime() <= at) return false;
++  return true;
++}
++
++/** Do two half-open windows overlap? Adjacent windows (a.until === b.from) do NOT overlap. */
++export function windowsOverlap(
++  a: Pick<AssignmentRecord, "effectiveFrom" | "effectiveUntil">,
++  b: Pick<AssignmentRecord, "effectiveFrom" | "effectiveUntil">,
++): boolean {
++  const aFrom = new Date(a.effectiveFrom).getTime();
++  const aUntil = a.effectiveUntil ? new Date(a.effectiveUntil).getTime() : Infinity;
++  const bFrom = new Date(b.effectiveFrom).getTime();
++  const bUntil = b.effectiveUntil ? new Date(b.effectiveUntil).getTime() : Infinity;
++  return aFrom < bUntil && bFrom < aUntil;
++}
++
++/** The single primary assignment in force at `asOf` for an already person-scoped list, if any. */
++export function primaryAsOf(assignments: readonly AssignmentRecord[], asOf: Date): AssignmentRecord | undefined {
++  return assignments.find((a) => a.isPrimary && isEffectiveAsOf(a, asOf));
++}
+diff --git a/src/platform/organization/in-memory-assignment-repository.ts b/src/platform/organization/in-memory-assignment-repository.ts
+new file mode 100644
+index 0000000..6384df5
+--- /dev/null
++++ b/src/platform/organization/in-memory-assignment-repository.ts
+@@ -0,0 +1,83 @@
++import { randomUUID } from "node:crypto";
++import { hasPermission, type TenantContext } from "@/platform/context";
++import { AuthorizationError } from "@/platform/errors";
++import type {
++  AssignPrimaryInput,
++  AssignmentReadRepository,
++  AssignmentWriteRepository,
++  EndAssignmentInput,
++} from "@/platform/organization/assignment-repository";
++import type { AssignmentRecord } from "@/platform/organization/assignment";
++
++function requireOrganizationView(context: TenantContext): void {
++  if (!hasPermission(context, "organization.view")) throw new AuthorizationError();
++}
++
++/** Shared in-process store so a test can write via one repository and read via the other. */
++export class AssignmentStore {
++  readonly assignments: AssignmentRecord[] = [];
++}
++
++export class InMemoryAssignmentWriteRepository implements AssignmentWriteRepository {
++  constructor(private readonly store: AssignmentStore = new AssignmentStore()) {}
++
++  async findById(tenantId: string, id: string): Promise<AssignmentRecord | undefined> {
++    return this.store.assignments.find((a) => a.tenantId === tenantId && a.id === id);
++  }
++
++  async listForPerson(tenantId: string, personId: string): Promise<AssignmentRecord[]> {
++    return this.store.assignments
++      .filter((a) => a.tenantId === tenantId && a.personId === personId)
++      .sort((a, b) => a.effectiveFrom.localeCompare(b.effectiveFrom));
++  }
++
++  async findCurrentPrimaryForPerson(tenantId: string, personId: string): Promise<AssignmentRecord | undefined> {
++    return this.store.assignments.find((a) => a.tenantId === tenantId && a.personId === personId && a.isPrimary && !a.effectiveUntil);
++  }
++
++  async create(input: AssignPrimaryInput): Promise<AssignmentRecord> {
++    const now = new Date().toISOString();
++    const assignment: AssignmentRecord = Object.freeze({
++      id: randomUUID(),
++      tenantId: input.tenantId,
++      personId: input.personId,
++      orgUnitId: input.orgUnitId,
++      ...(input.managerId ? { managerId: input.managerId } : {}),
++      isPrimary: true,
++      effectiveFrom: input.effectiveFrom,
++      createdAt: now,
++      createdBy: input.createdBy,
++      updatedAt: now,
++    });
++    this.store.assignments.push(assignment);
++    return assignment;
++  }
++
++  async end(input: EndAssignmentInput): Promise<AssignmentRecord> {
++    const index = this.store.assignments.findIndex((a) => a.tenantId === input.tenantId && a.id === input.id);
++    if (index === -1) throw new Error(`assignment ${input.id} not found for tenant ${input.tenantId}`);
++    const updated = Object.freeze({
++      ...this.store.assignments[index],
++      effectiveUntil: input.effectiveUntil,
++      updatedAt: new Date(Date.now() + 1).toISOString(),
++    });
++    this.store.assignments[index] = updated;
++    return updated;
++  }
++}
++
++export class InMemoryAssignmentReadRepository implements AssignmentReadRepository {
++  constructor(private readonly store: AssignmentStore) {}
++
++  async getCurrentForPerson(context: TenantContext, personId: string): Promise<AssignmentRecord | undefined> {
++    requireOrganizationView(context);
++    return this.store.assignments.find((a) => a.tenantId === context.tenantId && a.personId === personId && a.isPrimary && !a.effectiveUntil);
++  }
++
++  async listHistoryForPerson(context: TenantContext, personId: string): Promise<AssignmentRecord[]> {
++    requireOrganizationView(context);
++    return this.store.assignments
++      .filter((a) => a.tenantId === context.tenantId && a.personId === personId)
++      .sort((a, b) => a.effectiveFrom.localeCompare(b.effectiveFrom));
++  }
++}
+diff --git a/src/platform/organization/in-memory-assignment-unit-of-work.ts b/src/platform/organization/in-memory-assignment-unit-of-work.ts
+new file mode 100644
+index 0000000..6837b70
+--- /dev/null
++++ b/src/platform/organization/in-memory-assignment-unit-of-work.ts
+@@ -0,0 +1,67 @@
++import { randomUUID } from "node:crypto";
++import type { UnitOfWork, UnitOfWorkContext, UnitOfWorkTransaction } from "@/platform/transactions/unit-of-work";
++import { InMemoryDomainEventCollector, type DomainEventCollector } from "@/platform/events/domain-event-collector";
++import { InMemoryAuditCollector, type AuditCollector } from "@/platform/auditing/audit-collector";
++import { AuditRecordFactory } from "@/platform/auditing/audit-record-factory";
++import { ServerAuditIdGenerator } from "@/platform/auditing/audit-record";
++import { AssignmentStore, InMemoryAssignmentWriteRepository } from "@/platform/organization/in-memory-assignment-repository";
++import { AssignmentWriteTransaction } from "@/platform/organization/assignment-write-transaction";
++import { OrgUnitStore, InMemoryOrgUnitWriteRepository } from "@/platform/organization/in-memory-org-unit-repository";
++import { InMemoryPersonExistenceRepository } from "@/platform/organization/in-memory-person-existence-repository";
++import type { AssignmentTransactionRepositories } from "@/platform/organization/assignment-repository";
++
++/**
++ * In-memory transaction coordinator for server-side tests and development
++ * only. Exposes the backing org-unit store and person-existence registry so a
++ * test can seed the org units and employees an assignment must validate
++ * against, in the same way the Prisma adapter reads live tenant data.
++ */
++export class InMemoryAssignmentUnitOfWork implements UnitOfWork<AssignmentTransactionRepositories> {
++  constructor(
++    private readonly store: AssignmentStore = new AssignmentStore(),
++    private readonly orgUnitStore: OrgUnitStore = new OrgUnitStore(),
++    private readonly people: InMemoryPersonExistenceRepository = new InMemoryPersonExistenceRepository(),
++    private readonly eventCollector: DomainEventCollector = new InMemoryDomainEventCollector(),
++    private readonly auditCollector: AuditCollector = new InMemoryAuditCollector(),
++    private readonly auditRecords: AuditRecordFactory = new AuditRecordFactory(new ServerAuditIdGenerator(), { now: () => new Date().toISOString() }),
++    private readonly transactionIds: { next(): string } = { next: () => randomUUID() },
++  ) {}
++
++  getStore(): AssignmentStore { return this.store; }
++  getOrgUnitStore(): OrgUnitStore { return this.orgUnitStore; }
++  getPeople(): InMemoryPersonExistenceRepository { return this.people; }
++
++  async execute<TResult>(
++    context: UnitOfWorkContext,
++    operation: (transaction: UnitOfWorkTransaction<AssignmentTransactionRepositories>) => Promise<TResult>,
++  ): Promise<TResult> {
++    const transactionContext = Object.freeze({ ...context, transactionId: this.transactionIds.next() });
++    const snapshot = [...this.store.assignments];
++    const assignments = new AssignmentWriteTransaction(new InMemoryAssignmentWriteRepository(this.store), transactionContext);
++    const orgUnits = new InMemoryOrgUnitWriteRepository(this.orgUnitStore);
++    const transaction = Object.freeze({ context: transactionContext, repositories: Object.freeze({ assignments, orgUnits, people: this.people }) });
++
++    try {
++      const result = await operation(transaction);
++      const events = assignments.pullEvents();
++      this.eventCollector.collect(events);
++      const { actorUserId, requestId, commandName } = transactionContext;
++      if (actorUserId && requestId && commandName) {
++        this.auditCollector.collect(events.map((event) => this.auditRecords.organizationEvent({
++          tenantId: transactionContext.tenantId,
++          actorUserId,
++          requestId,
++          correlationId: transactionContext.correlationId,
++          transactionId: transactionContext.transactionId,
++          commandName,
++        }, event)));
++      }
++      return result;
++    } catch (error) {
++      this.store.assignments.length = 0;
++      this.store.assignments.push(...snapshot);
++      assignments.clearEvents();
++      throw error;
++    }
++  }
++}
+diff --git a/src/platform/organization/in-memory-person-existence-repository.ts b/src/platform/organization/in-memory-person-existence-repository.ts
+new file mode 100644
+index 0000000..a8bd0a8
+--- /dev/null
++++ b/src/platform/organization/in-memory-person-existence-repository.ts
+@@ -0,0 +1,14 @@
++import type { PersonExistenceRepository } from "@/platform/organization/person-existence-repository";
++
++/** In-memory existence check for server-side tests and development only. Seed known employees with `add`. */
++export class InMemoryPersonExistenceRepository implements PersonExistenceRepository {
++  private readonly known = new Set<string>();
++
++  add(tenantId: string, id: string): void {
++    this.known.add(`${tenantId}::${id}`);
++  }
++
++  async existsById(tenantId: string, id: string): Promise<boolean> {
++    return this.known.has(`${tenantId}::${id}`);
++  }
++}
+diff --git a/src/platform/organization/person-existence-repository.ts b/src/platform/organization/person-existence-repository.ts
+new file mode 100644
+index 0000000..4af7ba2
+--- /dev/null
++++ b/src/platform/organization/person-existence-repository.ts
+@@ -0,0 +1,12 @@
++/**
++ * A minimal, read-only existence check the organization domain needs to
++ * validate that an Assignment's person/manager refers to a real Employee in
++ * the same tenant (ADR-012 §7). This is deliberately not a dependency on the
++ * People domain's write machinery — just enough to turn a missing employee
++ * into a clean validation error instead of a raw foreign-key violation. The
++ * database-level composite foreign key (tenant_id, person_id) -> employees is
++ * the actual guarantee; this is only the pre-check for a good error message.
++ */
++export interface PersonExistenceRepository {
++  existsById(tenantId: string, id: string): Promise<boolean>;
++}
+diff --git a/src/platform/organization/prisma-assignment-read-repository.ts b/src/platform/organization/prisma-assignment-read-repository.ts
+new file mode 100644
+index 0000000..d10b8b9
+--- /dev/null
++++ b/src/platform/organization/prisma-assignment-read-repository.ts
+@@ -0,0 +1,53 @@
++import type { PrismaClient } from "@prisma/client";
++import { hasPermission, type TenantContext } from "@/platform/context";
++import { AuthorizationError } from "@/platform/errors";
++import type { AssignmentReadRepository } from "@/platform/organization/assignment-repository";
++import type { AssignmentRecord } from "@/platform/organization/assignment";
++
++export type PrismaAssignmentReadClient = Pick<PrismaClient, "assignment">;
++
++function requireOrganizationView(context: TenantContext): void {
++  if (!hasPermission(context, "organization.view")) throw new AuthorizationError();
++}
++
++function toRecord(value: {
++  id: string; tenantId: string; personId: string; orgUnitId: string; managerId: string | null;
++  isPrimary: boolean; effectiveFrom: Date; effectiveUntil: Date | null;
++  createdAt: Date; createdBy: string; updatedAt: Date;
++}): AssignmentRecord {
++  return Object.freeze({
++    id: value.id,
++    tenantId: value.tenantId,
++    personId: value.personId,
++    orgUnitId: value.orgUnitId,
++    ...(value.managerId ? { managerId: value.managerId } : {}),
++    isPrimary: value.isPrimary,
++    effectiveFrom: value.effectiveFrom.toISOString(),
++    ...(value.effectiveUntil ? { effectiveUntil: value.effectiveUntil.toISOString() } : {}),
++    createdAt: value.createdAt.toISOString(),
++    createdBy: value.createdBy,
++    updatedAt: value.updatedAt.toISOString(),
++  });
++}
++
++/** Read-only, tenant-scoped. Every method requires organization.view. */
++export class PrismaAssignmentReadRepository implements AssignmentReadRepository {
++  constructor(private readonly prisma: PrismaAssignmentReadClient) {}
++
++  async getCurrentForPerson(context: TenantContext, personId: string): Promise<AssignmentRecord | undefined> {
++    requireOrganizationView(context);
++    const assignment = await this.prisma.assignment.findFirst({
++      where: { tenantId: context.tenantId, personId, isPrimary: true, effectiveUntil: null },
++    });
++    return assignment ? toRecord(assignment) : undefined;
++  }
++
++  async listHistoryForPerson(context: TenantContext, personId: string): Promise<AssignmentRecord[]> {
++    requireOrganizationView(context);
++    const assignments = await this.prisma.assignment.findMany({
++      where: { tenantId: context.tenantId, personId },
++      orderBy: { effectiveFrom: "asc" },
++    });
++    return assignments.map(toRecord);
++  }
++}
+diff --git a/src/platform/organization/prisma-assignment-unit-of-work.ts b/src/platform/organization/prisma-assignment-unit-of-work.ts
+new file mode 100644
+index 0000000..8074a65
+--- /dev/null
++++ b/src/platform/organization/prisma-assignment-unit-of-work.ts
+@@ -0,0 +1,80 @@
++import { randomUUID } from "node:crypto";
++import type { Prisma } from "@prisma/client";
++import { AuditRecordFactory } from "@/platform/auditing/audit-record-factory";
++import { ServerAuditIdGenerator } from "@/platform/auditing/audit-record";
++import type { AuditCollector } from "@/platform/auditing/audit-collector";
++import type { ImmutableAuditRecordRepository } from "@/platform/auditing/immutable-audit-record-repository";
++import type { DomainEventCollector } from "@/platform/events/domain-event-collector";
++import { PrismaAuditRecordRepository } from "@/platform/auditing/prisma-audit-record-repository";
++import { PrismaOutboxRepository } from "@/platform/outbox/prisma-outbox-repository";
++import type { OutboxRepository } from "@/platform/outbox/outbox-repository";
++import { toOutboxMessage } from "@/platform/outbox/outbox-message";
++import { PrismaAssignmentWriteRepository } from "@/platform/organization/prisma-assignment-write-repository";
++import { AssignmentWriteTransaction } from "@/platform/organization/assignment-write-transaction";
++import { PrismaOrgUnitWriteRepository } from "@/platform/organization/prisma-org-unit-write-repository";
++import { PrismaPersonExistenceRepository } from "@/platform/organization/prisma-person-existence-repository";
++import type { AssignmentTransactionRepositories } from "@/platform/organization/assignment-repository";
++import type { UnitOfWork, UnitOfWorkContext, UnitOfWorkTransaction } from "@/platform/transactions/unit-of-work";
++import type { DomainEvent } from "@/platform/events/domain-event";
++
++/** A Prisma client able to own an interactive transaction spanning assignment, org-unit, employee, audit, and outbox tables. */
++export type PrismaAssignmentTransactionRunner = Readonly<{
++  $transaction<T>(fn: (client: Prisma.TransactionClient) => Promise<T>): Promise<T>;
++}>;
++
++/**
++ * Durable transaction coordinator for placement. Mirrors
++ * PrismaOrgUnitUnitOfWork: assignment writes, audit records, and outbox
++ * messages commit atomically inside one Prisma $transaction; domain events
++ * are released to their collector only after that commit succeeds. `orgUnits`
++ * and `people` are exposed read-only, for the service's in-transaction
++ * existence checks (ADR-012 §7).
++ */
++export class PrismaAssignmentUnitOfWork implements UnitOfWork<AssignmentTransactionRepositories> {
++  constructor(
++    private readonly prisma: PrismaAssignmentTransactionRunner,
++    private readonly eventCollector: DomainEventCollector,
++    private readonly auditCollector: AuditCollector,
++    private readonly auditRecords: AuditRecordFactory = new AuditRecordFactory(new ServerAuditIdGenerator(), { now: () => new Date().toISOString() }),
++    private readonly transactionIds: { next(): string } = { next: () => randomUUID() },
++    private readonly auditRepositoryFactory: (client: ConstructorParameters<typeof PrismaAuditRecordRepository>[0]) => ImmutableAuditRecordRepository = (client) => new PrismaAuditRecordRepository(client),
++    private readonly outboxRepositoryFactory: (client: ConstructorParameters<typeof PrismaOutboxRepository>[0]) => OutboxRepository = (client) => new PrismaOutboxRepository(client),
++  ) {}
++
++  async execute<TResult>(
++    context: UnitOfWorkContext,
++    operation: (transaction: UnitOfWorkTransaction<AssignmentTransactionRepositories>) => Promise<TResult>,
++  ): Promise<TResult> {
++    const transactionContext = Object.freeze({ ...context, transactionId: this.transactionIds.next() });
++    const committed = await this.prisma.$transaction(async (client) => {
++      const assignments = new AssignmentWriteTransaction(new PrismaAssignmentWriteRepository(client), transactionContext);
++      const orgUnits = new PrismaOrgUnitWriteRepository(client);
++      const people = new PrismaPersonExistenceRepository(client);
++      const transaction = Object.freeze({ context: transactionContext, repositories: Object.freeze({ assignments, orgUnits, people }) });
++      const result = await operation(transaction);
++      const events = assignments.pullEvents();
++      const records = this.createAuditRecords(transactionContext, events);
++      await this.auditRepositoryFactory(client).append(records);
++      const messages = events.map(toOutboxMessage);
++      await this.outboxRepositoryFactory(client).append(messages);
++      return Object.freeze({ result, events, records, messages });
++    });
++
++    this.eventCollector.collect(committed.events);
++    this.auditCollector.collect(committed.records);
++    return committed.result;
++  }
++
++  private createAuditRecords(context: UnitOfWorkTransaction<AssignmentTransactionRepositories>["context"], events: readonly DomainEvent[]) {
++    const { actorUserId, requestId, commandName } = context;
++    if (!actorUserId || !requestId || !commandName) return [];
++    return events.map((event) => this.auditRecords.organizationEvent({
++      tenantId: context.tenantId,
++      actorUserId,
++      requestId,
++      correlationId: context.correlationId,
++      transactionId: context.transactionId,
++      commandName,
++    }, event));
++  }
++}
+diff --git a/src/platform/organization/prisma-assignment-write-repository.ts b/src/platform/organization/prisma-assignment-write-repository.ts
+new file mode 100644
+index 0000000..34cc16e
+--- /dev/null
++++ b/src/platform/organization/prisma-assignment-write-repository.ts
+@@ -0,0 +1,83 @@
++import type { Prisma } from "@prisma/client";
++import type {
++  AssignPrimaryInput,
++  AssignmentWriteRepository,
++  EndAssignmentInput,
++} from "@/platform/organization/assignment-repository";
++import type { AssignmentRecord } from "@/platform/organization/assignment";
++
++export type PrismaAssignmentWriteClient = Pick<Prisma.TransactionClient, "assignment">;
++
++function toRecord(value: {
++  id: string; tenantId: string; personId: string; orgUnitId: string; managerId: string | null;
++  isPrimary: boolean; effectiveFrom: Date; effectiveUntil: Date | null;
++  createdAt: Date; createdBy: string; updatedAt: Date;
++}): AssignmentRecord {
++  return Object.freeze({
++    id: value.id,
++    tenantId: value.tenantId,
++    personId: value.personId,
++    orgUnitId: value.orgUnitId,
++    ...(value.managerId ? { managerId: value.managerId } : {}),
++    isPrimary: value.isPrimary,
++    effectiveFrom: value.effectiveFrom.toISOString(),
++    ...(value.effectiveUntil ? { effectiveUntil: value.effectiveUntil.toISOString() } : {}),
++    createdAt: value.createdAt.toISOString(),
++    createdBy: value.createdBy,
++    updatedAt: value.updatedAt.toISOString(),
++  });
++}
++
++/**
++ * Write-side adapter, used only inside an Assignment write transaction.
++ * Tenant scoping is on every query's where clause. Overlap prevention is
++ * enforced twice: here the service pre-checks in-transaction against live
++ * data for a clean error, and the database's GIST exclusion constraint is the
++ * actual guarantee against a race.
++ */
++export class PrismaAssignmentWriteRepository implements AssignmentWriteRepository {
++  constructor(private readonly prisma: PrismaAssignmentWriteClient) {}
++
++  async findById(tenantId: string, id: string): Promise<AssignmentRecord | undefined> {
++    const assignment = await this.prisma.assignment.findFirst({ where: { tenantId, id } });
++    return assignment ? toRecord(assignment) : undefined;
++  }
++
++  async listForPerson(tenantId: string, personId: string): Promise<AssignmentRecord[]> {
++    const assignments = await this.prisma.assignment.findMany({ where: { tenantId, personId }, orderBy: { effectiveFrom: "asc" } });
++    return assignments.map(toRecord);
++  }
++
++  async findCurrentPrimaryForPerson(tenantId: string, personId: string): Promise<AssignmentRecord | undefined> {
++    const assignment = await this.prisma.assignment.findFirst({ where: { tenantId, personId, isPrimary: true, effectiveUntil: null } });
++    return assignment ? toRecord(assignment) : undefined;
++  }
++
++  async create(input: AssignPrimaryInput): Promise<AssignmentRecord> {
++    const assignment = await this.prisma.assignment.create({
++      data: {
++        tenantId: input.tenantId,
++        personId: input.personId,
++        orgUnitId: input.orgUnitId,
++        managerId: input.managerId ?? null,
++        effectiveFrom: new Date(input.effectiveFrom),
++        createdBy: input.createdBy,
++      },
++    });
++    return toRecord(assignment);
++  }
++
++  async end(input: EndAssignmentInput): Promise<AssignmentRecord> {
++    // updateMany (not update) so the where clause can be tenant-scoped without
++    // requiring a compound (tenantId, id) unique key — id alone is never
++    // trusted for a write, even though it is a UUID.
++    const result = await this.prisma.assignment.updateMany({
++      where: { id: input.id, tenantId: input.tenantId },
++      data: { effectiveUntil: new Date(input.effectiveUntil) },
++    });
++    if (result.count === 0) throw new Error(`assignment ${input.id} not found for tenant ${input.tenantId}`);
++    const updated = await this.prisma.assignment.findFirst({ where: { id: input.id, tenantId: input.tenantId } });
++    if (!updated) throw new Error(`assignment ${input.id} not found for tenant ${input.tenantId}`);
++    return toRecord(updated);
++  }
++}
+diff --git a/src/platform/organization/prisma-person-existence-repository.ts b/src/platform/organization/prisma-person-existence-repository.ts
+new file mode 100644
+index 0000000..67d1ae1
+--- /dev/null
++++ b/src/platform/organization/prisma-person-existence-repository.ts
+@@ -0,0 +1,14 @@
++import type { Prisma } from "@prisma/client";
++import type { PersonExistenceRepository } from "@/platform/organization/person-existence-repository";
++
++export type PrismaPersonExistenceClient = Pick<Prisma.TransactionClient, "employee">;
++
++/** Existence-only adapter over the `employees` table, used inside an Assignment write transaction. */
++export class PrismaPersonExistenceRepository implements PersonExistenceRepository {
++  constructor(private readonly prisma: PrismaPersonExistenceClient) {}
++
++  async existsById(tenantId: string, id: string): Promise<boolean> {
++    const found = await this.prisma.employee.findFirst({ where: { tenantId, employeeId: id }, select: { employeeId: true } });
++    return found !== null;
++  }
++}
+-- 
+2.43.0
+

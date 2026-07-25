@@ -1,0 +1,1589 @@
+From ff9dec1b44ffd934ef91b472de4a43d76a0ed60a Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sat, 25 Jul 2026 01:49:11 +0000
+Subject: [PATCH] Epic 7B.4: Organization Query & People Integration (ADR-012)
+
+Exposes the Organization domain for read-side consumers and retires the
+organization-reference placeholder that was wired into production with
+dev-fixture-only data. No new aggregates; read-only.
+
+- OrganizationQueryService: resolveCurrentAssignment, resolveAssignmentAsOf,
+  resolveAssignmentHistory, resolveManager, resolveReports, resolveOrgPath
+  (ancestor chain), resolveDescendants, resolveOrgUnitsByKind, and a
+  standalone Location lookup. Composes the three existing read repositories
+  only - never Prisma directly, never the write side - so every placement
+  question resolves through Assignment (ADR-012 SS12 invariant #5).
+- Assignment gains listCurrentByManager (+Prisma+in-memory), backed by a new
+  partial index on (tenant_id, manager_id) WHERE effective_until IS NULL,
+  for an efficient "direct reports" query - verified against real Postgres.
+- People-facing OrganizationPlacementService (port + Prisma impl) is the one
+  place an Organization id becomes a display name: composes
+  OrganizationQueryService with a minimal, direct employee display-name
+  lookup. Department/team are derived from the org path (the nearest
+  DEPARTMENT/TEAM ancestor of the assigned OrgUnit), since OrgUnit is a
+  general recursive tree, not a fixed two-level hierarchy.
+- Migrated all three real consumers off the placeholder: People profile,
+  People directory (row display + department picker), and the Hire flow's
+  department/team/manager pickers - retiring
+  organization-reference-{repository,service}.ts entirely.
+- Architecture fitness: the query service can't import Prisma directly or
+  the write side; client components can't import either server composition;
+  a structural test confirms exactly one query service, one placement-service
+  implementation, and that placement resolution never reads a denormalized
+  Employee field.
+- 60 new/updated unit tests + 1 new integration test (listCurrentByManager
+  against real Postgres).
+
+Known gap, documented rather than papered over: Assignment carries no
+locationId (deferred in 7B.2/7B.3), so Location lookup is standalone and not
+yet part of "current placement" - profile.location still reads the legacy
+workLocation string. Closing that requires a future write-side slice.
+
+Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_012xkyMKxXWptQtBxJmKLszv
+---
+ .../migration.sql                             |   6 +
+ src/platform/application-runtime.ts           |   8 +-
+ .../architecture/import-boundaries.test.ts    |  27 +++
+ .../architecture/import-boundaries.ts         |  31 +++
+ .../capabilities/business-capabilities.ts     |   6 +-
+ src/platform/composition-root.ts              |  22 +-
+ .../assignment-platform.integration.test.ts   |  27 +++
+ .../organization/assignment-repository.ts     |   2 +
+ .../in-memory-assignment-repository.ts        |   7 +
+ .../organization-query-service.test.ts        | 223 ++++++++++++++++++
+ .../organization-query-service.ts             | 117 +++++++++
+ .../organization-query-structure.test.ts      |  76 ++++++
+ .../organization-reference-repository.ts      |  40 ----
+ .../organization-reference-service.test.ts    |  64 -----
+ .../organization-reference-service.ts         |  62 -----
+ .../prisma-assignment-read-repository.ts      |   9 +
+ .../people/directory-runtime-loader.test.ts   |  14 +-
+ .../people/directory-runtime-loader.ts        |  13 +-
+ .../people/prisma-people-read-runtime.ts      |  18 +-
+ .../people/profile-runtime-loader.test.ts     |  18 +-
+ src/platform/people/profile-runtime-loader.ts |  16 +-
+ .../read-models/employee-display-lookup.ts    |  12 +
+ .../organization-placement-service.ts         |  22 ++
+ .../prisma-employee-display-lookup.ts         |  22 ++
+ ...sma-organization-placement-service.test.ts | 162 +++++++++++++
+ .../prisma-organization-placement-service.ts  |  83 +++++++
+ src/platform/people/runtime-hire-loader.ts    |   2 +-
+ src/platform/tokens.ts                        |   6 +-
+ 28 files changed, 894 insertions(+), 221 deletions(-)
+ create mode 100644 prisma/migrations/20260725013223_organization_assignment_manager_index/migration.sql
+ create mode 100644 src/platform/organization/organization-query-service.test.ts
+ create mode 100644 src/platform/organization/organization-query-service.ts
+ create mode 100644 src/platform/organization/organization-query-structure.test.ts
+ delete mode 100644 src/platform/organization/organization-reference-repository.ts
+ delete mode 100644 src/platform/organization/organization-reference-service.test.ts
+ delete mode 100644 src/platform/organization/organization-reference-service.ts
+ create mode 100644 src/platform/people/read-models/employee-display-lookup.ts
+ create mode 100644 src/platform/people/read-models/organization-placement-service.ts
+ create mode 100644 src/platform/people/read-models/prisma-employee-display-lookup.ts
+ create mode 100644 src/platform/people/read-models/prisma-organization-placement-service.test.ts
+ create mode 100644 src/platform/people/read-models/prisma-organization-placement-service.ts
+
+diff --git a/prisma/migrations/20260725013223_organization_assignment_manager_index/migration.sql b/prisma/migrations/20260725013223_organization_assignment_manager_index/migration.sql
+new file mode 100644
+index 0000000..78d7e99
+--- /dev/null
++++ b/prisma/migrations/20260725013223_organization_assignment_manager_index/migration.sql
+@@ -0,0 +1,6 @@
++-- Index: fast lookup of a manager's current direct reports (Epic 7B.4
++-- Organization Query & People Integration). Mirrors the existing
++-- assignments_tenant_id_person_id_current_idx pattern — a partial index over
++-- only currently-open assignments, since "direct reports" always means the
++-- present-day org chart, not history.
++CREATE INDEX "assignments_tenant_id_manager_id_current_idx" ON "assignments"("tenant_id", "manager_id") WHERE "effective_until" IS NULL;
+diff --git a/src/platform/application-runtime.ts b/src/platform/application-runtime.ts
+index 7e391b1..c3c8898 100644
+--- a/src/platform/application-runtime.ts
++++ b/src/platform/application-runtime.ts
+@@ -5,8 +5,8 @@ import type { TrustedRequestContext } from "@/platform/runtime-context";
+ import { createTenantContext } from "@/platform/runtime-context";
+ import { PEOPLE_SERVICE } from "@/platform/tokens";
+ import type { TenantContext } from "@/platform/context";
+-import type { OrganizationReferenceService } from "@/platform/organization/organization-reference-service";
+-import { ORGANIZATION_REFERENCE_SERVICE } from "@/platform/tokens";
++import type { OrganizationPlacementService } from "@/platform/people/read-models/organization-placement-service";
++import { ORGANIZATION_PLACEMENT_SERVICE } from "@/platform/tokens";
+ import { CommandExecutionPipeline } from "@/platform/commands/command-execution-pipeline";
+ import type { CommandResult } from "@/platform/commands/command-result";
+ import type { CreateEmployeeCommand } from "@/platform/people/commands/create-employee-command";
+@@ -18,7 +18,7 @@ import { EMPLOYEE_UNIT_OF_WORK } from "@/platform/tokens";
+ export interface ApplicationRuntime {
+   readonly context: TenantContext;
+   readonly people: PeopleService;
+-  readonly organizationReferences: OrganizationReferenceService;
++  readonly organizationPlacements: OrganizationPlacementService;
+   readonly commands: Readonly<{
+     executeCreateEmployee(command: CreateEmployeeCommand): Promise<CommandResult<CreateEmployeePreparation>>;
+     executeInMemoryEmployeeCreate(command: CreateEmployeeCommand): Promise<CommandResult<InMemoryEmployeeCreation>>;
+@@ -39,7 +39,7 @@ export function createApplicationRuntime(request: TrustedRequestContext, root: S
+   return {
+     context: createTenantContext(request),
+     people: scope.resolve(PEOPLE_SERVICE),
+-    organizationReferences: scope.resolve(ORGANIZATION_REFERENCE_SERVICE),
++    organizationPlacements: scope.resolve(ORGANIZATION_PLACEMENT_SERVICE),
+     commands: Object.freeze({
+       executeCreateEmployee: (command) => preparationCommands.execute<CreateEmployeeCommand, CreateEmployeePreparation>(request, command),
+       executeInMemoryEmployeeCreate: (command) => inMemoryWriteCommands.execute<CreateEmployeeCommand, InMemoryEmployeeCreation>(request, command),
+diff --git a/src/platform/architecture/import-boundaries.test.ts b/src/platform/architecture/import-boundaries.test.ts
+index d92edd3..213d46e 100644
+--- a/src/platform/architecture/import-boundaries.test.ts
++++ b/src/platform/architecture/import-boundaries.test.ts
+@@ -251,6 +251,33 @@ describe("import boundary fitness rules (fixtures prove each rule actually catch
+     const file: SourceFile = { path: "src/platform/organization/location-service.ts", content: `import { hasPermission } from "@/platform/context";\nimport { validateCreateLocationDraft } from "@/platform/organization/location";\n` };
+     expect(scanImportBoundaries([file])).toHaveLength(0);
+   });
++
++  it("flags the organization query service importing Prisma directly (queries must go through the read repositories, never bypass Assignment)", () => {
++    const file: SourceFile = { path: "src/platform/organization/organization-query-service.ts", content: `import type { PrismaClient } from "@prisma/client";\n` };
++    expect(scanImportBoundaries([file])).toContainEqual({ path: file.path, rule: "organization-query-service-must-not-import-prisma-directly", matchedImport: "@prisma/client" });
++  });
++
++  it("flags the organization query service importing the write side (a read service must never mutate an aggregate)", () => {
++    const file: SourceFile = { path: "src/platform/organization/organization-query-service.ts", content: `import { LocationService } from "@/platform/organization/location-service";\n` };
++    expect(scanImportBoundaries([file])).toContainEqual({ path: file.path, rule: "organization-query-service-must-not-import-write-side", matchedImport: "@/platform/organization/location-service" });
++  });
++
++  it("flags a client component importing the organization query service or the People placement service (ADR-012 server composition)", () => {
++    const queryFile: SourceFile = { path: "src/components/organization/bad-query-client.tsx", content: `"use client";\nimport { OrganizationQueryService } from "@/platform/organization/organization-query-service";\n` };
++    const placementFile: SourceFile = { path: "src/components/people/bad-placement-client.tsx", content: `"use client";\nimport { PrismaOrganizationPlacementService } from "@/platform/people/read-models/prisma-organization-placement-service";\n` };
++    expect(scanImportBoundaries([queryFile])).toContainEqual({ path: queryFile.path, rule: "client-components-must-not-import-organization-server-composition", matchedImport: "@/platform/organization/organization-query-service" });
++    expect(scanImportBoundaries([placementFile])).toContainEqual({ path: placementFile.path, rule: "client-components-must-not-import-organization-server-composition", matchedImport: "@/platform/people/read-models/prisma-organization-placement-service" });
++  });
++
++  it("flags the People placement service implementation importing the Organization write side", () => {
++    const file: SourceFile = { path: "src/platform/people/read-models/prisma-organization-placement-service.ts", content: `import { AssignmentService } from "@/platform/organization/assignment-service";\n` };
++    expect(scanImportBoundaries([file])).toContainEqual({ path: file.path, rule: "organization-placement-service-must-not-import-write-side", matchedImport: "@/platform/organization/assignment-service" });
++  });
++
++  it("does not flag the legitimate organization query service composing the three read repositories", () => {
++    const file: SourceFile = { path: "src/platform/organization/organization-query-service.ts", content: `import type { AssignmentReadRepository } from "@/platform/organization/assignment-repository";\nimport type { OrgUnitReadRepository } from "@/platform/organization/org-unit-repository";\nimport type { LocationReadRepository } from "@/platform/organization/location-repository";\n` };
++    expect(scanImportBoundaries([file])).toHaveLength(0);
++  });
+ });
+ 
+ describe("import boundary fitness rules — real codebase scan", () => {
+diff --git a/src/platform/architecture/import-boundaries.ts b/src/platform/architecture/import-boundaries.ts
+index 37e4a7a..86bd98f 100644
+--- a/src/platform/architecture/import-boundaries.ts
++++ b/src/platform/architecture/import-boundaries.ts
+@@ -57,6 +57,14 @@ const isOrganizationReadRepository = (file: SourceFile) => ORGANIZATION_READ_REP
+ // Location is a dimension orthogonal to the OrgUnit tree (ADR-012 §5) — never
+ // a node within it, never owned by it. OrgUnit code must never reach into it.
+ const isOrgUnitCode = (file: SourceFile) => file.path.startsWith("src/platform/organization/org-unit");
++// The Epic 7B.4 read-side query surface. It composes the three read
++// repositories only — never Prisma directly, never the write side.
++const isOrganizationQueryService = (file: SourceFile) => file.path === "src/platform/organization/organization-query-service.ts";
++// The People-side integration that turns Organization ids into display
++// names (replaces the retired organization-reference placeholder). It reads
++// through OrganizationQueryService and a minimal employee display lookup —
++// never the Organization write side.
++const isOrganizationPlacementImplementation = (file: SourceFile) => file.path === "src/platform/people/read-models/prisma-organization-placement-service.ts";
+ 
+ const WRITE_RUNTIME_IMPORTS = [
+   /^@prisma\/client/,
+@@ -133,6 +141,9 @@ const ORGANIZATION_SERVER_ONLY_IMPORTS = [
+   /platform\/organization\/prisma-org-unit-read-repository/,
+   /platform\/organization\/prisma-assignment-read-repository/,
+   /platform\/organization\/prisma-location-read-repository/,
++  /platform\/organization\/organization-query-service/,
++  /platform\/people\/read-models\/prisma-organization-placement-service/,
++  /platform\/people\/read-models\/prisma-employee-display-lookup/,
+ ];
+ 
+ // Anything that lets a caller obtain or construct a TrustedRequestContext —
+@@ -255,6 +266,26 @@ export const RULES: Rule[] = [
+     appliesTo: isOrgUnitCode,
+     forbidden: [/platform\/organization\/location/],
+   },
++  {
++    // Epic 7B.4: every organizational query must go through the read
++    // repositories (which themselves resolve through Assignment) — never
++    // straight to Prisma. This is what keeps "queries must not bypass
++    // Assignment" mechanically true, not just a convention.
++    name: "organization-query-service-must-not-import-prisma-directly",
++    appliesTo: isOrganizationQueryService,
++    forbidden: [/^@prisma\/client/, /platform\/persistence\/prisma-client/],
++  },
++  {
++    // A read-only query surface must never be able to mutate an aggregate.
++    name: "organization-query-service-must-not-import-write-side",
++    appliesTo: isOrganizationQueryService,
++    forbidden: ORGANIZATION_WRITE_SIDE_IMPORTS,
++  },
++  {
++    name: "organization-placement-service-must-not-import-write-side",
++    appliesTo: isOrganizationPlacementImplementation,
++    forbidden: ORGANIZATION_WRITE_SIDE_IMPORTS,
++  },
+ ];
+ 
+ /** Pure scan: given source files, returns every boundary violation found. Deterministic, no filesystem access. */
+diff --git a/src/platform/capabilities/business-capabilities.ts b/src/platform/capabilities/business-capabilities.ts
+index 48be8c6..91abdaa 100644
+--- a/src/platform/capabilities/business-capabilities.ts
++++ b/src/platform/capabilities/business-capabilities.ts
+@@ -71,10 +71,10 @@ const hireParityCapabilities = [
+ 
+ const profileCapabilities = [
+   cap("PEOPLE.PROFILE.READ", "View profile overview", { entryPoint: "/people/[employeeId]", implementation: "PeopleService.getProfile → ProfileOverviewViewModel", readModel: "ProfileOverviewViewModel" }),
+-  cap("PEOPLE.PROFILE.EMPLOYMENT.READ", "View employment information", { entryPoint: "/employment", implementation: "profile loader + OrganizationReferenceService", readModel: "ProfileEmploymentViewModel" }),
+-  cap("PEOPLE.PROFILE.WORK_INFORMATION.READ", "View work information", { entryPoint: "/work-information", implementation: "profile loader + OrganizationReferenceService", readModel: "ProfileWorkInformationViewModel" }),
++  cap("PEOPLE.PROFILE.EMPLOYMENT.READ", "View employment information", { entryPoint: "/employment", implementation: "profile loader + OrganizationPlacementService", readModel: "ProfileEmploymentViewModel" }),
++  cap("PEOPLE.PROFILE.WORK_INFORMATION.READ", "View work information", { entryPoint: "/work-information", implementation: "profile loader + OrganizationPlacementService", readModel: "ProfileWorkInformationViewModel" }),
+   cap("PEOPLE.CONTACT.READ", "View contact information", { entryPoint: "/contact-information", implementation: "PeopleService.getContact", readModel: "ProfileContactInformationViewModel", sensitivity: "personal" }),
+-  cap("PEOPLE.ORGANIZATION_REFERENCES.READ", "Resolve organization references", { entryPoint: "Employment and Work Information", implementation: "OrganizationReferenceService" }),
++  cap("PEOPLE.ORGANIZATION_REFERENCES.READ", "Resolve organization placement (department/team/manager) through Assignment", { entryPoint: "Employment and Work Information", implementation: "OrganizationPlacementService" }),
+   cap("PEOPLE.PROFILE.HEADER.READ", "View profile header", { entryPoint: "profile shell", implementation: "ProfileOverviewViewModel" }),
+   cap("PEOPLE.PROFILE.TABS.NAVIGATE", "Navigate profile tabs", { entryPoint: "ProfileNav", implementation: "runtime tab links" }),
+   cap("PEOPLE.PROFILE.HISTORICAL_ROUTES.OPEN", "Open direct historical tab URLs", { entryPoint: "deferred routes", implementation: "RuntimeProfilePage deferred state", runtimeStatus: "DEFERRED_VISIBLE" }),
+diff --git a/src/platform/composition-root.ts b/src/platform/composition-root.ts
+index 9757344..d2c956a 100644
+--- a/src/platform/composition-root.ts
++++ b/src/platform/composition-root.ts
+@@ -4,13 +4,18 @@ import { AuditRecordFactory } from "@/platform/auditing/audit-record-factory";
+ import { ServerAuditIdGenerator } from "@/platform/auditing/audit-record";
+ import { InMemoryDomainEventCollector } from "@/platform/events/domain-event-collector";
+ import { ServiceContainer } from "@/platform/di";
+-import { AUDIT_COLLECTOR, AUDIT_RECORD_FACTORY, AUDIT_REPOSITORY, DOMAIN_EVENT_COLLECTOR, EMPLOYEE_AGGREGATE_REPOSITORY, EMPLOYEE_REPOSITORY, EMPLOYEE_UNIT_OF_WORK, ORGANIZATION_REFERENCE_REPOSITORY, ORGANIZATION_REFERENCE_SERVICE, PEOPLE_SERVICE } from "@/platform/tokens";
++import { AUDIT_COLLECTOR, AUDIT_RECORD_FACTORY, AUDIT_REPOSITORY, DOMAIN_EVENT_COLLECTOR, EMPLOYEE_AGGREGATE_REPOSITORY, EMPLOYEE_REPOSITORY, EMPLOYEE_UNIT_OF_WORK, ORGANIZATION_PLACEMENT_SERVICE, PEOPLE_SERVICE } from "@/platform/tokens";
+ import { InMemoryEmployeeRepository } from "@/platform/people/in-memory-employee-repository";
+ import { InMemoryEmployeeAggregateRepository } from "@/platform/people/persistence/in-memory-employee-aggregate-repository";
+ import { InMemoryEmployeeUnitOfWork } from "@/platform/people/persistence/in-memory-employee-unit-of-work";
+ import { PeopleApplicationService } from "@/platform/people/application/people-service";
+-import { InMemoryOrganizationReferenceRepository } from "@/platform/organization/organization-reference-repository";
+-import { OrganizationReferenceApplicationService } from "@/platform/organization/organization-reference-service";
++import { getPrismaClient } from "@/platform/persistence/prisma-client";
++import { OrganizationQueryService } from "@/platform/organization/organization-query-service";
++import { PrismaAssignmentReadRepository } from "@/platform/organization/prisma-assignment-read-repository";
++import { PrismaOrgUnitReadRepository } from "@/platform/organization/prisma-org-unit-read-repository";
++import { PrismaLocationReadRepository } from "@/platform/organization/prisma-location-read-repository";
++import { PrismaOrganizationPlacementService } from "@/platform/people/read-models/prisma-organization-placement-service";
++import { PrismaEmployeeDisplayLookup } from "@/platform/people/read-models/prisma-employee-display-lookup";
+ 
+ export function createPlatformContainer(): ServiceContainer {
+   const container = new ServiceContainer();
+@@ -25,8 +30,15 @@ export function createPlatformContainer(): ServiceContainer {
+   container.registerSingleton(AUDIT_COLLECTOR, audits);
+   container.registerSingleton(AUDIT_RECORD_FACTORY, auditFactory);
+   container.registerSingleton(EMPLOYEE_UNIT_OF_WORK, new InMemoryEmployeeUnitOfWork(employeeAggregates, domainEvents, audits, auditFactory));
+-  container.registerSingleton(ORGANIZATION_REFERENCE_REPOSITORY, new InMemoryOrganizationReferenceRepository());
+   container.registerFactory(PEOPLE_SERVICE, (scope) => new PeopleApplicationService(scope.resolve(EMPLOYEE_REPOSITORY), scope.resolve(AUDIT_REPOSITORY)));
+-  container.registerFactory(ORGANIZATION_REFERENCE_SERVICE, (scope) => new OrganizationReferenceApplicationService(scope.resolve(ORGANIZATION_REFERENCE_REPOSITORY)));
++  container.registerFactory(ORGANIZATION_PLACEMENT_SERVICE, () => {
++    const prisma = getPrismaClient();
++    const organizationQuery = new OrganizationQueryService(
++      new PrismaAssignmentReadRepository(prisma),
++      new PrismaOrgUnitReadRepository(prisma),
++      new PrismaLocationReadRepository(prisma),
++    );
++    return new PrismaOrganizationPlacementService(organizationQuery, new PrismaEmployeeDisplayLookup(prisma));
++  });
+   return container;
+ }
+diff --git a/src/platform/organization/assignment-platform.integration.test.ts b/src/platform/organization/assignment-platform.integration.test.ts
+index b213484..d67d614 100644
+--- a/src/platform/organization/assignment-platform.integration.test.ts
++++ b/src/platform/organization/assignment-platform.integration.test.ts
+@@ -165,4 +165,31 @@ describe("assignment platform (integration)", () => {
+       data: { tenantId: tenantA, personId, orgUnitId: foreignOrgUnit.id, effectiveFrom: new Date("2026-01-01"), createdBy: "tester" },
+     })).rejects.toThrow();
+   });
++
++  it("listCurrentByManager returns only that manager's currently open direct reports (Epic 7B.4)", async () => {
++    await seedTenant(tenantA);
++    const managerId = `emp-${randomUUID().slice(0, 8)}`;
++    const currentReportId = `emp-${randomUUID().slice(0, 8)}`;
++    const formerReportId = `emp-${randomUUID().slice(0, 8)}`;
++    const unrelatedManagerId = `emp-${randomUUID().slice(0, 8)}`;
++    await seedEmployee(tenantA, managerId);
++    await seedEmployee(tenantA, currentReportId);
++    await seedEmployee(tenantA, formerReportId);
++    await seedEmployee(tenantA, unrelatedManagerId);
++    const orgUnit = await seedOrgUnit(tenantA, randomUUID(), `OU-${randomUUID().slice(0, 8)}`.toUpperCase());
++
++    const service = new AssignmentService(new PrismaAssignmentUnitOfWork(prisma, new InMemoryDomainEventCollector(), new InMemoryAuditCollector()));
++    const current = await service.assignPrimary(request(tenantA), { personId: currentReportId, orgUnitId: orgUnit.id, managerId, effectiveFrom: "2026-01-01T00:00:00.000Z" });
++    if (current.kind !== "success") throw new Error("seed failed");
++
++    // A former report whose assignment to this manager has since ended must not appear.
++    const former = await service.assignPrimary(request(tenantA), { personId: formerReportId, orgUnitId: orgUnit.id, managerId, effectiveFrom: "2025-01-01T00:00:00.000Z" });
++    if (former.kind !== "success") throw new Error("seed failed");
++    await service.endAssignment(request(tenantA), { personId: formerReportId, effectiveUntil: "2025-06-01T00:00:00.000Z" });
++
++    const reader = new PrismaAssignmentReadRepository(prisma);
++    const reports = await reader.listCurrentByManager(readContext(tenantA), managerId);
++    expect(reports.map((a) => a.personId)).toEqual([currentReportId]);
++    expect(await reader.listCurrentByManager(readContext(tenantA), unrelatedManagerId)).toHaveLength(0);
++  });
+ });
+diff --git a/src/platform/organization/assignment-repository.ts b/src/platform/organization/assignment-repository.ts
+index b9e949c..1479129 100644
+--- a/src/platform/organization/assignment-repository.ts
++++ b/src/platform/organization/assignment-repository.ts
+@@ -55,4 +55,6 @@ export interface AssignmentReadRepository {
+   getCurrentForPerson(context: TenantContext, personId: string): Promise<AssignmentRecord | undefined>;
+   /** Full placement history for a person, ascending by effectiveFrom. */
+   listHistoryForPerson(context: TenantContext, personId: string): Promise<AssignmentRecord[]>;
++  /** Every currently open primary assignment reporting to this manager — the "direct reports" query. */
++  listCurrentByManager(context: TenantContext, managerId: string): Promise<AssignmentRecord[]>;
+ }
+diff --git a/src/platform/organization/in-memory-assignment-repository.ts b/src/platform/organization/in-memory-assignment-repository.ts
+index 6384df5..56be3c1 100644
+--- a/src/platform/organization/in-memory-assignment-repository.ts
++++ b/src/platform/organization/in-memory-assignment-repository.ts
+@@ -80,4 +80,11 @@ export class InMemoryAssignmentReadRepository implements AssignmentReadRepositor
+       .filter((a) => a.tenantId === context.tenantId && a.personId === personId)
+       .sort((a, b) => a.effectiveFrom.localeCompare(b.effectiveFrom));
+   }
++
++  async listCurrentByManager(context: TenantContext, managerId: string): Promise<AssignmentRecord[]> {
++    requireOrganizationView(context);
++    return this.store.assignments
++      .filter((a) => a.tenantId === context.tenantId && a.managerId === managerId && a.isPrimary && !a.effectiveUntil)
++      .sort((a, b) => a.effectiveFrom.localeCompare(b.effectiveFrom));
++  }
+ }
+diff --git a/src/platform/organization/organization-query-service.test.ts b/src/platform/organization/organization-query-service.test.ts
+new file mode 100644
+index 0000000..693df7a
+--- /dev/null
++++ b/src/platform/organization/organization-query-service.test.ts
+@@ -0,0 +1,223 @@
++import { describe, expect, it } from "vitest";
++import type { TenantContext } from "@/platform/context";
++import { PermissionSet } from "@/platform/context";
++import { AssignmentStore, InMemoryAssignmentReadRepository } from "@/platform/organization/in-memory-assignment-repository";
++import { OrgUnitStore, InMemoryOrgUnitReadRepository } from "@/platform/organization/in-memory-org-unit-repository";
++import { LocationStore, InMemoryLocationReadRepository } from "@/platform/organization/in-memory-location-repository";
++import { OrganizationQueryService } from "@/platform/organization/organization-query-service";
++import type { AssignmentRecord } from "@/platform/organization/assignment";
++import type { OrgUnitRecord } from "@/platform/organization/org-unit";
++import type { LocationRecord } from "@/platform/organization/location";
++
++function context(tenantId = "tenant-a"): TenantContext {
++  return { tenantId, actorId: "u", actorName: "U", roles: ["hr_admin"], permissions: new PermissionSet(["organization.view"]), correlationId: "c", authenticationMethod: "test", actorProvenance: "server_verified" };
++}
++
++function orgUnit(overrides: Partial<OrgUnitRecord> = {}): OrgUnitRecord {
++  return Object.freeze({
++    id: "ou1", tenantId: "tenant-a", code: "OU1", name: "Unit", kind: "TEAM", status: "ACTIVE",
++    createdAt: "2026-01-01T00:00:00.000Z", createdBy: "actor", updatedAt: "2026-01-01T00:00:00.000Z",
++    ...overrides,
++  });
++}
++
++function assignment(overrides: Partial<AssignmentRecord> = {}): AssignmentRecord {
++  return Object.freeze({
++    id: "a1", tenantId: "tenant-a", personId: "p1", orgUnitId: "ou1", isPrimary: true,
++    effectiveFrom: "2026-01-01T00:00:00.000Z", createdAt: "2026-01-01T00:00:00.000Z", createdBy: "actor", updatedAt: "2026-01-01T00:00:00.000Z",
++    ...overrides,
++  });
++}
++
++function harness() {
++  const assignmentStore = new AssignmentStore();
++  const orgUnitStore = new OrgUnitStore();
++  const locationStore = new LocationStore();
++  const service = new OrganizationQueryService(
++    new InMemoryAssignmentReadRepository(assignmentStore),
++    new InMemoryOrgUnitReadRepository(orgUnitStore),
++    new InMemoryLocationReadRepository(locationStore),
++  );
++  return { service, assignmentStore, orgUnitStore, locationStore };
++}
++
++describe("OrganizationQueryService — assignment resolution", () => {
++  it("resolveCurrentAssignment returns the open primary assignment", async () => {
++    const { service, assignmentStore } = harness();
++    assignmentStore.assignments.push(assignment());
++    const result = await service.resolveCurrentAssignment(context(), "p1");
++    expect(result?.id).toBe("a1");
++  });
++
++  it("resolveCurrentAssignment returns undefined when the person has none", async () => {
++    const { service } = harness();
++    expect(await service.resolveCurrentAssignment(context(), "ghost")).toBeUndefined();
++  });
++
++  it("resolveAssignmentAsOf resolves the placement in force at a past instant from full history", async () => {
++    const { service, assignmentStore } = harness();
++    assignmentStore.assignments.push(
++      assignment({ id: "a1", effectiveFrom: "2026-01-01T00:00:00.000Z", effectiveUntil: "2026-06-01T00:00:00.000Z" }),
++      assignment({ id: "a2", effectiveFrom: "2026-06-01T00:00:00.000Z" }),
++    );
++    expect((await service.resolveAssignmentAsOf(context(), "p1", new Date("2026-03-01T00:00:00.000Z")))?.id).toBe("a1");
++    expect((await service.resolveAssignmentAsOf(context(), "p1", new Date("2026-07-01T00:00:00.000Z")))?.id).toBe("a2");
++  });
++
++  it("resolveAssignmentHistory returns the full history, ascending", async () => {
++    const { service, assignmentStore } = harness();
++    assignmentStore.assignments.push(
++      assignment({ id: "a2", effectiveFrom: "2026-06-01T00:00:00.000Z" }),
++      assignment({ id: "a1", effectiveFrom: "2026-01-01T00:00:00.000Z", effectiveUntil: "2026-06-01T00:00:00.000Z" }),
++    );
++    const history = await service.resolveAssignmentHistory(context(), "p1");
++    expect(history.map((a) => a.id)).toEqual(["a1", "a2"]);
++  });
++});
++
++describe("OrganizationQueryService — manager and reports", () => {
++  it("resolveManager returns the current manager's person id", async () => {
++    const { service, assignmentStore } = harness();
++    assignmentStore.assignments.push(assignment({ managerId: "mgr-1" }));
++    expect(await service.resolveManager(context(), "p1")).toBe("mgr-1");
++  });
++
++  it("resolveManager returns undefined when there is no current assignment or no manager", async () => {
++    const { service, assignmentStore } = harness();
++    expect(await service.resolveManager(context(), "ghost")).toBeUndefined();
++    assignmentStore.assignments.push(assignment({ id: "a2", personId: "p2" }));
++    expect(await service.resolveManager(context(), "p2")).toBeUndefined();
++  });
++
++  it("resolveReports returns every current report for a manager", async () => {
++    const { service, assignmentStore } = harness();
++    assignmentStore.assignments.push(
++      assignment({ id: "a1", personId: "p1", managerId: "mgr-1" }),
++      assignment({ id: "a2", personId: "p2", managerId: "mgr-1" }),
++      assignment({ id: "a3", personId: "p3", managerId: "mgr-2" }),
++    );
++    const reports = await service.resolveReports(context(), "mgr-1");
++    expect(reports.map((a) => a.personId).sort()).toEqual(["p1", "p2"]);
++  });
++
++  it("resolveReports excludes ended assignments", async () => {
++    const { service, assignmentStore } = harness();
++    assignmentStore.assignments.push(assignment({ id: "a1", personId: "p1", managerId: "mgr-1", effectiveUntil: "2026-06-01T00:00:00.000Z" }));
++    expect(await service.resolveReports(context(), "mgr-1")).toHaveLength(0);
++  });
++});
++
++describe("OrganizationQueryService — current placement", () => {
++  it("resolves the assignment together with its OrgUnit", async () => {
++    const { service, assignmentStore, orgUnitStore } = harness();
++    orgUnitStore.units.push(orgUnit({ id: "ou1", name: "Finance" }));
++    assignmentStore.assignments.push(assignment({ orgUnitId: "ou1" }));
++    const placement = await service.resolveCurrentPlacement(context(), "p1");
++    expect(placement?.orgUnit.name).toBe("Finance");
++    expect(placement?.assignment.id).toBe("a1");
++  });
++
++  it("returns undefined when the person has no current assignment", async () => {
++    const { service } = harness();
++    expect(await service.resolveCurrentPlacement(context(), "ghost")).toBeUndefined();
++  });
++
++  it("returns undefined when the assigned OrgUnit no longer resolves (defensive against orphaned data)", async () => {
++    const { service, assignmentStore } = harness();
++    assignmentStore.assignments.push(assignment({ orgUnitId: "missing-ou" }));
++    expect(await service.resolveCurrentPlacement(context(), "p1")).toBeUndefined();
++  });
++});
++
++describe("OrganizationQueryService — hierarchy queries", () => {
++  function seedTree(orgUnitStore: OrgUnitStore) {
++    orgUnitStore.units.push(
++      orgUnit({ id: "root", name: "Root", code: "ROOT" }),
++      orgUnit({ id: "a", name: "A", code: "A", parentId: "root" }),
++      orgUnit({ id: "b", name: "B", code: "B", parentId: "a" }),
++      orgUnit({ id: "c", name: "C", code: "C", parentId: "a" }),
++      orgUnit({ id: "sibling", name: "Sibling", code: "SIB", parentId: "root" }),
++    );
++  }
++
++  it("resolveOrgPath returns the ancestor chain from root to the given unit, inclusive", async () => {
++    const { service, orgUnitStore } = harness();
++    seedTree(orgUnitStore);
++    const path = await service.resolveOrgPath(context(), "b");
++    expect(path.map((u) => u.id)).toEqual(["root", "a", "b"]);
++  });
++
++  it("resolveOrgPath for a root unit returns just that unit", async () => {
++    const { service, orgUnitStore } = harness();
++    seedTree(orgUnitStore);
++    expect((await service.resolveOrgPath(context(), "root")).map((u) => u.id)).toEqual(["root"]);
++  });
++
++  it("resolveOrgPath for a missing unit returns an empty path", async () => {
++    const { service } = harness();
++    expect(await service.resolveOrgPath(context(), "ghost")).toEqual([]);
++  });
++
++  it("resolveDescendants returns every unit strictly below the given unit", async () => {
++    const { service, orgUnitStore } = harness();
++    seedTree(orgUnitStore);
++    const descendants = await service.resolveDescendants(context(), "a");
++    expect(descendants.map((u) => u.id).sort()).toEqual(["b", "c"]);
++  });
++
++  it("resolveDescendants excludes siblings and the unit itself", async () => {
++    const { service, orgUnitStore } = harness();
++    seedTree(orgUnitStore);
++    const descendants = await service.resolveDescendants(context(), "root");
++    expect(descendants.map((u) => u.id).sort()).toEqual(["a", "b", "c", "sibling"]);
++  });
++
++  it("resolveOrgUnitsByKind returns only units of the requested kind", async () => {
++    const { service, orgUnitStore } = harness();
++    orgUnitStore.units.push(
++      orgUnit({ id: "d1", code: "D1", kind: "DEPARTMENT" }),
++      orgUnit({ id: "d2", code: "D2", kind: "DEPARTMENT" }),
++      orgUnit({ id: "t1", code: "T1", kind: "TEAM", parentId: "d1" }),
++    );
++    const departments = await service.resolveOrgUnitsByKind(context(), "DEPARTMENT");
++    expect(departments.map((u) => u.id).sort()).toEqual(["d1", "d2"]);
++    const teams = await service.resolveOrgUnitsByKind(context(), "TEAM");
++    expect(teams.map((u) => u.id)).toEqual(["t1"]);
++  });
++});
++
++describe("OrganizationQueryService — location lookup (standalone, not linked to Assignment)", () => {
++  function location(overrides: Partial<LocationRecord> = {}): LocationRecord {
++    return Object.freeze({
++      id: "loc1", tenantId: "tenant-a", code: "HQ", name: "Head Office",
++      address: { line1: "123 Ayala Ave", city: "Makati" }, countryCode: "PH", timezone: "Asia/Manila",
++      status: "ACTIVE", createdAt: "2026-01-01T00:00:00.000Z", createdBy: "actor", updatedAt: "2026-01-01T00:00:00.000Z",
++      ...overrides,
++    });
++  }
++
++  it("resolveLocationById and resolveLocationByCode resolve independently of any Assignment", async () => {
++    const { service, locationStore } = harness();
++    locationStore.locations.push(location());
++    expect((await service.resolveLocationById(context(), "loc1"))?.code).toBe("HQ");
++    expect((await service.resolveLocationByCode(context(), "HQ"))?.id).toBe("loc1");
++  });
++});
++
++describe("OrganizationQueryService — tenant isolation", () => {
++  it("never returns another tenant's assignment, org unit, or location", async () => {
++    const { service, assignmentStore, orgUnitStore, locationStore } = harness();
++    assignmentStore.assignments.push(assignment({ tenantId: "tenant-a", personId: "shared-id" }));
++    orgUnitStore.units.push(orgUnit({ id: "shared-id", tenantId: "tenant-a" }));
++    locationStore.locations.push(Object.freeze({
++      id: "shared-id", tenantId: "tenant-a", code: "HQ", name: "HQ", address: { line1: "x", city: "y" },
++      countryCode: "PH", timezone: "Asia/Manila", status: "ACTIVE" as const,
++      createdAt: "2026-01-01T00:00:00.000Z", createdBy: "actor", updatedAt: "2026-01-01T00:00:00.000Z",
++    }));
++
++    const asB = context("tenant-b");
++    expect(await service.resolveCurrentAssignment(asB, "shared-id")).toBeUndefined();
++    expect(await service.resolveOrgPath(asB, "shared-id")).toEqual([]);
++    expect(await service.resolveLocationById(asB, "shared-id")).toBeUndefined();
++  });
++});
+diff --git a/src/platform/organization/organization-query-service.ts b/src/platform/organization/organization-query-service.ts
+new file mode 100644
+index 0000000..5c9b364
+--- /dev/null
++++ b/src/platform/organization/organization-query-service.ts
+@@ -0,0 +1,117 @@
++import type { TenantContext } from "@/platform/context";
++import type { AssignmentReadRepository } from "@/platform/organization/assignment-repository";
++import type { OrgUnitReadRepository } from "@/platform/organization/org-unit-repository";
++import type { LocationReadRepository } from "@/platform/organization/location-repository";
++import { collectDescendantIds, type OrgUnitKind, type OrgUnitRecord } from "@/platform/organization/org-unit";
++import { primaryAsOf, type AssignmentRecord } from "@/platform/organization/assignment";
++import type { LocationRecord } from "@/platform/organization/location";
++
++/** A person's current primary placement: the Assignment and the OrgUnit it names. */
++export interface CurrentPlacement {
++  assignment: AssignmentRecord;
++  orgUnit: OrgUnitRecord;
++}
++
++/**
++ * The read-only query surface over the Organization domain (ADR-012). It
++ * composes the three existing read repositories (Assignment, OrgUnit,
++ * Location) and never mutates an aggregate, never touches Prisma directly,
++ * and never reads a denormalized Employee organization field — every
++ * placement question resolves through Assignment, as ADR-012 §12 requires.
++ *
++ * This is deliberately ID-level only: it has no knowledge of Employee display
++ * names. Turning an id into a name for UI display is a People-domain concern
++ * (see `@/platform/people/read-models/organization-placement-service.ts`).
++ *
++ * Location has no linkage to Assignment yet (Assignment carries no
++ * `locationId` — that was explicitly deferred in Epic 7B.2/7B.3, and adding
++ * it is a write-side aggregate change out of this slice's read-only scope).
++ * `resolveLocationById`/`resolveLocationByCode` are therefore standalone
++ * lookups, not part of `resolveCurrentPlacement`.
++ */
++export class OrganizationQueryService {
++  constructor(
++    private readonly assignments: AssignmentReadRepository,
++    private readonly orgUnits: OrgUnitReadRepository,
++    private readonly locations: LocationReadRepository,
++  ) {}
++
++  /** The currently open primary assignment for a person, if any. */
++  resolveCurrentAssignment(context: TenantContext, personId: string): Promise<AssignmentRecord | undefined> {
++    return this.assignments.getCurrentForPerson(context, personId);
++  }
++
++  /** The primary assignment in force for a person at a given instant, resolved from their full history. */
++  async resolveAssignmentAsOf(context: TenantContext, personId: string, asOf: Date): Promise<AssignmentRecord | undefined> {
++    const history = await this.assignments.listHistoryForPerson(context, personId);
++    return primaryAsOf(history, asOf);
++  }
++
++  /** A person's full placement history, ascending by effectiveFrom. */
++  resolveAssignmentHistory(context: TenantContext, personId: string): Promise<AssignmentRecord[]> {
++    return this.assignments.listHistoryForPerson(context, personId);
++  }
++
++  /** The current manager's person id, if the person has a current assignment with a manager. */
++  async resolveManager(context: TenantContext, personId: string): Promise<string | undefined> {
++    const current = await this.assignments.getCurrentForPerson(context, personId);
++    return current?.managerId;
++  }
++
++  /** Every currently open primary assignment reporting to this manager. */
++  resolveReports(context: TenantContext, managerId: string): Promise<AssignmentRecord[]> {
++    return this.assignments.listCurrentByManager(context, managerId);
++  }
++
++  /** A person's current assignment together with the OrgUnit it names, or undefined if the person has none. */
++  async resolveCurrentPlacement(context: TenantContext, personId: string): Promise<CurrentPlacement | undefined> {
++    const assignment = await this.assignments.getCurrentForPerson(context, personId);
++    if (!assignment) return undefined;
++    const orgUnit = await this.orgUnits.getById(context, assignment.orgUnitId);
++    if (!orgUnit) return undefined;
++    return Object.freeze({ assignment, orgUnit });
++  }
++
++  /**
++   * The ancestor chain from the tree root down to (and including) the given
++   * unit. Walks `parentId` one level at a time rather than loading the whole
++   * tenant tree — cheaper for a single path query at large tenant scale
++   * (ADR-012 §10: adjacency today, measure before adding a closure table).
++   * Defensively bounded against a pre-existing cycle in stored data.
++   */
++  async resolveOrgPath(context: TenantContext, orgUnitId: string): Promise<OrgUnitRecord[]> {
++    const path: OrgUnitRecord[] = [];
++    const seen = new Set<string>();
++    let current = await this.orgUnits.getById(context, orgUnitId);
++    while (current && !seen.has(current.id)) {
++      path.unshift(current);
++      seen.add(current.id);
++      if (!current.parentId) break;
++      current = await this.orgUnits.getById(context, current.parentId);
++    }
++    return path;
++  }
++
++  /** Every OrgUnit strictly below the given unit in the tree. */
++  async resolveDescendants(context: TenantContext, orgUnitId: string): Promise<OrgUnitRecord[]> {
++    const all = await this.orgUnits.listAll(context);
++    const descendantIds = collectDescendantIds(all, orgUnitId);
++    return all.filter((unit) => descendantIds.has(unit.id));
++  }
++
++  /** Every OrgUnit of a given kind — e.g. every DEPARTMENT or TEAM, for a picker or a filter. */
++  async resolveOrgUnitsByKind(context: TenantContext, kind: OrgUnitKind): Promise<OrgUnitRecord[]> {
++    const all = await this.orgUnits.listAll(context);
++    return all.filter((unit) => unit.kind === kind);
++  }
++
++  /** Standalone Location lookup — not resolvable via Assignment yet (see class doc). */
++  resolveLocationById(context: TenantContext, id: string): Promise<LocationRecord | undefined> {
++    return this.locations.getById(context, id);
++  }
++
++  /** Standalone Location lookup — not resolvable via Assignment yet (see class doc). */
++  resolveLocationByCode(context: TenantContext, code: string): Promise<LocationRecord | undefined> {
++    return this.locations.getByCode(context, code);
++  }
++}
+diff --git a/src/platform/organization/organization-query-structure.test.ts b/src/platform/organization/organization-query-structure.test.ts
+new file mode 100644
+index 0000000..d54a178
+--- /dev/null
++++ b/src/platform/organization/organization-query-structure.test.ts
+@@ -0,0 +1,76 @@
++import { readFileSync, readdirSync } from "node:fs";
++import { join, relative } from "node:path";
++import { describe, expect, it } from "vitest";
++
++/**
++ * Structural guards for Epic 7B.4 (Organization Query & People Integration):
++ * exactly one query service and one placement-service implementation, and
++ * the placement-resolution code path never reads a denormalized Employee
++ * organization field (ADR-012 §12 invariant #5) — resolution goes through
++ * Assignment, never `Employee.departmentId/teamId/managerId/workLocation`.
++ */
++const REPO_ROOT = join(__dirname, "..", "..", "..");
++// `managerId` is deliberately excluded here: it is a legitimate field on
++// AssignmentRecord itself (that is exactly what these files are supposed to
++// read). The forbidden thing is reading it off an *Employee*-shaped value —
++// checked separately, below, by property-access shape.
++const LEGACY_EMPLOYEE_FIELDS_EXCEPT_MANAGER = /\b(departmentId|teamId|workLocation)\b/;
++const EMPLOYEE_SHAPED_MANAGER_ACCESS = /\b(profile|employee)\.managerId\b/;
++
++function sourceFiles(): { path: string; content: string }[] {
++  const walk = (dir: string): string[] =>
++    readdirSync(dir, { withFileTypes: true }).flatMap((entry) => {
++      const full = join(dir, entry.name);
++      if (entry.isDirectory()) return entry.name === "node_modules" || entry.name === ".next" ? [] : walk(full);
++      if (/\.(ts|tsx)$/.test(entry.name) && !/\.test\.tsx?$/.test(entry.name)) return [full];
++      return [];
++    });
++  return walk(join(REPO_ROOT, "src")).map((absolute) => ({
++    path: relative(REPO_ROOT, absolute).split("\\").join("/"),
++    content: readFileSync(absolute, "utf8"),
++  }));
++}
++
++describe("a single OrganizationQueryService and a single OrganizationPlacementService implementation", () => {
++  const files = sourceFiles();
++
++  it("declares the OrganizationQueryService class in exactly one file", () => {
++    const declarers = files.filter((f) => /(export\s+)?class\s+OrganizationQueryService\b/.test(f.content));
++    expect(declarers.map((f) => f.path)).toEqual(["src/platform/organization/organization-query-service.ts"]);
++  });
++
++  it("declares the PrismaOrganizationPlacementService class in exactly one file", () => {
++    const declarers = files.filter((f) => /(export\s+)?class\s+PrismaOrganizationPlacementService\b/.test(f.content));
++    expect(declarers.map((f) => f.path)).toEqual(["src/platform/people/read-models/prisma-organization-placement-service.ts"]);
++  });
++});
++
++describe("placement resolution never reads a denormalized Employee organization field (ADR-012 §12)", () => {
++  const files = sourceFiles();
++  const placementResolutionPaths = [
++    "src/platform/organization/organization-query-service.ts",
++    "src/platform/people/read-models/organization-placement-service.ts",
++    "src/platform/people/read-models/prisma-organization-placement-service.ts",
++    "src/platform/people/profile-runtime-loader.ts",
++  ];
++
++  for (const path of placementResolutionPaths) {
++    it(`${path} never references Employee.departmentId, Employee.teamId, or Employee.workLocation`, () => {
++      const file = files.find((f) => f.path === path);
++      expect(file, `expected ${path} to exist`).toBeDefined();
++      expect(file!.content).not.toMatch(LEGACY_EMPLOYEE_FIELDS_EXCEPT_MANAGER);
++    });
++
++    it(`${path} never reads managerId off an Employee-shaped value (profile.managerId / employee.managerId)`, () => {
++      const file = files.find((f) => f.path === path);
++      expect(file, `expected ${path} to exist`).toBeDefined();
++      expect(file!.content).not.toMatch(EMPLOYEE_SHAPED_MANAGER_ACCESS);
++    });
++  }
++
++  it("the directory row resolver passes only person ids to placement resolution, never legacy fields", () => {
++    const file = files.find((f) => f.path === "src/platform/people/directory-runtime-loader.ts");
++    expect(file).toBeDefined();
++    expect(file!.content).toMatch(/resolvePlacementSummaries\(\s*\n?\s*runtime\.context,\s*\n?\s*employees\.map\(\(employee\) => employee\.id\)/);
++  });
++});
+diff --git a/src/platform/organization/organization-reference-repository.ts b/src/platform/organization/organization-reference-repository.ts
+deleted file mode 100644
+index eef4f04..0000000
+--- a/src/platform/organization/organization-reference-repository.ts
++++ /dev/null
+@@ -1,40 +0,0 @@
+-import { createSeed } from "@/lib/people/people-data";
+-import { fullName } from "@/lib/people/directory-query";
+-import type { TenantContext } from "@/platform/context";
+-import type { OrganizationReferenceType } from "@/platform/organization/organization-reference-dtos";
+-
+-export interface OrganizationReferenceRecord {
+-  id: string;
+-  displayName: string;
+-  type: OrganizationReferenceType;
+-  tenantId: string;
+-  parentId?: string;
+-}
+-
+-export interface OrganizationReferenceRepository {
+-  findById(context: TenantContext, type: OrganizationReferenceType, id: string): Promise<OrganizationReferenceRecord | undefined>;
+-  list(context: TenantContext, type: OrganizationReferenceType): Promise<OrganizationReferenceRecord[]>;
+-}
+-
+-/** Development infrastructure only. It owns organization projections, not UI store state. */
+-export class InMemoryOrganizationReferenceRepository implements OrganizationReferenceRepository {
+-  private readonly records = this.createRecords();
+-
+-  async findById(context: TenantContext, type: OrganizationReferenceType, id: string) {
+-    const record = this.records.find((item) => item.tenantId === context.tenantId && item.type === type && item.id === id);
+-    return record ? { ...record } : undefined;
+-  }
+-
+-  async list(context: TenantContext, type: OrganizationReferenceType) {
+-    return this.records.filter((item) => item.tenantId === context.tenantId && item.type === type).map((item) => ({ ...item }));
+-  }
+-
+-  private createRecords(): OrganizationReferenceRecord[] {
+-    const seed = createSeed();
+-    return [
+-      ...seed.departments.map((department) => ({ id: department.id, displayName: department.name, type: "department" as const, tenantId: "nw-ph" })),
+-      ...seed.teams.map((team) => ({ id: team.id, displayName: team.name, type: "team" as const, tenantId: "nw-ph", parentId: team.departmentId })),
+-      ...seed.employees.map((employee) => ({ id: employee.id, displayName: fullName(employee), type: "manager" as const, tenantId: "nw-ph" })),
+-    ];
+-  }
+-}
+diff --git a/src/platform/organization/organization-reference-service.test.ts b/src/platform/organization/organization-reference-service.test.ts
+deleted file mode 100644
+index df24ea3..0000000
+--- a/src/platform/organization/organization-reference-service.test.ts
++++ /dev/null
+@@ -1,64 +0,0 @@
+-import { describe, expect, it, vi } from "vitest";
+-import { AuthorizationError } from "@/platform/errors";
+-import type { TenantContext } from "@/platform/context";
+-import { PermissionSet } from "@/platform/context";
+-import { OrganizationReferenceApplicationService } from "@/platform/organization/organization-reference-service";
+-import type { OrganizationReferenceRepository } from "@/platform/organization/organization-reference-repository";
+-
+-const context: TenantContext = { tenantId: "tenant-a", actorId: "hr-1", actorName: "HR", roles: ["hr_admin"], permissions: new PermissionSet(["people.read"]), correlationId: "test-request", authenticationMethod: "test", actorProvenance: "server_verified" };
+-const records = [
+-  { id: "dep-1", displayName: "Finance", type: "department" as const, tenantId: "tenant-a" },
+-  { id: "team-1", displayName: "Planning", type: "team" as const, tenantId: "tenant-a" },
+-  { id: "emp-1", displayName: "Maria Santos", type: "manager" as const, tenantId: "tenant-a" },
+-];
+-const repository: OrganizationReferenceRepository = {
+-  async findById(requestContext, type, id) {
+-    const record = records.find((item) => item.tenantId === requestContext.tenantId && item.type === type && item.id === id);
+-    return record ? { ...record } : undefined;
+-  },
+-  async list(requestContext, type) {
+-    return records.filter((item) => item.tenantId === requestContext.tenantId && item.type === type).map((item) => ({ ...item }));
+-  },
+-};
+-
+-describe("organization reference runtime", () => {
+-  const service = new OrganizationReferenceApplicationService(repository);
+-
+-  it("maps verified department, team, and manager labels", async () => {
+-    await expect(service.resolveSummary(context, { departmentId: "dep-1", teamId: "team-1", managerId: "emp-1" })).resolves.toEqual({
+-      department: { id: "dep-1", displayName: "Finance", type: "department" },
+-      team: { id: "team-1", displayName: "Planning", type: "team" },
+-      manager: { id: "emp-1", displayName: "Maria Santos", type: "manager" },
+-    });
+-  });
+-
+-  it("returns no reference for missing or tenant-isolated records", async () => {
+-    await expect(service.resolve(context, "department", "missing")).resolves.toBeUndefined();
+-    await expect(service.resolve({ ...context, tenantId: "tenant-b" }, "department", "dep-1")).resolves.toBeUndefined();
+-  });
+-
+-  it("requires People read authorization", async () => {
+-    await expect(service.resolve({ ...context, roles: ["employee"] }, "department", "dep-1")).rejects.toBeInstanceOf(AuthorizationError);
+-  });
+-
+-  it("returns only the public display DTO boundary", async () => {
+-    const result = await service.resolve(context, "manager", "emp-1");
+-    expect(result).toEqual({ id: "emp-1", displayName: "Maria Santos", type: "manager" });
+-    expect(result).not.toHaveProperty("tenantId");
+-  });
+-
+-  it("lists tenant-isolated selectable references without repository records", async () => {
+-    await expect(service.list(context, "department")).resolves.toEqual([{ id: "dep-1", displayName: "Finance", type: "department" }]);
+-    await expect(service.list({ ...context, tenantId: "tenant-b" }, "department")).resolves.toEqual([]);
+-  });
+-
+-  it("batches repeated references without repeated repository lookups", async () => {
+-    const findById = vi.fn(repository.findById);
+-    const batched = new OrganizationReferenceApplicationService({ findById, list: repository.list });
+-    await batched.resolveSummaries(context, [
+-      { departmentId: "dep-1", managerId: "emp-1" },
+-      { departmentId: "dep-1", managerId: "emp-1" },
+-    ]);
+-    expect(findById).toHaveBeenCalledTimes(2);
+-  });
+-});
+diff --git a/src/platform/organization/organization-reference-service.ts b/src/platform/organization/organization-reference-service.ts
+deleted file mode 100644
+index 2a38705..0000000
+--- a/src/platform/organization/organization-reference-service.ts
++++ /dev/null
+@@ -1,62 +0,0 @@
+-import type { TenantContext } from "@/platform/context";
+-import { requirePeoplePermission } from "@/platform/people/application/people-policies";
+-import type { OrganizationReferenceDto, OrganizationReferenceOptionDto, OrganizationReferenceType, OrganizationSummaryDto } from "@/platform/organization/organization-reference-dtos";
+-import type { OrganizationReferenceRepository } from "@/platform/organization/organization-reference-repository";
+-
+-export interface OrganizationReferenceInput {
+-  departmentId?: string;
+-  teamId?: string;
+-  managerId?: string;
+-}
+-
+-export interface OrganizationReferenceService {
+-  resolve(context: TenantContext, type: OrganizationReferenceType, id: string): Promise<OrganizationReferenceDto | undefined>;
+-  list(context: TenantContext, type: OrganizationReferenceType): Promise<OrganizationReferenceOptionDto[]>;
+-  resolveSummary(context: TenantContext, input: OrganizationReferenceInput): Promise<OrganizationSummaryDto>;
+-  resolveSummaries(context: TenantContext, inputs: OrganizationReferenceInput[]): Promise<OrganizationSummaryDto[]>;
+-}
+-
+-export class OrganizationReferenceApplicationService implements OrganizationReferenceService {
+-  constructor(private readonly references: OrganizationReferenceRepository) {}
+-
+-  async resolve(context: TenantContext, type: OrganizationReferenceType, id: string) {
+-    requirePeoplePermission(context, "people.read");
+-    return this.resolveUnchecked(context, type, id);
+-  }
+-
+-  async list(context: TenantContext, type: OrganizationReferenceType) {
+-    requirePeoplePermission(context, "people.read");
+-    return (await this.references.list(context, type)).map((reference) => ({ id: reference.id, displayName: reference.displayName, type: reference.type, ...(reference.parentId ? { parentId: reference.parentId } : {}) }));
+-  }
+-
+-  async resolveSummary(context: TenantContext, input: OrganizationReferenceInput): Promise<OrganizationSummaryDto> {
+-    return (await this.resolveSummaries(context, [input]))[0];
+-  }
+-
+-  async resolveSummaries(context: TenantContext, inputs: OrganizationReferenceInput[]): Promise<OrganizationSummaryDto[]> {
+-    requirePeoplePermission(context, "people.read");
+-    const cache = new Map<string, Promise<OrganizationReferenceDto | undefined>>();
+-    const resolveCached = (type: OrganizationReferenceType, id: string | undefined) => {
+-      if (!id) return undefined;
+-      const key = `${type}:${id}`;
+-      const existing = cache.get(key);
+-      if (existing) return existing;
+-      const pending = this.resolveUnchecked(context, type, id);
+-      cache.set(key, pending);
+-      return pending;
+-    };
+-    return Promise.all(inputs.map(async (input) => {
+-      const [department, team, manager] = await Promise.all([
+-        resolveCached("department", input.departmentId),
+-        resolveCached("team", input.teamId),
+-        resolveCached("manager", input.managerId),
+-      ]);
+-      return { department, team, manager };
+-    }));
+-  }
+-
+-  private async resolveUnchecked(context: TenantContext, type: OrganizationReferenceType, id: string) {
+-    const reference = await this.references.findById(context, type, id);
+-    return reference && { id: reference.id, displayName: reference.displayName, type: reference.type };
+-  }
+-}
+diff --git a/src/platform/organization/prisma-assignment-read-repository.ts b/src/platform/organization/prisma-assignment-read-repository.ts
+index d10b8b9..8513eef 100644
+--- a/src/platform/organization/prisma-assignment-read-repository.ts
++++ b/src/platform/organization/prisma-assignment-read-repository.ts
+@@ -50,4 +50,13 @@ export class PrismaAssignmentReadRepository implements AssignmentReadRepository
+     });
+     return assignments.map(toRecord);
+   }
++
++  async listCurrentByManager(context: TenantContext, managerId: string): Promise<AssignmentRecord[]> {
++    requireOrganizationView(context);
++    const assignments = await this.prisma.assignment.findMany({
++      where: { tenantId: context.tenantId, managerId, isPrimary: true, effectiveUntil: null },
++      orderBy: { effectiveFrom: "asc" },
++    });
++    return assignments.map(toRecord);
++  }
+ }
+diff --git a/src/platform/people/directory-runtime-loader.test.ts b/src/platform/people/directory-runtime-loader.test.ts
+index 2b297ab..1ecebfd 100644
+--- a/src/platform/people/directory-runtime-loader.test.ts
++++ b/src/platform/people/directory-runtime-loader.test.ts
+@@ -1,5 +1,5 @@
+ import { describe, expect, it, vi } from "vitest";
+-import type { ApplicationRuntime } from "@/platform/application-runtime";
++import type { PrismaPeopleReadRuntime } from "@/platform/people/prisma-people-read-runtime";
+ import type { EmployeeDirectoryDto } from "@/platform/people/application/people-dtos";
+ import { resolveDirectoryRows, toPeopleDirectoryRow } from "@/platform/people/directory-runtime-loader";
+ 
+@@ -22,15 +22,15 @@ describe("People directory runtime row mapping", () => {
+   });
+ 
+   it("uses resolved references without failing the listing when organization lookup is unavailable", async () => {
+-    const organizationReferences = { resolveSummaries: vi.fn().mockRejectedValue(new Error("offline")) };
+-    const runtime = { context: { tenantId: "nw-ph", actorId: "hr", actorName: "HR", roles: ["hr_admin"] }, organizationReferences } as unknown as Pick<ApplicationRuntime, "context" | "organizationReferences">;
++    const organizationPlacements = { resolvePlacementSummaries: vi.fn().mockRejectedValue(new Error("offline")) };
++    const runtime = { context: { tenantId: "nw-ph", actorId: "hr", actorName: "HR", roles: ["hr_admin"] }, organizationPlacements } as unknown as Pick<PrismaPeopleReadRuntime, "context" | "organizationPlacements">;
+     await expect(resolveDirectoryRows(runtime, [employee])).resolves.toEqual([toPeopleDirectoryRow(employee)]);
+   });
+ 
+-  it("passes only department and manager identifiers to the organization runtime", async () => {
+-    const organizationReferences = { resolveSummaries: vi.fn().mockResolvedValue([{ department: { id: "dep-fin", displayName: "Finance", type: "department" }, manager: { id: "emp-2", displayName: "Maria Santos", type: "manager" } }]) };
+-    const runtime = { context: { tenantId: "nw-ph", actorId: "hr", actorName: "HR", roles: ["hr_admin"] }, organizationReferences } as unknown as Pick<ApplicationRuntime, "context" | "organizationReferences">;
++  it("passes only person identifiers to the organization runtime", async () => {
++    const organizationPlacements = { resolvePlacementSummaries: vi.fn().mockResolvedValue([{ department: { id: "dep-fin", displayName: "Finance", type: "department" }, manager: { id: "emp-2", displayName: "Maria Santos", type: "manager" } }]) };
++    const runtime = { context: { tenantId: "nw-ph", actorId: "hr", actorName: "HR", roles: ["hr_admin"] }, organizationPlacements } as unknown as Pick<PrismaPeopleReadRuntime, "context" | "organizationPlacements">;
+     await expect(resolveDirectoryRows(runtime, [employee])).resolves.toMatchObject([{ department: "Finance", manager: "Maria Santos" }]);
+-    expect(organizationReferences.resolveSummaries).toHaveBeenCalledWith(runtime.context, [{ departmentId: "dep-fin", managerId: "emp-2" }]);
++    expect(organizationPlacements.resolvePlacementSummaries).toHaveBeenCalledWith(runtime.context, [employee.id]);
+   });
+ });
+diff --git a/src/platform/people/directory-runtime-loader.ts b/src/platform/people/directory-runtime-loader.ts
+index 5c52259..f80f80d 100644
+--- a/src/platform/people/directory-runtime-loader.ts
++++ b/src/platform/people/directory-runtime-loader.ts
+@@ -46,18 +46,15 @@ export function toPeopleDirectoryRow(
+ }
+ 
+ export async function resolveDirectoryRows(
+-  runtime: Pick<PrismaPeopleReadRuntime, "context" | "organizationReferences">,
++  runtime: Pick<PrismaPeopleReadRuntime, "context" | "organizationPlacements">,
+   employees: readonly PeopleDirectoryReadModel[],
+ ): Promise<PeopleDirectoryRow[]> {
+   try {
+-    const references = await runtime.organizationReferences.resolveSummaries(
++    const summaries = await runtime.organizationPlacements.resolvePlacementSummaries(
+       runtime.context,
+-      employees.map((employee) => ({
+-        departmentId: employee.departmentId,
+-        managerId: employee.managerId,
+-      })),
++      employees.map((employee) => employee.id),
+     );
+-    return employees.map((employee, index) => toPeopleDirectoryRow(employee, references[index]));
++    return employees.map((employee, index) => toPeopleDirectoryRow(employee, summaries[index]));
+   } catch {
+     return employees.map((employee) => toPeopleDirectoryRow(employee));
+   }
+@@ -86,7 +83,7 @@ export async function loadRuntimeDirectory(input: {
+       ...(status.length ? { status } : {}),
+       ...(departmentId ? { departmentId } : {}),
+     }),
+-    runtime.organizationReferences.list(runtime.context, "department"),
++    runtime.organizationPlacements.listOptions(runtime.context, "department"),
+   ]);
+   return {
+     items: await resolveDirectoryRows(runtime, result.items),
+diff --git a/src/platform/people/prisma-people-read-runtime.ts b/src/platform/people/prisma-people-read-runtime.ts
+index b6ebd49..699cd54 100644
+--- a/src/platform/people/prisma-people-read-runtime.ts
++++ b/src/platform/people/prisma-people-read-runtime.ts
+@@ -1,10 +1,15 @@
+ import type { TenantContext } from "@/platform/context";
+-import { InMemoryOrganizationReferenceRepository } from "@/platform/organization/organization-reference-repository";
+-import { OrganizationReferenceApplicationService, type OrganizationReferenceService } from "@/platform/organization/organization-reference-service";
++import { OrganizationQueryService } from "@/platform/organization/organization-query-service";
++import { PrismaAssignmentReadRepository } from "@/platform/organization/prisma-assignment-read-repository";
++import { PrismaOrgUnitReadRepository } from "@/platform/organization/prisma-org-unit-read-repository";
++import { PrismaLocationReadRepository } from "@/platform/organization/prisma-location-read-repository";
+ import { getPrismaClient } from "@/platform/persistence/prisma-client";
+ import type { EmployeeProfileReadRepository } from "@/platform/people/read-models/employee-profile-read-repository";
+ import { PrismaEmployeeProfileReadRepository, PrismaPeopleDirectoryReadRepository } from "@/platform/people/read-models/prisma-people-read-repositories";
+ import type { PeopleDirectoryReadRepository } from "@/platform/people/read-models/people-directory-read-repository";
++import type { OrganizationPlacementService } from "@/platform/people/read-models/organization-placement-service";
++import { PrismaOrganizationPlacementService } from "@/platform/people/read-models/prisma-organization-placement-service";
++import { PrismaEmployeeDisplayLookup } from "@/platform/people/read-models/prisma-employee-display-lookup";
+ import type { TrustedRequestContext } from "@/platform/runtime-context";
+ import { createTenantContext } from "@/platform/runtime-context";
+ 
+@@ -12,7 +17,7 @@ export interface PrismaPeopleReadRuntime {
+   readonly context: TenantContext;
+   readonly directory: PeopleDirectoryReadRepository;
+   readonly profiles: EmployeeProfileReadRepository;
+-  readonly organizationReferences: OrganizationReferenceService;
++  readonly organizationPlacements: OrganizationPlacementService;
+ }
+ 
+ /**
+@@ -21,10 +26,15 @@ export interface PrismaPeopleReadRuntime {
+  */
+ export function createPrismaPeopleReadRuntime(request: TrustedRequestContext): PrismaPeopleReadRuntime {
+   const prisma = getPrismaClient();
++  const organizationQuery = new OrganizationQueryService(
++    new PrismaAssignmentReadRepository(prisma),
++    new PrismaOrgUnitReadRepository(prisma),
++    new PrismaLocationReadRepository(prisma),
++  );
+   return Object.freeze({
+     context: createTenantContext(request),
+     directory: new PrismaPeopleDirectoryReadRepository(prisma),
+     profiles: new PrismaEmployeeProfileReadRepository(prisma),
+-    organizationReferences: new OrganizationReferenceApplicationService(new InMemoryOrganizationReferenceRepository()),
++    organizationPlacements: new PrismaOrganizationPlacementService(organizationQuery, new PrismaEmployeeDisplayLookup(prisma)),
+   });
+ }
+diff --git a/src/platform/people/profile-runtime-loader.test.ts b/src/platform/people/profile-runtime-loader.test.ts
+index 6991cfa..21d33e5 100644
+--- a/src/platform/people/profile-runtime-loader.test.ts
++++ b/src/platform/people/profile-runtime-loader.test.ts
+@@ -3,7 +3,7 @@ import { AuthorizationError } from "@/platform/errors";
+ import type { EmployeeProfileDto } from "@/platform/people/application/people-dtos";
+ import type { PrismaPeopleReadRuntime } from "@/platform/people/prisma-people-read-runtime";
+ import type { EmployeeProfileReadRepository } from "@/platform/people/read-models/employee-profile-read-repository";
+-import type { OrganizationReferenceService } from "@/platform/organization/organization-reference-service";
++import type { OrganizationPlacementService } from "@/platform/people/read-models/organization-placement-service";
+ import {
+   aggregateRuntimeProfile,
+   toProfileContactInformationViewModel,
+@@ -26,20 +26,20 @@ const profile: EmployeeProfileDto = {
+   regularizationDate: "2022-07-01",
+ };
+ 
+-function runtime(overrides: Partial<EmployeeProfileReadRepository> = {}, organizationOverrides: Partial<OrganizationReferenceService> = {}) {
++function runtime(overrides: Partial<EmployeeProfileReadRepository> = {}, organizationOverrides: Partial<OrganizationPlacementService> = {}) {
+   const profiles = {
+     findProfile: vi.fn().mockResolvedValue(profile),
+     findContact: vi.fn().mockResolvedValue({ id: "emp-1", workEmail: "ana@work.example" }),
+     ...overrides,
+   } as unknown as EmployeeProfileReadRepository;
+-  const organizationReferences = {
+-    resolveSummary: vi.fn().mockResolvedValue({
++  const organizationPlacements = {
++    resolvePlacementSummary: vi.fn().mockResolvedValue({
+       department: { id: "finance", displayName: "Finance", type: "department" },
+       team: { id: "planning", displayName: "Financial Planning", type: "team" },
+       manager: { id: "emp-2", displayName: "Maria Santos", type: "manager" },
+     }),
+     ...organizationOverrides,
+-  } as unknown as OrganizationReferenceService;
++  } as unknown as OrganizationPlacementService;
+   return {
+     context: {
+       tenantId: "tenant-secret",
+@@ -48,8 +48,8 @@ function runtime(overrides: Partial<EmployeeProfileReadRepository> = {}, organiz
+       permissions: ["people.read"],
+     },
+     profiles,
+-    organizationReferences,
+-  } as unknown as Pick<PrismaPeopleReadRuntime, "context" | "profiles" | "organizationReferences">;
++    organizationPlacements,
++  } as unknown as Pick<PrismaPeopleReadRuntime, "context" | "profiles" | "organizationPlacements">;
+ }
+ 
+ describe("runtime profile view models", () => {
+@@ -144,11 +144,11 @@ describe("runtime profile aggregation", () => {
+     expect(result.kind).toBe("ready");
+     expect(app.profiles.findProfile).toHaveBeenCalledOnce();
+     expect(app.profiles.findContact).toHaveBeenCalledOnce();
+-    expect(app.organizationReferences.resolveSummary).toHaveBeenCalledOnce();
++    expect(app.organizationPlacements.resolvePlacementSummary).toHaveBeenCalledOnce();
+   });
+ 
+   it("keeps Work Information safe when organization resolution fails", async () => {
+-    const app = runtime({}, { resolveSummary: vi.fn().mockRejectedValue(new Error("offline")) });
++    const app = runtime({}, { resolvePlacementSummary: vi.fn().mockRejectedValue(new Error("offline")) });
+     const result = await aggregateRuntimeProfile(app, "emp-1");
+     expect(result).toMatchObject({ kind: "ready", workInformation: { department: undefined, team: undefined, manager: undefined } });
+   });
+diff --git a/src/platform/people/profile-runtime-loader.ts b/src/platform/people/profile-runtime-loader.ts
+index 28d5205..578b447 100644
+--- a/src/platform/people/profile-runtime-loader.ts
++++ b/src/platform/people/profile-runtime-loader.ts
+@@ -5,7 +5,7 @@ import { createPrismaPeopleReadRuntime, type PrismaPeopleReadRuntime } from "@/p
+ import type { EmployeeContactReadModel, EmployeeProfileReadModel } from "@/platform/people/read-models/people-read-models";
+ import type { EmployeeProfileReadRepository } from "@/platform/people/read-models/employee-profile-read-repository";
+ import type { OrganizationSummaryDto } from "@/platform/organization/organization-reference-dtos";
+-import type { OrganizationReferenceService } from "@/platform/organization/organization-reference-service";
++import type { OrganizationPlacementService } from "@/platform/people/read-models/organization-placement-service";
+ 
+ export interface ProfileOverviewViewModel {
+   employeeId: string;
+@@ -116,17 +116,13 @@ export function toProfileEmploymentViewModel(
+   };
+ }
+ 
+-async function loadOrganizationReferences(
+-  references: OrganizationReferenceService,
++async function loadOrganizationPlacement(
++  organizationPlacements: OrganizationPlacementService,
+   context: TenantContext,
+   profile: EmployeeProfileReadModel,
+ ): Promise<OrganizationSummaryDto> {
+   try {
+-    return await references.resolveSummary(context, {
+-      departmentId: profile.departmentId,
+-      teamId: profile.teamId,
+-      managerId: profile.managerId,
+-    });
++    return await organizationPlacements.resolvePlacementSummary(context, profile.id);
+   } catch {
+     return {};
+   }
+@@ -157,7 +153,7 @@ async function loadContact(
+ }
+ 
+ export async function aggregateRuntimeProfile(
+-  runtime: Pick<PrismaPeopleReadRuntime, "context" | "profiles" | "organizationReferences">,
++  runtime: Pick<PrismaPeopleReadRuntime, "context" | "profiles" | "organizationPlacements">,
+   employeeId: string,
+ ): Promise<RuntimeProfilePageResult> {
+   try {
+@@ -165,7 +161,7 @@ export async function aggregateRuntimeProfile(
+     if (!profile) return { kind: "not_found" };
+     const [contactInformation, organization] = await Promise.all([
+       loadContact(runtime.profiles, runtime.context, employeeId),
+-      loadOrganizationReferences(runtime.organizationReferences, runtime.context, profile),
++      loadOrganizationPlacement(runtime.organizationPlacements, runtime.context, profile),
+     ]);
+     return {
+       kind: "ready",
+diff --git a/src/platform/people/read-models/employee-display-lookup.ts b/src/platform/people/read-models/employee-display-lookup.ts
+new file mode 100644
+index 0000000..d5953d4
+--- /dev/null
++++ b/src/platform/people/read-models/employee-display-lookup.ts
+@@ -0,0 +1,12 @@
++/**
++ * A minimal, read-only Employee display-name lookup — just enough for the
++ * Organization placement service to turn a manager's person id into a name,
++ * or list employees as manager-picker candidates. Deliberately not a
++ * dependency on People's full profile/directory read models; this is the
++ * People-domain mirror of Organization's own `PersonExistenceRepository`
++ * precedent: a narrow, direct read rather than a heavier cross-cutting one.
++ */
++export interface EmployeeDisplayLookup {
++  findDisplayName(tenantId: string, employeeId: string): Promise<string | undefined>;
++  listDisplays(tenantId: string): Promise<{ id: string; displayName: string }[]>;
++}
+diff --git a/src/platform/people/read-models/organization-placement-service.ts b/src/platform/people/read-models/organization-placement-service.ts
+new file mode 100644
+index 0000000..b3ceca6
+--- /dev/null
++++ b/src/platform/people/read-models/organization-placement-service.ts
+@@ -0,0 +1,22 @@
++import type { TenantContext } from "@/platform/context";
++import type { OrganizationReferenceOptionDto, OrganizationReferenceType, OrganizationSummaryDto } from "@/platform/organization/organization-reference-dtos";
++
++/**
++ * People-facing integration over the Organization domain (Epic 7B.4). This
++ * replaces the retired `organization-reference-*` placeholder: resolution is
++ * keyed by `personId` and always goes through that person's Assignment —
++ * never a denormalized Employee field (ADR-012 §12).
++ *
++ * This is where an Organization id becomes a display name. The Organization
++ * domain itself (`OrganizationQueryService`) knows nothing about Employee
++ * display names by design; this service is the one place that composes the
++ * two for UI consumption.
++ */
++export interface OrganizationPlacementService {
++  /** Department/team/manager display references for one person's current Assignment. Empty fields when the person has no current assignment yet. */
++  resolvePlacementSummary(context: TenantContext, personId: string): Promise<OrganizationSummaryDto>;
++  /** Batched form of resolvePlacementSummary — one result per input id, same order. */
++  resolvePlacementSummaries(context: TenantContext, personIds: readonly string[]): Promise<OrganizationSummaryDto[]>;
++  /** Picker options: OrgUnits of kind DEPARTMENT/TEAM, or every employee as a manager candidate. */
++  listOptions(context: TenantContext, type: OrganizationReferenceType): Promise<OrganizationReferenceOptionDto[]>;
++}
+diff --git a/src/platform/people/read-models/prisma-employee-display-lookup.ts b/src/platform/people/read-models/prisma-employee-display-lookup.ts
+new file mode 100644
+index 0000000..a18d363
+--- /dev/null
++++ b/src/platform/people/read-models/prisma-employee-display-lookup.ts
+@@ -0,0 +1,22 @@
++import type { PrismaClient } from "@prisma/client";
++import type { EmployeeDisplayLookup } from "@/platform/people/read-models/employee-display-lookup";
++
++export type PrismaEmployeeDisplayClient = Pick<PrismaClient, "employee">;
++
++export class PrismaEmployeeDisplayLookup implements EmployeeDisplayLookup {
++  constructor(private readonly prisma: PrismaEmployeeDisplayClient) {}
++
++  async findDisplayName(tenantId: string, employeeId: string): Promise<string | undefined> {
++    const employee = await this.prisma.employee.findUnique({ where: { tenantId_employeeId: { tenantId, employeeId } }, select: { displayName: true } });
++    return employee?.displayName;
++  }
++
++  async listDisplays(tenantId: string): Promise<{ id: string; displayName: string }[]> {
++    const employees = await this.prisma.employee.findMany({
++      where: { tenantId },
++      select: { employeeId: true, displayName: true },
++      orderBy: [{ lastName: "asc" }, { firstName: "asc" }],
++    });
++    return employees.map((employee) => ({ id: employee.employeeId, displayName: employee.displayName }));
++  }
++}
+diff --git a/src/platform/people/read-models/prisma-organization-placement-service.test.ts b/src/platform/people/read-models/prisma-organization-placement-service.test.ts
+new file mode 100644
+index 0000000..b3e025a
+--- /dev/null
++++ b/src/platform/people/read-models/prisma-organization-placement-service.test.ts
+@@ -0,0 +1,162 @@
++import { describe, expect, it, vi } from "vitest";
++import type { PlatformRole, TenantContext } from "@/platform/context";
++import { PermissionSet } from "@/platform/context";
++import { AuthorizationError } from "@/platform/errors";
++import { AssignmentStore, InMemoryAssignmentReadRepository } from "@/platform/organization/in-memory-assignment-repository";
++import { OrgUnitStore, InMemoryOrgUnitReadRepository } from "@/platform/organization/in-memory-org-unit-repository";
++import { LocationStore, InMemoryLocationReadRepository } from "@/platform/organization/in-memory-location-repository";
++import { OrganizationQueryService } from "@/platform/organization/organization-query-service";
++import type { AssignmentRecord } from "@/platform/organization/assignment";
++import type { OrgUnitRecord } from "@/platform/organization/org-unit";
++import type { EmployeeDisplayLookup } from "@/platform/people/read-models/employee-display-lookup";
++import { PrismaOrganizationPlacementService } from "@/platform/people/read-models/prisma-organization-placement-service";
++
++function context(roles: readonly PlatformRole[] = ["hr_admin"], tenantId = "tenant-a"): TenantContext {
++  return { tenantId, actorId: "u", actorName: "U", roles, permissions: new PermissionSet([]), correlationId: "c", authenticationMethod: "test", actorProvenance: "server_verified" };
++}
++
++function orgUnit(overrides: Partial<OrgUnitRecord> = {}): OrgUnitRecord {
++  return Object.freeze({
++    id: "ou1", tenantId: "tenant-a", code: "OU1", name: "Unit", kind: "TEAM", status: "ACTIVE",
++    createdAt: "2026-01-01T00:00:00.000Z", createdBy: "actor", updatedAt: "2026-01-01T00:00:00.000Z",
++    ...overrides,
++  });
++}
++
++function assignment(overrides: Partial<AssignmentRecord> = {}): AssignmentRecord {
++  return Object.freeze({
++    id: "a1", tenantId: "tenant-a", personId: "p1", orgUnitId: "ou1", isPrimary: true,
++    effectiveFrom: "2026-01-01T00:00:00.000Z", createdAt: "2026-01-01T00:00:00.000Z", createdBy: "actor", updatedAt: "2026-01-01T00:00:00.000Z",
++    ...overrides,
++  });
++}
++
++function fakeEmployeeLookup(records: readonly { id: string; displayName: string }[]): EmployeeDisplayLookup {
++  return {
++    findDisplayName: vi.fn(async (_tenantId: string, id: string) => records.find((r) => r.id === id)?.displayName),
++    listDisplays: vi.fn(async () => [...records]),
++  };
++}
++
++function harness(employeeRecords: readonly { id: string; displayName: string }[] = []) {
++  const assignmentStore = new AssignmentStore();
++  const orgUnitStore = new OrgUnitStore();
++  const locationStore = new LocationStore();
++  const query = new OrganizationQueryService(
++    new InMemoryAssignmentReadRepository(assignmentStore),
++    new InMemoryOrgUnitReadRepository(orgUnitStore),
++    new InMemoryLocationReadRepository(locationStore),
++  );
++  const employees = fakeEmployeeLookup(employeeRecords);
++  const service = new PrismaOrganizationPlacementService(query, employees);
++  return { service, assignmentStore, orgUnitStore, employees };
++}
++
++describe("PrismaOrganizationPlacementService — resolvePlacementSummary", () => {
++  it("resolves department (nearest DEPARTMENT ancestor), team (the assigned unit), and manager display name", async () => {
++    const { service, assignmentStore, orgUnitStore } = harness([{ id: "mgr-1", displayName: "Maria Santos" }]);
++    orgUnitStore.units.push(
++      orgUnit({ id: "dept", code: "DEPT", name: "Finance", kind: "DEPARTMENT" }),
++      orgUnit({ id: "team", code: "TEAM", name: "Payroll Team", kind: "TEAM", parentId: "dept" }),
++    );
++    assignmentStore.assignments.push(assignment({ orgUnitId: "team", managerId: "mgr-1" }));
++
++    const summary = await service.resolvePlacementSummary(context(), "p1");
++    expect(summary.department).toEqual({ id: "dept", displayName: "Finance", type: "department" });
++    expect(summary.team).toEqual({ id: "team", displayName: "Payroll Team", type: "team" });
++    expect(summary.manager).toEqual({ id: "mgr-1", displayName: "Maria Santos", type: "manager" });
++  });
++
++  it("returns an empty summary when the person has no current assignment", async () => {
++    const { service } = harness();
++    expect(await service.resolvePlacementSummary(context(), "ghost")).toEqual({});
++  });
++
++  it("leaves department/team undefined when the assigned unit has no DEPARTMENT/TEAM ancestor", async () => {
++    const { service, assignmentStore, orgUnitStore } = harness();
++    orgUnitStore.units.push(orgUnit({ id: "div", code: "DIV", name: "APAC Division", kind: "DIVISION" }));
++    assignmentStore.assignments.push(assignment({ orgUnitId: "div" }));
++    const summary = await service.resolvePlacementSummary(context(), "p1");
++    expect(summary.department).toBeUndefined();
++    expect(summary.team).toBeUndefined();
++  });
++
++  it("omits manager from the summary when the managerId does not resolve to a known employee", async () => {
++    const { service, assignmentStore, orgUnitStore } = harness([]); // no employees registered
++    orgUnitStore.units.push(orgUnit({ id: "team", kind: "TEAM" }));
++    assignmentStore.assignments.push(assignment({ orgUnitId: "team", managerId: "ghost-manager" }));
++    const summary = await service.resolvePlacementSummary(context(), "p1");
++    expect(summary.manager).toBeUndefined();
++  });
++
++  it("never surfaces the legacy Employee.departmentId/teamId/managerId/workLocation fields — resolution is personId-keyed", async () => {
++    const { service } = harness();
++    // The method signature itself only accepts a personId; there is no way to pass a legacy field in.
++    expect(service.resolvePlacementSummary.length).toBe(2);
++  });
++
++  it("requires people.read", async () => {
++    const { service } = harness();
++    await expect(service.resolvePlacementSummary(context([]), "p1")).rejects.toBeInstanceOf(AuthorizationError);
++  });
++});
++
++describe("PrismaOrganizationPlacementService — resolvePlacementSummaries", () => {
++  it("resolves each person in order and caches manager lookups within the batch", async () => {
++    const { service, assignmentStore, orgUnitStore, employees } = harness([{ id: "mgr-1", displayName: "Maria Santos" }]);
++    orgUnitStore.units.push(orgUnit({ id: "team", kind: "TEAM" }));
++    assignmentStore.assignments.push(
++      assignment({ id: "a1", personId: "p1", orgUnitId: "team", managerId: "mgr-1" }),
++      assignment({ id: "a2", personId: "p2", orgUnitId: "team", managerId: "mgr-1" }),
++    );
++    const summaries = await service.resolvePlacementSummaries(context(), ["p1", "p2"]);
++    expect(summaries).toHaveLength(2);
++    expect(summaries[0].manager?.displayName).toBe("Maria Santos");
++    expect(summaries[1].manager?.displayName).toBe("Maria Santos");
++    expect(employees.findDisplayName).toHaveBeenCalledTimes(1);
++  });
++});
++
++describe("PrismaOrganizationPlacementService — listOptions", () => {
++  it("lists DEPARTMENT-kind OrgUnits for type department, with parentId when present", async () => {
++    const { service, orgUnitStore } = harness();
++    orgUnitStore.units.push(
++      orgUnit({ id: "root", code: "ROOT", name: "Root", kind: "DIVISION" }),
++      orgUnit({ id: "dept", code: "DEPT", name: "Finance", kind: "DEPARTMENT", parentId: "root" }),
++      orgUnit({ id: "team", code: "TEAM", name: "Payroll", kind: "TEAM", parentId: "dept" }),
++    );
++    const options = await service.listOptions(context(), "department");
++    expect(options).toEqual([{ id: "dept", displayName: "Finance", type: "department", parentId: "root" }]);
++  });
++
++  it("lists TEAM-kind OrgUnits for type team", async () => {
++    const { service, orgUnitStore } = harness();
++    orgUnitStore.units.push(orgUnit({ id: "team", code: "TEAM", name: "Payroll", kind: "TEAM", parentId: "dept" }));
++    const options = await service.listOptions(context(), "team");
++    expect(options).toEqual([{ id: "team", displayName: "Payroll", type: "team", parentId: "dept" }]);
++  });
++
++  it("lists every employee for type manager", async () => {
++    const { service } = harness([{ id: "e1", displayName: "Ana Reyes" }, { id: "e2", displayName: "Bea Cruz" }]);
++    const options = await service.listOptions(context(), "manager");
++    expect(options).toEqual([
++      { id: "e1", displayName: "Ana Reyes", type: "manager" },
++      { id: "e2", displayName: "Bea Cruz", type: "manager" },
++    ]);
++  });
++
++  it("requires people.read", async () => {
++    const { service } = harness();
++    await expect(service.listOptions(context([]), "department")).rejects.toBeInstanceOf(AuthorizationError);
++  });
++});
++
++describe("PrismaOrganizationPlacementService — tenant isolation", () => {
++  it("does not resolve another tenant's assignment or org unit", async () => {
++    const { service, assignmentStore, orgUnitStore } = harness();
++    orgUnitStore.units.push(orgUnit({ id: "team", tenantId: "tenant-a", kind: "TEAM" }));
++    assignmentStore.assignments.push(assignment({ tenantId: "tenant-a", orgUnitId: "team" }));
++    const summary = await service.resolvePlacementSummary(context(["hr_admin"], "tenant-b"), "p1");
++    expect(summary).toEqual({});
++  });
++});
+diff --git a/src/platform/people/read-models/prisma-organization-placement-service.ts b/src/platform/people/read-models/prisma-organization-placement-service.ts
+new file mode 100644
+index 0000000..39feaf7
+--- /dev/null
++++ b/src/platform/people/read-models/prisma-organization-placement-service.ts
+@@ -0,0 +1,83 @@
++import type { TenantContext } from "@/platform/context";
++import { requirePeoplePermission } from "@/platform/people/application/people-policies";
++import type { OrganizationReferenceOptionDto, OrganizationReferenceType, OrganizationSummaryDto } from "@/platform/organization/organization-reference-dtos";
++import type { OrganizationQueryService } from "@/platform/organization/organization-query-service";
++import type { OrgUnitKind, OrgUnitRecord } from "@/platform/organization/org-unit";
++import type { OrganizationPlacementService } from "@/platform/people/read-models/organization-placement-service";
++import type { EmployeeDisplayLookup } from "@/platform/people/read-models/employee-display-lookup";
++
++/** The nearest ancestor (or the unit itself) of a given kind, searching from the leaf toward the root. */
++function nearestByKind(path: readonly OrgUnitRecord[], kind: OrgUnitKind): OrgUnitRecord | undefined {
++  for (let i = path.length - 1; i >= 0; i--) {
++    if (path[i].kind === kind) return path[i];
++  }
++  return undefined;
++}
++
++/**
++ * The real `OrganizationPlacementService`. Composes `OrganizationQueryService`
++ * (which resolves ids only, through Assignment) with a minimal, direct
++ * employee display-name lookup — the one place an Organization id becomes a
++ * name for People UI. Never reads a denormalized Employee organization field
++ * (ADR-012 §12 invariant #5) — resolution goes through Assignment only.
++ *
++ * "Department" and "team" are derived from the org path: the nearest
++ * ancestor (or the assigned unit itself) of kind DEPARTMENT / TEAM. Assignment
++ * names exactly one OrgUnit; department/team are read off the path to it, not
++ * off separate fields, since OrgUnit is a general recursive tree, not a fixed
++ * two-level department→team hierarchy.
++ */
++export class PrismaOrganizationPlacementService implements OrganizationPlacementService {
++  constructor(
++    private readonly query: OrganizationQueryService,
++    private readonly employees: EmployeeDisplayLookup,
++  ) {}
++
++  async resolvePlacementSummary(context: TenantContext, personId: string): Promise<OrganizationSummaryDto> {
++    requirePeoplePermission(context, "people.read");
++    return this.resolveOne(context, personId, new Map());
++  }
++
++  async resolvePlacementSummaries(context: TenantContext, personIds: readonly string[]): Promise<OrganizationSummaryDto[]> {
++    requirePeoplePermission(context, "people.read");
++    const managerNameCache = new Map<string, Promise<string | undefined>>();
++    return Promise.all(personIds.map((personId) => this.resolveOne(context, personId, managerNameCache)));
++  }
++
++  async listOptions(context: TenantContext, type: OrganizationReferenceType): Promise<OrganizationReferenceOptionDto[]> {
++    requirePeoplePermission(context, "people.read");
++    if (type === "manager") {
++      const employees = await this.employees.listDisplays(context.tenantId);
++      return employees.map((employee) => Object.freeze({ id: employee.id, displayName: employee.displayName, type: "manager" as const }));
++    }
++    const kind: OrgUnitKind = type === "department" ? "DEPARTMENT" : "TEAM";
++    const units = await this.query.resolveOrgUnitsByKind(context, kind);
++    return units.map((unit) => Object.freeze({ id: unit.id, displayName: unit.name, type, ...(unit.parentId ? { parentId: unit.parentId } : {}) }));
++  }
++
++  private async resolveOne(context: TenantContext, personId: string, managerNameCache: Map<string, Promise<string | undefined>>): Promise<OrganizationSummaryDto> {
++    const placement = await this.query.resolveCurrentPlacement(context, personId);
++    if (!placement) return {};
++
++    const path = await this.query.resolveOrgPath(context, placement.orgUnit.id);
++    const department = nearestByKind(path, "DEPARTMENT");
++    const team = nearestByKind(path, "TEAM");
++
++    const managerId = placement.assignment.managerId;
++    const managerName = managerId ? await this.lookupManagerName(context.tenantId, managerId, managerNameCache) : undefined;
++
++    return Object.freeze({
++      ...(department ? { department: Object.freeze({ id: department.id, displayName: department.name, type: "department" as const }) } : {}),
++      ...(team ? { team: Object.freeze({ id: team.id, displayName: team.name, type: "team" as const }) } : {}),
++      ...(managerId && managerName ? { manager: Object.freeze({ id: managerId, displayName: managerName, type: "manager" as const }) } : {}),
++    });
++  }
++
++  private lookupManagerName(tenantId: string, managerId: string, cache: Map<string, Promise<string | undefined>>): Promise<string | undefined> {
++    const existing = cache.get(managerId);
++    if (existing) return existing;
++    const pending = this.employees.findDisplayName(tenantId, managerId);
++    cache.set(managerId, pending);
++    return pending;
++  }
++}
+diff --git a/src/platform/people/runtime-hire-loader.ts b/src/platform/people/runtime-hire-loader.ts
+index 587d936..52d1cea 100644
+--- a/src/platform/people/runtime-hire-loader.ts
++++ b/src/platform/people/runtime-hire-loader.ts
+@@ -9,7 +9,7 @@ export async function loadRuntimeHireReferences(): Promise<RuntimeHireReferences
+   const context = await resolveRequestContext();
+   try {
+     const runtime = createApplicationRuntime(context);
+-    const [departments, teams, managers] = await Promise.all([runtime.organizationReferences.list(runtime.context, "department"), runtime.organizationReferences.list(runtime.context, "team"), runtime.organizationReferences.list(runtime.context, "manager")]);
++    const [departments, teams, managers] = await Promise.all([runtime.organizationPlacements.listOptions(runtime.context, "department"), runtime.organizationPlacements.listOptions(runtime.context, "team"), runtime.organizationPlacements.listOptions(runtime.context, "manager")]);
+     return { departments, teams, managers };
+   } catch { return emptyRuntimeHireReferences(); }
+ }
+diff --git a/src/platform/tokens.ts b/src/platform/tokens.ts
+index d44ebb9..3491f73 100644
+--- a/src/platform/tokens.ts
++++ b/src/platform/tokens.ts
+@@ -2,8 +2,7 @@ import type { AuditRepository } from "@/platform/audit";
+ import type { EmployeeRepository } from "@/platform/people/employee-repository";
+ import { createServiceToken } from "@/platform/di";
+ import type { PeopleService } from "@/platform/people/application/people-service";
+-import type { OrganizationReferenceRepository } from "@/platform/organization/organization-reference-repository";
+-import type { OrganizationReferenceService } from "@/platform/organization/organization-reference-service";
++import type { OrganizationPlacementService } from "@/platform/people/read-models/organization-placement-service";
+ import type { EmployeeAggregateRepository } from "@/platform/people/persistence/employee-aggregate-repository";
+ import type { EmployeeTransactionRepositories } from "@/platform/people/persistence/in-memory-employee-unit-of-work";
+ import type { UnitOfWork } from "@/platform/transactions/unit-of-work";
+@@ -13,8 +12,7 @@ import type { AuditRecordFactory } from "@/platform/auditing/audit-record-factor
+ export const AUDIT_REPOSITORY = createServiceToken<AuditRepository>("AuditRepository");
+ export const EMPLOYEE_REPOSITORY = createServiceToken<EmployeeRepository>("EmployeeRepository");
+ export const PEOPLE_SERVICE = createServiceToken<PeopleService>("PeopleService");
+-export const ORGANIZATION_REFERENCE_REPOSITORY = createServiceToken<OrganizationReferenceRepository>("OrganizationReferenceRepository");
+-export const ORGANIZATION_REFERENCE_SERVICE = createServiceToken<OrganizationReferenceService>("OrganizationReferenceService");
++export const ORGANIZATION_PLACEMENT_SERVICE = createServiceToken<OrganizationPlacementService>("OrganizationPlacementService");
+ export const EMPLOYEE_AGGREGATE_REPOSITORY = createServiceToken<EmployeeAggregateRepository>("EmployeeAggregateRepository");
+ export const EMPLOYEE_UNIT_OF_WORK = createServiceToken<UnitOfWork<EmployeeTransactionRepositories>>("EmployeeUnitOfWork");
+ export const DOMAIN_EVENT_COLLECTOR = createServiceToken<DomainEventCollector>("DomainEventCollector");
+-- 
+2.43.0
+

@@ -1,0 +1,93 @@
+From e986664730298f75cee1b1c401c94abbc180f85f Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sat, 25 Jul 2026 02:06:45 +0000
+Subject: [PATCH] Fix: /people directory page crashes when the
+ department-options lookup fails
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+loadRuntimeDirectory() called organizationPlacements.listOptions() directly
+inside a Promise.all with no error handling, unlike the row-summary lookup
+right next to it, which already degraded gracefully on failure. Any failure
+there — a permission edge case, a transient DB error, or the Organization
+tables from Epics 7B.1-7B.3 not yet being migrated on a given environment's
+database — took down the entire /people page with an uncaught exception
+instead of just showing an empty department filter.
+
+Wraps it the same way resolveDirectoryRows already handles its own
+Organization read: never throws, degrades to an empty option list.
+
+Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_012xkyMKxXWptQtBxJmKLszv
+---
+ .../people/directory-runtime-loader.test.ts     | 17 ++++++++++++++++-
+ src/platform/people/directory-runtime-loader.ts | 13 ++++++++++++-
+ 2 files changed, 28 insertions(+), 2 deletions(-)
+
+diff --git a/src/platform/people/directory-runtime-loader.test.ts b/src/platform/people/directory-runtime-loader.test.ts
+index 1ecebfd..b09245f 100644
+--- a/src/platform/people/directory-runtime-loader.test.ts
++++ b/src/platform/people/directory-runtime-loader.test.ts
+@@ -1,7 +1,7 @@
+ import { describe, expect, it, vi } from "vitest";
+ import type { PrismaPeopleReadRuntime } from "@/platform/people/prisma-people-read-runtime";
+ import type { EmployeeDirectoryDto } from "@/platform/people/application/people-dtos";
+-import { resolveDirectoryRows, toPeopleDirectoryRow } from "@/platform/people/directory-runtime-loader";
++import { resolveDepartmentOptions, resolveDirectoryRows, toPeopleDirectoryRow } from "@/platform/people/directory-runtime-loader";
+ 
+ const employee: EmployeeDirectoryDto = { id: "emp-1", employeeNumber: "NW-1", displayName: "Ana Domingo", workEmail: "ana@northwind.ph", departmentId: "dep-fin", teamId: "team-fin", hireDate: "2022-01-01", position: "Analyst", status: "regular", managerId: "emp-2" };
+ 
+@@ -34,3 +34,18 @@ describe("People directory runtime row mapping", () => {
+     expect(organizationPlacements.resolvePlacementSummaries).toHaveBeenCalledWith(runtime.context, [employee.id]);
+   });
+ });
++
++describe("resolveDepartmentOptions", () => {
++  it("returns the department picker options", async () => {
++    const organizationPlacements = { listOptions: vi.fn().mockResolvedValue([{ id: "dep-fin", displayName: "Finance", type: "department" }]) };
++    const runtime = { context: { tenantId: "nw-ph", actorId: "hr", actorName: "HR", roles: ["hr_admin"] }, organizationPlacements } as unknown as Pick<PrismaPeopleReadRuntime, "context" | "organizationPlacements">;
++    await expect(resolveDepartmentOptions(runtime)).resolves.toEqual([{ id: "dep-fin", displayName: "Finance", type: "department" }]);
++    expect(organizationPlacements.listOptions).toHaveBeenCalledWith(runtime.context, "department");
++  });
++
++  it("degrades to an empty list instead of throwing when the Organization read is unavailable — this is what keeps a missing migration or a permission edge case from crashing the whole /people page", async () => {
++    const organizationPlacements = { listOptions: vi.fn().mockRejectedValue(new Error("relation \"org_units\" does not exist")) };
++    const runtime = { context: { tenantId: "nw-ph", actorId: "hr", actorName: "HR", roles: ["hr_admin"] }, organizationPlacements } as unknown as Pick<PrismaPeopleReadRuntime, "context" | "organizationPlacements">;
++    await expect(resolveDepartmentOptions(runtime)).resolves.toEqual([]);
++  });
++});
+diff --git a/src/platform/people/directory-runtime-loader.ts b/src/platform/people/directory-runtime-loader.ts
+index f80f80d..bbc2852 100644
+--- a/src/platform/people/directory-runtime-loader.ts
++++ b/src/platform/people/directory-runtime-loader.ts
+@@ -60,6 +60,17 @@ export async function resolveDirectoryRows(
+   }
+ }
+ 
++/** Never throws: an unavailable Organization read (e.g. a permission edge case or a transient failure) degrades to no filter options rather than failing the whole directory page. */
++export async function resolveDepartmentOptions(
++  runtime: Pick<PrismaPeopleReadRuntime, "context" | "organizationPlacements">,
++): Promise<OrganizationReferenceOptionDto[]> {
++  try {
++    return await runtime.organizationPlacements.listOptions(runtime.context, "department");
++  } catch {
++    return [];
++  }
++}
++
+ export async function loadRuntimeDirectory(input: {
+   query?: string;
+   offset?: number;
+@@ -83,7 +94,7 @@ export async function loadRuntimeDirectory(input: {
+       ...(status.length ? { status } : {}),
+       ...(departmentId ? { departmentId } : {}),
+     }),
+-    runtime.organizationPlacements.listOptions(runtime.context, "department"),
++    resolveDepartmentOptions(runtime),
+   ]);
+   return {
+     items: await resolveDirectoryRows(runtime, result.items),
+-- 
+2.43.0
+
