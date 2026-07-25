@@ -251,6 +251,33 @@ describe("import boundary fitness rules (fixtures prove each rule actually catch
     const file: SourceFile = { path: "src/platform/organization/location-service.ts", content: `import { hasPermission } from "@/platform/context";\nimport { validateCreateLocationDraft } from "@/platform/organization/location";\n` };
     expect(scanImportBoundaries([file])).toHaveLength(0);
   });
+
+  it("flags the organization query service importing Prisma directly (queries must go through the read repositories, never bypass Assignment)", () => {
+    const file: SourceFile = { path: "src/platform/organization/organization-query-service.ts", content: `import type { PrismaClient } from "@prisma/client";\n` };
+    expect(scanImportBoundaries([file])).toContainEqual({ path: file.path, rule: "organization-query-service-must-not-import-prisma-directly", matchedImport: "@prisma/client" });
+  });
+
+  it("flags the organization query service importing the write side (a read service must never mutate an aggregate)", () => {
+    const file: SourceFile = { path: "src/platform/organization/organization-query-service.ts", content: `import { LocationService } from "@/platform/organization/location-service";\n` };
+    expect(scanImportBoundaries([file])).toContainEqual({ path: file.path, rule: "organization-query-service-must-not-import-write-side", matchedImport: "@/platform/organization/location-service" });
+  });
+
+  it("flags a client component importing the organization query service or the People placement service (ADR-012 server composition)", () => {
+    const queryFile: SourceFile = { path: "src/components/organization/bad-query-client.tsx", content: `"use client";\nimport { OrganizationQueryService } from "@/platform/organization/organization-query-service";\n` };
+    const placementFile: SourceFile = { path: "src/components/people/bad-placement-client.tsx", content: `"use client";\nimport { PrismaOrganizationPlacementService } from "@/platform/people/read-models/prisma-organization-placement-service";\n` };
+    expect(scanImportBoundaries([queryFile])).toContainEqual({ path: queryFile.path, rule: "client-components-must-not-import-organization-server-composition", matchedImport: "@/platform/organization/organization-query-service" });
+    expect(scanImportBoundaries([placementFile])).toContainEqual({ path: placementFile.path, rule: "client-components-must-not-import-organization-server-composition", matchedImport: "@/platform/people/read-models/prisma-organization-placement-service" });
+  });
+
+  it("flags the People placement service implementation importing the Organization write side", () => {
+    const file: SourceFile = { path: "src/platform/people/read-models/prisma-organization-placement-service.ts", content: `import { AssignmentService } from "@/platform/organization/assignment-service";\n` };
+    expect(scanImportBoundaries([file])).toContainEqual({ path: file.path, rule: "organization-placement-service-must-not-import-write-side", matchedImport: "@/platform/organization/assignment-service" });
+  });
+
+  it("does not flag the legitimate organization query service composing the three read repositories", () => {
+    const file: SourceFile = { path: "src/platform/organization/organization-query-service.ts", content: `import type { AssignmentReadRepository } from "@/platform/organization/assignment-repository";\nimport type { OrgUnitReadRepository } from "@/platform/organization/org-unit-repository";\nimport type { LocationReadRepository } from "@/platform/organization/location-repository";\n` };
+    expect(scanImportBoundaries([file])).toHaveLength(0);
+  });
 });
 
 describe("import boundary fitness rules — real codebase scan", () => {

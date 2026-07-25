@@ -71,10 +71,10 @@ const hireParityCapabilities = [
 
 const profileCapabilities = [
   cap("PEOPLE.PROFILE.READ", "View profile overview", { entryPoint: "/people/[employeeId]", implementation: "PeopleService.getProfile → ProfileOverviewViewModel", readModel: "ProfileOverviewViewModel" }),
-  cap("PEOPLE.PROFILE.EMPLOYMENT.READ", "View employment information", { entryPoint: "/employment", implementation: "profile loader + OrganizationReferenceService", readModel: "ProfileEmploymentViewModel" }),
-  cap("PEOPLE.PROFILE.WORK_INFORMATION.READ", "View work information", { entryPoint: "/work-information", implementation: "profile loader + OrganizationReferenceService", readModel: "ProfileWorkInformationViewModel" }),
+  cap("PEOPLE.PROFILE.EMPLOYMENT.READ", "View employment information", { entryPoint: "/employment", implementation: "profile loader + OrganizationPlacementService", readModel: "ProfileEmploymentViewModel" }),
+  cap("PEOPLE.PROFILE.WORK_INFORMATION.READ", "View work information", { entryPoint: "/work-information", implementation: "profile loader + OrganizationPlacementService", readModel: "ProfileWorkInformationViewModel" }),
   cap("PEOPLE.CONTACT.READ", "View contact information", { entryPoint: "/contact-information", implementation: "PeopleService.getContact", readModel: "ProfileContactInformationViewModel", sensitivity: "personal" }),
-  cap("PEOPLE.ORGANIZATION_REFERENCES.READ", "Resolve organization references", { entryPoint: "Employment and Work Information", implementation: "OrganizationReferenceService" }),
+  cap("PEOPLE.ORGANIZATION_REFERENCES.READ", "Resolve organization placement (department/team/manager) through Assignment", { entryPoint: "Employment and Work Information", implementation: "OrganizationPlacementService" }),
   cap("PEOPLE.PROFILE.HEADER.READ", "View profile header", { entryPoint: "profile shell", implementation: "ProfileOverviewViewModel" }),
   cap("PEOPLE.PROFILE.TABS.NAVIGATE", "Navigate profile tabs", { entryPoint: "ProfileNav", implementation: "runtime tab links" }),
   cap("PEOPLE.PROFILE.HISTORICAL_ROUTES.OPEN", "Open direct historical tab URLs", { entryPoint: "deferred routes", implementation: "RuntimeProfilePage deferred state", runtimeStatus: "DEFERRED_VISIBLE" }),

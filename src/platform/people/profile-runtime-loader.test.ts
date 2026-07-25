@@ -3,7 +3,7 @@ import { AuthorizationError } from "@/platform/errors";
 import type { EmployeeProfileDto } from "@/platform/people/application/people-dtos";
 import type { PrismaPeopleReadRuntime } from "@/platform/people/prisma-people-read-runtime";
 import type { EmployeeProfileReadRepository } from "@/platform/people/read-models/employee-profile-read-repository";
-import type { OrganizationReferenceService } from "@/platform/organization/organization-reference-service";
+import type { OrganizationPlacementService } from "@/platform/people/read-models/organization-placement-service";
 import {
   aggregateRuntimeProfile,
   toProfileContactInformationViewModel,
@@ -26,20 +26,20 @@ const profile: EmployeeProfileDto = {
   regularizationDate: "2022-07-01",
 };
 
-function runtime(overrides: Partial<EmployeeProfileReadRepository> = {}, organizationOverrides: Partial<OrganizationReferenceService> = {}) {
+function runtime(overrides: Partial<EmployeeProfileReadRepository> = {}, organizationOverrides: Partial<OrganizationPlacementService> = {}) {
   const profiles = {
     findProfile: vi.fn().mockResolvedValue(profile),
     findContact: vi.fn().mockResolvedValue({ id: "emp-1", workEmail: "ana@work.example" }),
     ...overrides,
   } as unknown as EmployeeProfileReadRepository;
-  const organizationReferences = {
-    resolveSummary: vi.fn().mockResolvedValue({
+  const organizationPlacements = {
+    resolvePlacementSummary: vi.fn().mockResolvedValue({
       department: { id: "finance", displayName: "Finance", type: "department" },
       team: { id: "planning", displayName: "Financial Planning", type: "team" },
       manager: { id: "emp-2", displayName: "Maria Santos", type: "manager" },
     }),
     ...organizationOverrides,
-  } as unknown as OrganizationReferenceService;
+  } as unknown as OrganizationPlacementService;
   return {
     context: {
       tenantId: "tenant-secret",
@@ -48,8 +48,8 @@ function runtime(overrides: Partial<EmployeeProfileReadRepository> = {}, organiz
       permissions: ["people.read"],
     },
     profiles,
-    organizationReferences,
-  } as unknown as Pick<PrismaPeopleReadRuntime, "context" | "profiles" | "organizationReferences">;
+    organizationPlacements,
+  } as unknown as Pick<PrismaPeopleReadRuntime, "context" | "profiles" | "organizationPlacements">;
 }
 
 describe("runtime profile view models", () => {
@@ -144,11 +144,11 @@ describe("runtime profile aggregation", () => {
     expect(result.kind).toBe("ready");
     expect(app.profiles.findProfile).toHaveBeenCalledOnce();
     expect(app.profiles.findContact).toHaveBeenCalledOnce();
-    expect(app.organizationReferences.resolveSummary).toHaveBeenCalledOnce();
+    expect(app.organizationPlacements.resolvePlacementSummary).toHaveBeenCalledOnce();
   });
 
   it("keeps Work Information safe when organization resolution fails", async () => {
-    const app = runtime({}, { resolveSummary: vi.fn().mockRejectedValue(new Error("offline")) });
+    const app = runtime({}, { resolvePlacementSummary: vi.fn().mockRejectedValue(new Error("offline")) });
     const result = await aggregateRuntimeProfile(app, "emp-1");
     expect(result).toMatchObject({ kind: "ready", workInformation: { department: undefined, team: undefined, manager: undefined } });
   });

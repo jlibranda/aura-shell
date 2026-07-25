@@ -55,4 +55,6 @@ export interface AssignmentReadRepository {
   getCurrentForPerson(context: TenantContext, personId: string): Promise<AssignmentRecord | undefined>;
   /** Full placement history for a person, ascending by effectiveFrom. */
   listHistoryForPerson(context: TenantContext, personId: string): Promise<AssignmentRecord[]>;
+  /** Every currently open primary assignment reporting to this manager — the "direct reports" query. */
+  listCurrentByManager(context: TenantContext, managerId: string): Promise<AssignmentRecord[]>;
 }

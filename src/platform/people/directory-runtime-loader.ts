@@ -46,18 +46,15 @@ export function toPeopleDirectoryRow(
 }
 
 export async function resolveDirectoryRows(
-  runtime: Pick<PrismaPeopleReadRuntime, "context" | "organizationReferences">,
+  runtime: Pick<PrismaPeopleReadRuntime, "context" | "organizationPlacements">,
   employees: readonly PeopleDirectoryReadModel[],
 ): Promise<PeopleDirectoryRow[]> {
   try {
-    const references = await runtime.organizationReferences.resolveSummaries(
+    const summaries = await runtime.organizationPlacements.resolvePlacementSummaries(
       runtime.context,
-      employees.map((employee) => ({
-        departmentId: employee.departmentId,
-        managerId: employee.managerId,
-      })),
+      employees.map((employee) => employee.id),
     );
-    return employees.map((employee, index) => toPeopleDirectoryRow(employee, references[index]));
+    return employees.map((employee, index) => toPeopleDirectoryRow(employee, summaries[index]));
   } catch {
     return employees.map((employee) => toPeopleDirectoryRow(employee));
   }
@@ -86,7 +83,7 @@ export async function loadRuntimeDirectory(input: {
       ...(status.length ? { status } : {}),
       ...(departmentId ? { departmentId } : {}),
     }),
-    runtime.organizationReferences.list(runtime.context, "department"),
+    runtime.organizationPlacements.listOptions(runtime.context, "department"),
   ]);
   return {
     items: await resolveDirectoryRows(runtime, result.items),
