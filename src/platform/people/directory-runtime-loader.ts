@@ -60,6 +60,17 @@ export async function resolveDirectoryRows(
   }
 }
 
+/** Never throws: an unavailable Organization read (e.g. a permission edge case or a transient failure) degrades to no filter options rather than failing the whole directory page. */
+export async function resolveDepartmentOptions(
+  runtime: Pick<PrismaPeopleReadRuntime, "context" | "organizationPlacements">,
+): Promise<OrganizationReferenceOptionDto[]> {
+  try {
+    return await runtime.organizationPlacements.listOptions(runtime.context, "department");
+  } catch {
+    return [];
+  }
+}
+
 export async function loadRuntimeDirectory(input: {
   query?: string;
   offset?: number;
@@ -83,7 +94,7 @@ export async function loadRuntimeDirectory(input: {
       ...(status.length ? { status } : {}),
       ...(departmentId ? { departmentId } : {}),
     }),
-    runtime.organizationPlacements.listOptions(runtime.context, "department"),
+    resolveDepartmentOptions(runtime),
   ]);
   return {
     items: await resolveDirectoryRows(runtime, result.items),

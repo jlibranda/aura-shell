@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import type { PrismaPeopleReadRuntime } from "@/platform/people/prisma-people-read-runtime";
 import type { EmployeeDirectoryDto } from "@/platform/people/application/people-dtos";
-import { resolveDirectoryRows, toPeopleDirectoryRow } from "@/platform/people/directory-runtime-loader";
+import { resolveDepartmentOptions, resolveDirectoryRows, toPeopleDirectoryRow } from "@/platform/people/directory-runtime-loader";
 
 const employee: EmployeeDirectoryDto = { id: "emp-1", employeeNumber: "NW-1", displayName: "Ana Domingo", workEmail: "ana@northwind.ph", departmentId: "dep-fin", teamId: "team-fin", hireDate: "2022-01-01", position: "Analyst", status: "regular", managerId: "emp-2" };
 
@@ -32,5 +32,20 @@ describe("People directory runtime row mapping", () => {
     const runtime = { context: { tenantId: "nw-ph", actorId: "hr", actorName: "HR", roles: ["hr_admin"] }, organizationPlacements } as unknown as Pick<PrismaPeopleReadRuntime, "context" | "organizationPlacements">;
     await expect(resolveDirectoryRows(runtime, [employee])).resolves.toMatchObject([{ department: "Finance", manager: "Maria Santos" }]);
     expect(organizationPlacements.resolvePlacementSummaries).toHaveBeenCalledWith(runtime.context, [employee.id]);
+  });
+});
+
+describe("resolveDepartmentOptions", () => {
+  it("returns the department picker options", async () => {
+    const organizationPlacements = { listOptions: vi.fn().mockResolvedValue([{ id: "dep-fin", displayName: "Finance", type: "department" }]) };
+    const runtime = { context: { tenantId: "nw-ph", actorId: "hr", actorName: "HR", roles: ["hr_admin"] }, organizationPlacements } as unknown as Pick<PrismaPeopleReadRuntime, "context" | "organizationPlacements">;
+    await expect(resolveDepartmentOptions(runtime)).resolves.toEqual([{ id: "dep-fin", displayName: "Finance", type: "department" }]);
+    expect(organizationPlacements.listOptions).toHaveBeenCalledWith(runtime.context, "department");
+  });
+
+  it("degrades to an empty list instead of throwing when the Organization read is unavailable — this is what keeps a missing migration or a permission edge case from crashing the whole /people page", async () => {
+    const organizationPlacements = { listOptions: vi.fn().mockRejectedValue(new Error("relation \"org_units\" does not exist")) };
+    const runtime = { context: { tenantId: "nw-ph", actorId: "hr", actorName: "HR", roles: ["hr_admin"] }, organizationPlacements } as unknown as Pick<PrismaPeopleReadRuntime, "context" | "organizationPlacements">;
+    await expect(resolveDepartmentOptions(runtime)).resolves.toEqual([]);
   });
 });
