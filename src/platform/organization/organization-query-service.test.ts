@@ -129,6 +129,25 @@ describe("OrganizationQueryService — current placement", () => {
   });
 });
 
+describe("OrganizationQueryService — current assignments (Epic 7B.5 admin list)", () => {
+  it("resolveCurrentAssignments returns every currently open primary assignment for the tenant", async () => {
+    const { service, assignmentStore } = harness();
+    assignmentStore.assignments.push(
+      assignment({ id: "a1", personId: "p1" }),
+      assignment({ id: "a2", personId: "p2" }),
+      assignment({ id: "a3", personId: "p3", effectiveUntil: "2026-06-01T00:00:00.000Z" }),
+    );
+    const current = await service.resolveCurrentAssignments(context());
+    expect(current.map((a) => a.personId).sort()).toEqual(["p1", "p2"]);
+  });
+
+  it("resolveCurrentAssignments never returns another tenant's assignments", async () => {
+    const { service, assignmentStore } = harness();
+    assignmentStore.assignments.push(assignment({ tenantId: "tenant-a", personId: "p1" }));
+    expect(await service.resolveCurrentAssignments(context("tenant-b"))).toEqual([]);
+  });
+});
+
 describe("OrganizationQueryService — hierarchy queries", () => {
   function seedTree(orgUnitStore: OrgUnitStore) {
     orgUnitStore.units.push(

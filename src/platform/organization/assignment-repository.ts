@@ -57,4 +57,6 @@ export interface AssignmentReadRepository {
   listHistoryForPerson(context: TenantContext, personId: string): Promise<AssignmentRecord[]>;
   /** Every currently open primary assignment reporting to this manager — the "direct reports" query. */
   listCurrentByManager(context: TenantContext, managerId: string): Promise<AssignmentRecord[]>;
+  /** Every currently open primary assignment for the tenant — the Assignment administration list. */
+  listCurrentPrimary(context: TenantContext): Promise<AssignmentRecord[]>;
 }

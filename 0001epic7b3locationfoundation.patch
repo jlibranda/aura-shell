@@ -1,0 +1,1661 @@
+From 43c40b75fd1c290d4d2fa12965e387682fe229b7 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sat, 25 Jul 2026 01:10:58 +0000
+Subject: [PATCH] Epic 7B.3: Location Foundation (ADR-012)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Adds Location as a first-class Organization aggregate — a physical or
+recognized work site, orthogonal to the OrgUnit tree (never a node in it,
+never an OrgUnit kind). Location identity (id, code) is immutable and never
+reused; a rename changes only the display name; locations are archived, never
+hard-deleted.
+
+- Location aggregate + Address value object (no independent lifecycle) +
+  validation: code format, ISO 3166-1 alpha-2 country code, and IANA time
+  zone validated via the runtime's own Intl.DateTimeFormat probe (same
+  technique Configuration's general company settings use, reimplemented
+  locally since Organization must never import Configuration)
+- Schema + migration: tenant-scoped unique id/code (mirrors OrgUnit), a
+  status CHECK constraint, address flattened onto the table as plain columns
+  (no JSON blob) — verified against real Postgres
+- Write/read repositories (Prisma + in-memory), event-buffering write
+  transaction, and a UnitOfWork committing location + audit + outbox
+  atomically, mirroring the OrgUnit/Assignment platform pattern exactly
+- LocationService: create, updateDetails, archive — organization.manage
+  gated, unique-code-per-tenant enforced in-transaction
+- Architecture fitness rules extended: Location read/write-side boundary,
+  client-composition guard, and a new org-unit-must-not-import-location rule
+  protecting "Location is orthogonal to OrgUnit, never owned by it"; a
+  structure test guards a single Location aggregate/service and confirms
+  Location is never declared as an OrgUnit kind
+- 22 unit tests + 5 real-Postgres integration tests (atomicity, DB-level
+  guards, full lifecycle, tenant isolation)
+
+Out of scope, per ADR-012 and ticket: LegalEntity, Location-Employee
+assignment, any change to the Assignment aggregate, OrgUnit-Location
+ownership, work schedules, geofencing, and a Location administration UI.
+Employee.workLocation remains the legacy, non-authoritative field.
+
+Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_012xkyMKxXWptQtBxJmKLszv
+---
+ .../migration.sql                             |  36 ++++
+ prisma/schema.prisma                          |  33 +++
+ .../architecture/import-boundaries.test.ts    |  25 +++
+ .../architecture/import-boundaries.ts         |  21 +-
+ .../in-memory-location-repository.ts          | 100 +++++++++
+ .../in-memory-location-unit-of-work.ts        |  55 +++++
+ src/platform/organization/location-events.ts  |  41 ++++
+ .../location-platform.integration.test.ts     | 119 +++++++++++
+ .../organization/location-repository.ts       |  51 +++++
+ .../organization/location-service.test.ts     | 172 ++++++++++++++++
+ src/platform/organization/location-service.ts | 108 ++++++++++
+ .../organization/location-structure.test.ts   |  63 ++++++
+ .../location-write-transaction.ts             |  77 +++++++
+ src/platform/organization/location.test.ts    |  85 ++++++++
+ src/platform/organization/location.ts         | 190 ++++++++++++++++++
+ .../prisma-location-read-repository.ts        |  69 +++++++
+ .../prisma-location-unit-of-work.ts           |  74 +++++++
+ .../prisma-location-write-repository.ts       | 101 ++++++++++
+ 18 files changed, 1418 insertions(+), 2 deletions(-)
+ create mode 100644 prisma/migrations/20260725010313_organization_location/migration.sql
+ create mode 100644 src/platform/organization/in-memory-location-repository.ts
+ create mode 100644 src/platform/organization/in-memory-location-unit-of-work.ts
+ create mode 100644 src/platform/organization/location-events.ts
+ create mode 100644 src/platform/organization/location-platform.integration.test.ts
+ create mode 100644 src/platform/organization/location-repository.ts
+ create mode 100644 src/platform/organization/location-service.test.ts
+ create mode 100644 src/platform/organization/location-service.ts
+ create mode 100644 src/platform/organization/location-structure.test.ts
+ create mode 100644 src/platform/organization/location-write-transaction.ts
+ create mode 100644 src/platform/organization/location.test.ts
+ create mode 100644 src/platform/organization/location.ts
+ create mode 100644 src/platform/organization/prisma-location-read-repository.ts
+ create mode 100644 src/platform/organization/prisma-location-unit-of-work.ts
+ create mode 100644 src/platform/organization/prisma-location-write-repository.ts
+
+diff --git a/prisma/migrations/20260725010313_organization_location/migration.sql b/prisma/migrations/20260725010313_organization_location/migration.sql
+new file mode 100644
+index 0000000..bbe2b28
+--- /dev/null
++++ b/prisma/migrations/20260725010313_organization_location/migration.sql
+@@ -0,0 +1,36 @@
++-- CreateTable
++CREATE TABLE "locations" (
++    "location_id" TEXT NOT NULL,
++    "tenant_id" TEXT NOT NULL,
++    "code" TEXT NOT NULL,
++    "name" TEXT NOT NULL,
++    "address_line1" TEXT NOT NULL,
++    "address_line2" TEXT,
++    "city" TEXT NOT NULL,
++    "region" TEXT,
++    "postal_code" TEXT,
++    "country_code" TEXT NOT NULL,
++    "timezone" TEXT NOT NULL,
++    "status" TEXT NOT NULL DEFAULT 'ACTIVE',
++    "created_at" TIMESTAMPTZ(6) NOT NULL DEFAULT CURRENT_TIMESTAMP,
++    "created_by" TEXT NOT NULL,
++    "updated_at" TIMESTAMPTZ(6) NOT NULL,
++    "archived_at" TIMESTAMPTZ(6),
++
++    CONSTRAINT "locations_pkey" PRIMARY KEY ("location_id")
++);
++
++-- CreateIndex
++CREATE INDEX "locations_tenant_id_status_idx" ON "locations"("tenant_id", "status");
++
++-- CreateIndex
++CREATE UNIQUE INDEX "locations_tenant_id_location_id_key" ON "locations"("tenant_id", "location_id");
++
++-- CreateIndex
++CREATE UNIQUE INDEX "locations_tenant_id_code_key" ON "locations"("tenant_id", "code");
++
++-- AddForeignKey
++ALTER TABLE "locations" ADD CONSTRAINT "locations_tenant_id_fkey" FOREIGN KEY ("tenant_id") REFERENCES "tenants"("tenant_id") ON DELETE RESTRICT ON UPDATE CASCADE;
++
++-- Valid lifecycle status only (mirrors org_units_status_check).
++ALTER TABLE "locations" ADD CONSTRAINT "locations_status_check" CHECK (status IN ('ACTIVE', 'ARCHIVED'));
+diff --git a/prisma/schema.prisma b/prisma/schema.prisma
+index 5855239..933de45 100644
+--- a/prisma/schema.prisma
++++ b/prisma/schema.prisma
+@@ -23,6 +23,7 @@ model Tenant {
+   configurationVersions        ConfigurationVersion[]
+   orgUnits                     OrgUnit[]
+   assignments                  Assignment[]
++  locations                    Location[]
+ 
+   @@map("tenants")
+ }
+@@ -144,6 +145,38 @@ model Assignment {
+   @@map("assignments")
+ }
+ 
++/// Location — a physical or recognized work site (ADR-012 §5). A dimension
++/// orthogonal to the OrgUnit tree, not a node within it: never an OrgUnit
++/// `kind`, never owned by an OrgUnit. `id` and `code` are stable identity —
++/// immutable and never reused. A rename changes only the display name.
++/// Locations are archived, never hard-deleted; history lives in the audit
++/// trail, not in per-row versions. Address is a value object flattened onto
++/// this table (no independent lifecycle, per ADR-012 §5/§8).
++model Location {
++  id           String    @id @default(uuid()) @map("location_id")
++  tenantId     String    @map("tenant_id")
++  code         String    @map("code")
++  name         String    @map("name")
++  addressLine1 String    @map("address_line1")
++  addressLine2 String?   @map("address_line2")
++  city         String    @map("city")
++  region       String?   @map("region")
++  postalCode   String?   @map("postal_code")
++  countryCode  String    @map("country_code")
++  timezone     String    @map("timezone")
++  status       String    @default("ACTIVE") @map("status")
++  createdAt    DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
++  createdBy    String    @map("created_by")
++  updatedAt    DateTime  @updatedAt @map("updated_at") @db.Timestamptz(6)
++  archivedAt   DateTime? @map("archived_at") @db.Timestamptz(6)
++  tenant       Tenant    @relation(fields: [tenantId], references: [id], onDelete: Restrict, onUpdate: Cascade)
++
++  @@unique([tenantId, id])
++  @@unique([tenantId, code])
++  @@index([tenantId, status])
++  @@map("locations")
++}
++
+ /// The platform login identity (Epic 6 Slice 6M0.1). Deliberately separate
+ /// from Employee: Employee is HR record data, not authentication data, and
+ /// a User is not guaranteed to correspond to an Employee row.
+diff --git a/src/platform/architecture/import-boundaries.test.ts b/src/platform/architecture/import-boundaries.test.ts
+index 2e20f57..d92edd3 100644
+--- a/src/platform/architecture/import-boundaries.test.ts
++++ b/src/platform/architecture/import-boundaries.test.ts
+@@ -226,6 +226,31 @@ describe("import boundary fitness rules (fixtures prove each rule actually catch
+     const file: SourceFile = { path: "src/platform/organization/prisma-org-unit-read-repository.ts", content: `import type { PrismaClient } from "@prisma/client";\nimport { hasPermission } from "@/platform/context";\nimport type { OrgUnitReadRepository } from "@/platform/organization/org-unit-repository";\n` };
+     expect(scanImportBoundaries([file])).toHaveLength(0);
+   });
++
++  it("flags the location read repository importing the location write side (read model must stay read-only)", () => {
++    const file: SourceFile = { path: "src/platform/organization/prisma-location-read-repository.ts", content: `import { LocationService } from "@/platform/organization/location-service";\n` };
++    expect(scanImportBoundaries([file])).toContainEqual({ path: file.path, rule: "organization-read-repository-must-not-import-write-side", matchedImport: "@/platform/organization/location-service" });
++  });
++
++  it("flags a client component importing the location service (ADR-012 server composition)", () => {
++    const file: SourceFile = { path: "src/components/organization/bad-location-client.tsx", content: `"use client";\nimport { LocationService } from "@/platform/organization/location-service";\n` };
++    expect(scanImportBoundaries([file])).toContainEqual({ path: file.path, rule: "client-components-must-not-import-organization-server-composition", matchedImport: "@/platform/organization/location-service" });
++  });
++
++  it("does not flag the legitimate location read repository reading through Prisma with a permission gate", () => {
++    const file: SourceFile = { path: "src/platform/organization/prisma-location-read-repository.ts", content: `import type { PrismaClient } from "@prisma/client";\nimport { hasPermission } from "@/platform/context";\nimport type { LocationReadRepository } from "@/platform/organization/location-repository";\n` };
++    expect(scanImportBoundaries([file])).toHaveLength(0);
++  });
++
++  it("flags OrgUnit code importing Location (Location is orthogonal to the tree, never owned by OrgUnit)", () => {
++    const file: SourceFile = { path: "src/platform/organization/org-unit-service.ts", content: `import type { LocationRecord } from "@/platform/organization/location";\n` };
++    expect(scanImportBoundaries([file])).toContainEqual({ path: file.path, rule: "org-unit-must-not-import-location", matchedImport: "@/platform/organization/location" });
++  });
++
++  it("does not flag Location code importing OrgUnit-unrelated organization utilities (Location may stand alone)", () => {
++    const file: SourceFile = { path: "src/platform/organization/location-service.ts", content: `import { hasPermission } from "@/platform/context";\nimport { validateCreateLocationDraft } from "@/platform/organization/location";\n` };
++    expect(scanImportBoundaries([file])).toHaveLength(0);
++  });
+ });
+ 
+ describe("import boundary fitness rules — real codebase scan", () => {
+diff --git a/src/platform/architecture/import-boundaries.ts b/src/platform/architecture/import-boundaries.ts
+index e367733..37e4a7a 100644
+--- a/src/platform/architecture/import-boundaries.ts
++++ b/src/platform/architecture/import-boundaries.ts
+@@ -51,8 +51,12 @@ const isOrganizationCode = (file: SourceFile) => file.path.startsWith("src/platf
+ const ORGANIZATION_READ_REPOSITORY_FILES = new Set([
+   "src/platform/organization/prisma-org-unit-read-repository.ts",
+   "src/platform/organization/prisma-assignment-read-repository.ts",
++  "src/platform/organization/prisma-location-read-repository.ts",
+ ]);
+ const isOrganizationReadRepository = (file: SourceFile) => ORGANIZATION_READ_REPOSITORY_FILES.has(file.path);
++// Location is a dimension orthogonal to the OrgUnit tree (ADR-012 §5) — never
++// a node within it, never owned by it. OrgUnit code must never reach into it.
++const isOrgUnitCode = (file: SourceFile) => file.path.startsWith("src/platform/organization/org-unit");
+ 
+ const WRITE_RUNTIME_IMPORTS = [
+   /^@prisma\/client/,
+@@ -103,8 +107,8 @@ const CONFIGURATION_PERSISTENCE_IMPORTS = [
+ const WRITE_RUNTIME_MODULE_IMPORTS = [/platform\/people\/commands\//, /platform\/submissions\//, /durable-application-runtime/];
+ 
+ // The Organization write side (ADR-012). The read repository — and any client —
+-// must never reach these; writes go only through the OrgUnit/Assignment
+-// services + their UnitOfWork.
++// must never reach these; writes go only through the OrgUnit/Assignment/
++// Location services + their UnitOfWork.
+ const ORGANIZATION_WRITE_SIDE_IMPORTS = [
+   /platform\/organization\/prisma-org-unit-write-repository/,
+   /platform\/organization\/org-unit-write-transaction/,
+@@ -116,6 +120,11 @@ const ORGANIZATION_WRITE_SIDE_IMPORTS = [
+   /platform\/organization\/prisma-assignment-unit-of-work/,
+   /platform\/organization\/in-memory-assignment-unit-of-work/,
+   /platform\/organization\/assignment-service/,
++  /platform\/organization\/prisma-location-write-repository/,
++  /platform\/organization\/location-write-transaction/,
++  /platform\/organization\/prisma-location-unit-of-work/,
++  /platform\/organization\/in-memory-location-unit-of-work/,
++  /platform\/organization\/location-service/,
+ ];
+ 
+ // Server-only Organization composition a client component must never import.
+@@ -123,6 +132,7 @@ const ORGANIZATION_SERVER_ONLY_IMPORTS = [
+   ...ORGANIZATION_WRITE_SIDE_IMPORTS,
+   /platform\/organization\/prisma-org-unit-read-repository/,
+   /platform\/organization\/prisma-assignment-read-repository/,
++  /platform\/organization\/prisma-location-read-repository/,
+ ];
+ 
+ // Anything that lets a caller obtain or construct a TrustedRequestContext —
+@@ -238,6 +248,13 @@ export const RULES: Rule[] = [
+     appliesTo: isOrganizationCode,
+     forbidden: [/platform\/configuration\//],
+   },
++  {
++    // ADR-012 §5: Location is orthogonal to the OrgUnit tree, not a node in
++    // it and never owned by it — OrgUnit must never reach into Location code.
++    name: "org-unit-must-not-import-location",
++    appliesTo: isOrgUnitCode,
++    forbidden: [/platform\/organization\/location/],
++  },
+ ];
+ 
+ /** Pure scan: given source files, returns every boundary violation found. Deterministic, no filesystem access. */
+diff --git a/src/platform/organization/in-memory-location-repository.ts b/src/platform/organization/in-memory-location-repository.ts
+new file mode 100644
+index 0000000..341a1a1
+--- /dev/null
++++ b/src/platform/organization/in-memory-location-repository.ts
+@@ -0,0 +1,100 @@
++import { randomUUID } from "node:crypto";
++import { hasPermission, type TenantContext } from "@/platform/context";
++import { AuthorizationError } from "@/platform/errors";
++import type {
++  CreateLocationInput,
++  LocationReadRepository,
++  LocationWriteRepository,
++  UpdateLocationDetailsInput,
++} from "@/platform/organization/location-repository";
++import type { LocationRecord } from "@/platform/organization/location";
++
++function requireOrganizationView(context: TenantContext): void {
++  if (!hasPermission(context, "organization.view")) throw new AuthorizationError();
++}
++
++/** Shared in-process store so a test can write via one repository and read via the other. */
++export class LocationStore {
++  readonly locations: LocationRecord[] = [];
++}
++
++export class InMemoryLocationWriteRepository implements LocationWriteRepository {
++  constructor(private readonly store: LocationStore = new LocationStore()) {}
++
++  async findById(tenantId: string, id: string): Promise<LocationRecord | undefined> {
++    return this.store.locations.find((l) => l.tenantId === tenantId && l.id === id);
++  }
++
++  async findByCode(tenantId: string, code: string): Promise<LocationRecord | undefined> {
++    return this.store.locations.find((l) => l.tenantId === tenantId && l.code === code);
++  }
++
++  async create(input: CreateLocationInput): Promise<LocationRecord> {
++    const now = new Date().toISOString();
++    const location: LocationRecord = Object.freeze({
++      id: randomUUID(),
++      tenantId: input.tenantId,
++      code: input.code,
++      name: input.name,
++      address: input.address,
++      countryCode: input.countryCode,
++      timezone: input.timezone,
++      status: "ACTIVE" as const,
++      createdAt: now,
++      createdBy: input.createdBy,
++      updatedAt: now,
++    });
++    this.store.locations.push(location);
++    return location;
++  }
++
++  async updateDetails(input: UpdateLocationDetailsInput): Promise<LocationRecord> {
++    return this.replace(input.tenantId, input.id, (l) => ({
++      ...l,
++      name: input.name,
++      address: input.address,
++      countryCode: input.countryCode,
++      timezone: input.timezone,
++    }));
++  }
++
++  async archive(tenantId: string, id: string): Promise<LocationRecord> {
++    return this.replace(tenantId, id, (l) => ({ ...l, status: "ARCHIVED" as const, archivedAt: new Date().toISOString() }));
++  }
++
++  private replace(tenantId: string, id: string, mutate: (l: LocationRecord) => LocationRecord): LocationRecord {
++    const index = this.store.locations.findIndex((l) => l.tenantId === tenantId && l.id === id);
++    if (index === -1) throw new Error(`location ${id} not found for tenant ${tenantId}`);
++    const updated = Object.freeze({ ...mutate(this.store.locations[index]), updatedAt: new Date(Date.now() + 1).toISOString() });
++    this.store.locations[index] = updated;
++    return updated;
++  }
++}
++
++export class InMemoryLocationReadRepository implements LocationReadRepository {
++  constructor(private readonly store: LocationStore) {}
++
++  async getById(context: TenantContext, id: string): Promise<LocationRecord | undefined> {
++    requireOrganizationView(context);
++    return this.store.locations.find((l) => l.tenantId === context.tenantId && l.id === id);
++  }
++
++  async getByCode(context: TenantContext, code: string): Promise<LocationRecord | undefined> {
++    requireOrganizationView(context);
++    return this.store.locations.find((l) => l.tenantId === context.tenantId && l.code === code);
++  }
++
++  async listActive(context: TenantContext): Promise<LocationRecord[]> {
++    requireOrganizationView(context);
++    return this.store.locations
++      .filter((l) => l.tenantId === context.tenantId && l.status === "ACTIVE")
++      .sort((a, b) => a.name.localeCompare(b.name) || a.code.localeCompare(b.code));
++  }
++
++  async listAll(context: TenantContext): Promise<LocationRecord[]> {
++    requireOrganizationView(context);
++    return this.store.locations
++      .filter((l) => l.tenantId === context.tenantId)
++      .sort((a, b) => a.name.localeCompare(b.name) || a.code.localeCompare(b.code));
++  }
++}
+diff --git a/src/platform/organization/in-memory-location-unit-of-work.ts b/src/platform/organization/in-memory-location-unit-of-work.ts
+new file mode 100644
+index 0000000..12014d1
+--- /dev/null
++++ b/src/platform/organization/in-memory-location-unit-of-work.ts
+@@ -0,0 +1,55 @@
++import { randomUUID } from "node:crypto";
++import type { UnitOfWork, UnitOfWorkContext, UnitOfWorkTransaction } from "@/platform/transactions/unit-of-work";
++import { InMemoryDomainEventCollector, type DomainEventCollector } from "@/platform/events/domain-event-collector";
++import { InMemoryAuditCollector, type AuditCollector } from "@/platform/auditing/audit-collector";
++import { AuditRecordFactory } from "@/platform/auditing/audit-record-factory";
++import { ServerAuditIdGenerator } from "@/platform/auditing/audit-record";
++import { LocationStore, InMemoryLocationWriteRepository } from "@/platform/organization/in-memory-location-repository";
++import { LocationWriteTransaction } from "@/platform/organization/location-write-transaction";
++import type { LocationTransactionRepositories } from "@/platform/organization/location-repository";
++
++/** In-memory transaction coordinator for server-side tests and development only. */
++export class InMemoryLocationUnitOfWork implements UnitOfWork<LocationTransactionRepositories> {
++  constructor(
++    private readonly store: LocationStore = new LocationStore(),
++    private readonly eventCollector: DomainEventCollector = new InMemoryDomainEventCollector(),
++    private readonly auditCollector: AuditCollector = new InMemoryAuditCollector(),
++    private readonly auditRecords: AuditRecordFactory = new AuditRecordFactory(new ServerAuditIdGenerator(), { now: () => new Date().toISOString() }),
++    private readonly transactionIds: { next(): string } = { next: () => randomUUID() },
++  ) {}
++
++  getStore(): LocationStore { return this.store; }
++
++  async execute<TResult>(
++    context: UnitOfWorkContext,
++    operation: (transaction: UnitOfWorkTransaction<LocationTransactionRepositories>) => Promise<TResult>,
++  ): Promise<TResult> {
++    const transactionContext = Object.freeze({ ...context, transactionId: this.transactionIds.next() });
++    const snapshot = [...this.store.locations];
++    const locations = new LocationWriteTransaction(new InMemoryLocationWriteRepository(this.store), transactionContext);
++    const transaction = Object.freeze({ context: transactionContext, repositories: Object.freeze({ locations }) });
++
++    try {
++      const result = await operation(transaction);
++      const events = locations.pullEvents();
++      this.eventCollector.collect(events);
++      const { actorUserId, requestId, commandName } = transactionContext;
++      if (actorUserId && requestId && commandName) {
++        this.auditCollector.collect(events.map((event) => this.auditRecords.organizationEvent({
++          tenantId: transactionContext.tenantId,
++          actorUserId,
++          requestId,
++          correlationId: transactionContext.correlationId,
++          transactionId: transactionContext.transactionId,
++          commandName,
++        }, event)));
++      }
++      return result;
++    } catch (error) {
++      this.store.locations.length = 0;
++      this.store.locations.push(...snapshot);
++      locations.clearEvents();
++      throw error;
++    }
++  }
++}
+diff --git a/src/platform/organization/location-events.ts b/src/platform/organization/location-events.ts
+new file mode 100644
+index 0000000..ab5079c
+--- /dev/null
++++ b/src/platform/organization/location-events.ts
+@@ -0,0 +1,41 @@
++import { createDomainEvent, type DomainEvent, type DomainEventClock, type EventIdGenerator } from "@/platform/events/domain-event";
++import type { LocationRecord } from "@/platform/organization/location";
++
++type EventContext = Readonly<{ tenantId: string; correlationId: string }>;
++
++function locationEvent(
++  eventName: string,
++  location: LocationRecord,
++  context: EventContext,
++  ids: EventIdGenerator,
++  clock: DomainEventClock,
++): DomainEvent {
++  return createDomainEvent({
++    eventName,
++    aggregateType: "location",
++    aggregateId: location.id,
++    tenantId: context.tenantId,
++    correlationId: context.correlationId,
++    requestId: context.correlationId,
++    version: 1,
++    payload: {
++      locationId: location.id,
++      code: location.code,
++      countryCode: location.countryCode,
++      timezone: location.timezone,
++      status: location.status,
++    },
++  }, ids, clock);
++}
++
++export function createLocationCreatedEvent(location: LocationRecord, context: EventContext, ids: EventIdGenerator, clock: DomainEventClock): DomainEvent {
++  return locationEvent("organization.location.created", location, context, ids, clock);
++}
++
++export function createLocationUpdatedEvent(location: LocationRecord, context: EventContext, ids: EventIdGenerator, clock: DomainEventClock): DomainEvent {
++  return locationEvent("organization.location.updated", location, context, ids, clock);
++}
++
++export function createLocationArchivedEvent(location: LocationRecord, context: EventContext, ids: EventIdGenerator, clock: DomainEventClock): DomainEvent {
++  return locationEvent("organization.location.archived", location, context, ids, clock);
++}
+diff --git a/src/platform/organization/location-platform.integration.test.ts b/src/platform/organization/location-platform.integration.test.ts
+new file mode 100644
+index 0000000..c4accfe
+--- /dev/null
++++ b/src/platform/organization/location-platform.integration.test.ts
+@@ -0,0 +1,119 @@
++import { randomUUID } from "node:crypto";
++import { afterAll, describe, expect, it } from "vitest";
++import { getPrismaClient } from "@/platform/persistence/prisma-client";
++import { PrismaLocationUnitOfWork } from "@/platform/organization/prisma-location-unit-of-work";
++import { PrismaLocationReadRepository } from "@/platform/organization/prisma-location-read-repository";
++import { InMemoryDomainEventCollector } from "@/platform/events/domain-event-collector";
++import { InMemoryAuditCollector } from "@/platform/auditing/audit-collector";
++import { LocationService } from "@/platform/organization/location-service";
++import { createTrustedRequestContext } from "@/platform/runtime-context";
++import { PermissionSet, type TenantContext } from "@/platform/context";
++
++/**
++ * Real-Postgres coverage for what an in-memory suite cannot verify: actual
++ * $transaction atomicity (location + audit + outbox commit together), the
++ * DB-level guards (status CHECK, tenant-scoped unique code), and real
++ * tenant-isolated queries.
++ */
++describe("location platform (integration)", () => {
++  const prisma = getPrismaClient();
++  const tenantA = `test-tenant-7b3-${randomUUID()}`;
++  const tenantB = `test-tenant-7b3-${randomUUID()}`;
++
++  afterAll(async () => {
++    await prisma.location.deleteMany({ where: { tenantId: { in: [tenantA, tenantB] } } }).catch(() => undefined);
++    await prisma.tenant.deleteMany({ where: { id: { in: [tenantA, tenantB] } } }).catch(() => undefined);
++  });
++
++  async function seedTenant(tenantId: string) {
++    await prisma.tenant.upsert({ where: { id: tenantId }, create: { id: tenantId }, update: {} });
++  }
++
++  function request(tenantId: string) {
++    return createTrustedRequestContext({
++      principal: { subjectId: "s", userId: "user-1", tenantId, authenticationMethod: "test", authenticatedAt: "2026-01-01T00:00:00.000Z" },
++      roles: ["hr_admin"],
++      permissions: ["organization.view", "organization.manage"],
++      actorProvenance: "server_verified",
++      correlationId: "corr-1",
++    });
++  }
++
++  function readContext(tenantId: string): TenantContext {
++    return { tenantId, actorId: "user-1", actorName: "A", roles: ["hr_admin"], permissions: new PermissionSet(["organization.view"]), correlationId: "c", authenticationMethod: "test", actorProvenance: "server_verified" };
++  }
++
++  const address = { line1: "123 Ayala Ave", city: "Makati" };
++
++  it("commits the location, audit record, and outbox message atomically on create", async () => {
++    await seedTenant(tenantA);
++    const events = new InMemoryDomainEventCollector();
++    const audit = new InMemoryAuditCollector();
++    const service = new LocationService(new PrismaLocationUnitOfWork(prisma, events, audit));
++
++    const code = `HQ-${randomUUID().slice(0, 8)}`.toUpperCase();
++    const result = await service.createLocation(request(tenantA), { code, name: "Head Office", address, countryCode: "PH", timezone: "Asia/Manila" });
++    expect(result.kind).toBe("success");
++    if (result.kind !== "success") return;
++
++    const dbLocation = await prisma.location.findUniqueOrThrow({ where: { id: result.value.location.id } });
++    expect(dbLocation.countryCode).toBe("PH");
++    const dbAudit = await prisma.auditRecord.findFirst({ where: { aggregateId: result.value.location.id, eventName: "organization.location.created" } });
++    expect(dbAudit).not.toBeNull();
++    const dbOutbox = await prisma.outboxMessage.findFirst({ where: { aggregateId: result.value.location.id, eventName: "organization.location.created" } });
++    expect(dbOutbox).not.toBeNull();
++    expect(dbOutbox?.tenantId).toBe(tenantA);
++  });
++
++  it("the database rejects an invalid status (DB-level guard)", async () => {
++    await seedTenant(tenantA);
++    const id = randomUUID();
++    await expect(prisma.location.create({
++      data: { id, tenantId: tenantA, code: `BAD-${id.slice(0, 6)}`, name: "Bad", addressLine1: address.line1, city: address.city, countryCode: "PH", timezone: "Asia/Manila", status: "CLOSED", createdBy: "tester" },
++    })).rejects.toThrow();
++  });
++
++  it("the database rejects a duplicate code within a tenant", async () => {
++    await seedTenant(tenantA);
++    const code = `UNIQ-${randomUUID().slice(0, 8)}`.toUpperCase();
++    await prisma.location.create({ data: { tenantId: tenantA, code, name: "One", addressLine1: address.line1, city: address.city, countryCode: "PH", timezone: "Asia/Manila", createdBy: "tester" } });
++    await expect(prisma.location.create({
++      data: { tenantId: tenantA, code, name: "Two", addressLine1: address.line1, city: address.city, countryCode: "PH", timezone: "Asia/Manila", createdBy: "tester" },
++    })).rejects.toThrow();
++  });
++
++  it("a full real lifecycle: create, update details, archive, and read back correctly", async () => {
++    await seedTenant(tenantA);
++    const service = new LocationService(new PrismaLocationUnitOfWork(prisma, new InMemoryDomainEventCollector(), new InMemoryAuditCollector()));
++    const code = `LC-${randomUUID().slice(0, 8)}`.toUpperCase();
++    const created = await service.createLocation(request(tenantA), { code, name: "Satellite Office", address, countryCode: "PH", timezone: "Asia/Manila" });
++    if (created.kind !== "success") throw new Error("create failed");
++
++    const updated = await service.updateLocationDetails(request(tenantA), { id: created.value.location.id, name: "Satellite Office 2", address: { line1: "456 Ayala Ave", city: "Makati" }, countryCode: "PH", timezone: "Asia/Singapore" });
++    expect(updated.kind).toBe("success");
++
++    const archived = await service.archiveLocation(request(tenantA), { id: created.value.location.id });
++    expect(archived.kind).toBe("success");
++    if (archived.kind !== "success") return;
++    expect(archived.value.location.status).toBe("ARCHIVED");
++
++    const reader = new PrismaLocationReadRepository(prisma);
++    expect(await reader.listActive(readContext(tenantA))).not.toContainEqual(expect.objectContaining({ id: created.value.location.id }));
++    const all = await reader.listAll(readContext(tenantA));
++    expect(all.find((l) => l.id === created.value.location.id)?.name).toBe("Satellite Office 2");
++  });
++
++  it("keeps locations strictly tenant-isolated in reads", async () => {
++    await seedTenant(tenantA);
++    await seedTenant(tenantB);
++    const service = new LocationService(new PrismaLocationUnitOfWork(prisma, new InMemoryDomainEventCollector(), new InMemoryAuditCollector()));
++    const code = `ISO-${randomUUID().slice(0, 8)}`.toUpperCase();
++    const created = await service.createLocation(request(tenantA), { code, name: "A only", address, countryCode: "PH", timezone: "Asia/Manila" });
++    if (created.kind !== "success") throw new Error("create failed");
++
++    const reader = new PrismaLocationReadRepository(prisma);
++    expect(await reader.getByCode(readContext(tenantA), code)).toBeDefined();
++    expect(await reader.getByCode(readContext(tenantB), code)).toBeUndefined();
++    expect(await reader.getById(readContext(tenantB), created.value.location.id)).toBeUndefined();
++  });
++});
+diff --git a/src/platform/organization/location-repository.ts b/src/platform/organization/location-repository.ts
+new file mode 100644
+index 0000000..3093674
+--- /dev/null
++++ b/src/platform/organization/location-repository.ts
+@@ -0,0 +1,51 @@
++import type { TenantContext } from "@/platform/context";
++import type { Address, LocationRecord } from "@/platform/organization/location";
++
++export interface CreateLocationInput {
++  tenantId: string;
++  code: string;
++  name: string;
++  address: Address;
++  countryCode: string;
++  timezone: string;
++  createdBy: string;
++}
++
++export interface UpdateLocationDetailsInput {
++  tenantId: string;
++  id: string;
++  name: string;
++  address: Address;
++  countryCode: string;
++  timezone: string;
++}
++
++/**
++ * Server-only write port for locations. Used only inside a tenant-scoped
++ * write transaction. `id` and `code` are immutable — there is deliberately no
++ * method to change them. There is no delete: a location is archived, never
++ * removed, so identifiers are never reused.
++ */
++export interface LocationWriteRepository {
++  findById(tenantId: string, id: string): Promise<LocationRecord | undefined>;
++  findByCode(tenantId: string, code: string): Promise<LocationRecord | undefined>;
++  create(input: CreateLocationInput): Promise<LocationRecord>;
++  updateDetails(input: UpdateLocationDetailsInput): Promise<LocationRecord>;
++  archive(tenantId: string, id: string): Promise<LocationRecord>;
++}
++
++/** Transaction-scoped repositories exposed to the location write service via UnitOfWork.execute(). */
++export type LocationTransactionRepositories = Readonly<{ locations: LocationWriteRepository }>;
++
++/**
++ * Server-only read port. Read-only, tenant-scoped, used outside any write
++ * transaction. Every method requires organization.view.
++ */
++export interface LocationReadRepository {
++  getById(context: TenantContext, id: string): Promise<LocationRecord | undefined>;
++  getByCode(context: TenantContext, code: string): Promise<LocationRecord | undefined>;
++  /** Only ACTIVE locations — the default listing for any picker/roster consumer. */
++  listActive(context: TenantContext): Promise<LocationRecord[]>;
++  /** Every location regardless of status, for history/audit-style views. */
++  listAll(context: TenantContext): Promise<LocationRecord[]>;
++}
+diff --git a/src/platform/organization/location-service.test.ts b/src/platform/organization/location-service.test.ts
+new file mode 100644
+index 0000000..7964035
+--- /dev/null
++++ b/src/platform/organization/location-service.test.ts
+@@ -0,0 +1,172 @@
++import { describe, expect, it } from "vitest";
++import { createTrustedRequestContext, type TrustedRequestContext } from "@/platform/runtime-context";
++import type { Permission, PlatformRole } from "@/platform/context";
++import { InMemoryAuditCollector } from "@/platform/auditing/audit-collector";
++import { InMemoryDomainEventCollector } from "@/platform/events/domain-event-collector";
++import { InMemoryLocationUnitOfWork } from "@/platform/organization/in-memory-location-unit-of-work";
++import { InMemoryLocationReadRepository } from "@/platform/organization/in-memory-location-repository";
++import { LocationService } from "@/platform/organization/location-service";
++
++function requestFor(roles: readonly PlatformRole[], permissions: readonly Permission[] = [], tenantId = "tenant-a"): TrustedRequestContext {
++  return createTrustedRequestContext({
++    principal: { subjectId: "s-1", userId: "user-1", tenantId, authenticationMethod: "test", authenticatedAt: "2026-01-01T00:00:00.000Z" },
++    roles,
++    permissions,
++    actorProvenance: "server_verified",
++    correlationId: "corr-1",
++  });
++}
++
++const MANAGE: Permission[] = ["organization.view", "organization.manage"];
++const VALID_ADDRESS = { line1: "123 Ayala Ave", city: "Makati" };
++
++function harness() {
++  const audit = new InMemoryAuditCollector();
++  const events = new InMemoryDomainEventCollector();
++  const unitOfWork = new InMemoryLocationUnitOfWork(undefined, events, audit);
++  const service = new LocationService(unitOfWork);
++  const reader = new InMemoryLocationReadRepository(unitOfWork.getStore());
++  const readContext = (tenantId: string) => ({ tenantId, actorId: "user-1", actorName: "A", roles: ["hr_admin"] as PlatformRole[], permissions: { has: () => true, toArray: () => [] } as never, correlationId: "c", authenticationMethod: "test", actorProvenance: "server_verified" as const });
++  return { service, audit, events, unitOfWork, reader, readContext };
++}
++
++describe("LocationService — authorization", () => {
++  it("denies create without organization.manage", async () => {
++    const { service } = harness();
++    const result = await service.createLocation(requestFor(["employee"], []), { code: "HQ", name: "Head Office", address: VALID_ADDRESS, countryCode: "PH", timezone: "Asia/Manila" });
++    expect(result.kind).toBe("authorization_failure");
++  });
++
++  it("denies update and archive without organization.manage", async () => {
++    const { service } = harness();
++    const request = requestFor(["payroll"], ["organization.view"]);
++    expect((await service.updateLocationDetails(request, { id: "x", name: "X", address: VALID_ADDRESS, countryCode: "PH", timezone: "Asia/Manila" })).kind).toBe("authorization_failure");
++    expect((await service.archiveLocation(request, { id: "x" })).kind).toBe("authorization_failure");
++  });
++});
++
++describe("LocationService — create", () => {
++  it("creates a location and audits + emits an outbox-eligible event", async () => {
++    const { service, audit, events } = harness();
++    const result = await service.createLocation(requestFor(["hr_admin"], MANAGE), { code: "HQ", name: "Head Office", address: VALID_ADDRESS, countryCode: "PH", timezone: "Asia/Manila" });
++    expect(result.kind).toBe("success");
++    if (result.kind === "success") {
++      expect(result.value.location.code).toBe("HQ");
++      expect(result.value.location.status).toBe("ACTIVE");
++    }
++    expect(events.list().map((e) => e.eventName)).toEqual(["organization.location.created"]);
++    expect(audit.list()).toHaveLength(1);
++    expect(audit.list()[0].metadata).toHaveProperty("code", "HQ");
++  });
++
++  it("rejects a duplicate code as a conflict", async () => {
++    const { service } = harness();
++    const request = requestFor(["hr_admin"], MANAGE);
++    await service.createLocation(request, { code: "HQ", name: "Head Office", address: VALID_ADDRESS, countryCode: "PH", timezone: "Asia/Manila" });
++    const dup = await service.createLocation(request, { code: "HQ", name: "Head Office 2", address: VALID_ADDRESS, countryCode: "PH", timezone: "Asia/Manila" });
++    expect(dup.kind).toBe("conflict");
++  });
++
++  it("returns validation failure for an unrecognized time zone without writing", async () => {
++    const { service, unitOfWork } = harness();
++    const result = await service.createLocation(requestFor(["hr_admin"], MANAGE), { code: "HQ", name: "Head Office", address: VALID_ADDRESS, countryCode: "PH", timezone: "not/a/zone" });
++    expect(result.kind).toBe("validation_failure");
++    expect(unitOfWork.getStore().locations).toHaveLength(0);
++  });
++});
++
++describe("LocationService — updateLocationDetails", () => {
++  async function seedLocation() {
++    const h = harness();
++    const request = requestFor(["hr_admin"], MANAGE);
++    const created = await h.service.createLocation(request, { code: "HQ", name: "Head Office", address: VALID_ADDRESS, countryCode: "PH", timezone: "Asia/Manila" });
++    if (created.kind !== "success") throw new Error("seed failed");
++    return { ...h, request, id: created.value.location.id };
++  }
++
++  it("updates descriptive attributes (name changes, code and id stay as immutable identity)", async () => {
++    const { service, request, id, events } = await seedLocation();
++    const result = await service.updateLocationDetails(request, { id, name: "Head Office Tower", address: { line1: "456 Ayala Ave", city: "Makati" }, countryCode: "PH", timezone: "Asia/Singapore" });
++    expect(result.kind).toBe("success");
++    if (result.kind === "success") {
++      expect(result.value.location.name).toBe("Head Office Tower");
++      expect(result.value.location.id).toBe(id);
++      expect(result.value.location.code).toBe("HQ");
++      expect(result.value.location.timezone).toBe("Asia/Singapore");
++    }
++    expect(events.list().some((e) => e.eventName === "organization.location.updated")).toBe(true);
++  });
++
++  it("rejects updating a location that no longer exists", async () => {
++    const { service, request } = await seedLocation();
++    const result = await service.updateLocationDetails(request, { id: "ghost", name: "X", address: VALID_ADDRESS, countryCode: "PH", timezone: "Asia/Manila" });
++    expect(result.kind).toBe("validation_failure");
++  });
++});
++
++describe("LocationService — archiveLocation", () => {
++  it("archives a location (soft lifecycle — never a hard delete)", async () => {
++    const h = harness();
++    const request = requestFor(["hr_admin"], MANAGE);
++    const created = await h.service.createLocation(request, { code: "HQ", name: "Head Office", address: VALID_ADDRESS, countryCode: "PH", timezone: "Asia/Manila" });
++    if (created.kind !== "success") throw new Error("seed failed");
++
++    const result = await h.service.archiveLocation(request, { id: created.value.location.id });
++    expect(result.kind).toBe("success");
++    if (result.kind === "success") {
++      expect(result.value.location.status).toBe("ARCHIVED");
++      expect(result.value.location.archivedAt).toBeDefined();
++    }
++    expect(h.events.list().some((e) => e.eventName === "organization.location.archived")).toBe(true);
++  });
++
++  it("rejects archiving an already-archived location as a conflict", async () => {
++    const h = harness();
++    const request = requestFor(["hr_admin"], MANAGE);
++    const created = await h.service.createLocation(request, { code: "HQ", name: "Head Office", address: VALID_ADDRESS, countryCode: "PH", timezone: "Asia/Manila" });
++    if (created.kind !== "success") throw new Error("seed failed");
++    await h.service.archiveLocation(request, { id: created.value.location.id });
++    const again = await h.service.archiveLocation(request, { id: created.value.location.id });
++    expect(again.kind).toBe("conflict");
++  });
++
++  it("an archived location is excluded from active-only listings but remains resolvable by id", async () => {
++    const h = harness();
++    const request = requestFor(["hr_admin"], MANAGE);
++    const created = await h.service.createLocation(request, { code: "HQ", name: "Head Office", address: VALID_ADDRESS, countryCode: "PH", timezone: "Asia/Manila" });
++    if (created.kind !== "success") throw new Error("seed failed");
++    await h.service.archiveLocation(request, { id: created.value.location.id });
++
++    const context = h.readContext("tenant-a");
++    expect(await h.reader.listActive(context)).toHaveLength(0);
++    expect(await h.reader.listAll(context)).toHaveLength(1);
++    expect((await h.reader.getById(context, created.value.location.id))?.status).toBe("ARCHIVED");
++  });
++});
++
++describe("LocationService — tenant isolation", () => {
++  it("does not let tenant B update or read tenant A's location", async () => {
++    const { service, reader } = harness();
++    const created = await service.createLocation(requestFor(["hr_admin"], MANAGE, "tenant-a"), { code: "HQ", name: "Head Office", address: VALID_ADDRESS, countryCode: "PH", timezone: "Asia/Manila" });
++    if (created.kind !== "success") throw new Error("create failed");
++
++    const asB = requestFor(["hr_admin"], MANAGE, "tenant-b");
++    const update = await service.updateLocationDetails(asB, { id: created.value.location.id, name: "Hijacked", address: VALID_ADDRESS, countryCode: "PH", timezone: "Asia/Manila" });
++    expect(update.kind).toBe("validation_failure");
++
++    const bContext = { tenantId: "tenant-b", actorId: "u", actorName: "u", roles: ["hr_admin"] as PlatformRole[], permissions: { has: () => true, toArray: () => [] } as never, correlationId: "c", authenticationMethod: "test", actorProvenance: "server_verified" as const };
++    expect(await reader.getById(bContext, created.value.location.id)).toBeUndefined();
++  });
++});
++
++describe("LocationService — transaction rollback", () => {
++  it("releases no events/audit when the operation is rejected before writing (duplicate code)", async () => {
++    const { service, audit, events } = harness();
++    const request = requestFor(["hr_admin"], MANAGE);
++    await service.createLocation(request, { code: "HQ", name: "Head Office", address: VALID_ADDRESS, countryCode: "PH", timezone: "Asia/Manila" });
++    const before = { events: events.list().length, audit: audit.list().length };
++    await service.createLocation(request, { code: "HQ", name: "Dup", address: VALID_ADDRESS, countryCode: "PH", timezone: "Asia/Manila" });
++    expect(events.list()).toHaveLength(before.events);
++    expect(audit.list()).toHaveLength(before.audit);
++  });
++});
+diff --git a/src/platform/organization/location-service.ts b/src/platform/organization/location-service.ts
+new file mode 100644
+index 0000000..30c9877
+--- /dev/null
++++ b/src/platform/organization/location-service.ts
+@@ -0,0 +1,108 @@
++import { hasPermission } from "@/platform/context";
++import { commandAuthorizationFailure, commandConflict, commandSuccess, commandValidationFailure, type CommandResult } from "@/platform/commands/command-result";
++import { issue } from "@/platform/validation";
++import { createTenantContext, type TrustedRequestContext } from "@/platform/runtime-context";
++import type { UnitOfWork, UnitOfWorkContext } from "@/platform/transactions/unit-of-work";
++import type { LocationTransactionRepositories } from "@/platform/organization/location-repository";
++import { validateCreateLocationDraft, validateUpdateLocationDetails, type AddressInput, type LocationRecord } from "@/platform/organization/location";
++
++export type LocationCreated = Readonly<{ state: "created"; location: LocationRecord }>;
++export type LocationUpdated = Readonly<{ state: "updated"; location: LocationRecord }>;
++export type LocationArchived = Readonly<{ state: "archived"; location: LocationRecord }>;
++
++/**
++ * The single write entry point for locations. It owns the invariant that must
++ * be enforced against live data *inside the write transaction* — unique code
++ * per tenant — and produces audit and outbox atomically through the
++ * UnitOfWork. Every mutation requires organization.manage; tenant identity
++ * comes only from the trusted request.
++ */
++export class LocationService {
++  constructor(private readonly unitOfWork: UnitOfWork<LocationTransactionRepositories>) {}
++
++  async createLocation(
++    request: TrustedRequestContext,
++    input: { code: string; name: string; address: AddressInput; countryCode: string; timezone: string },
++  ): Promise<CommandResult<LocationCreated>> {
++    const denied = this.requireManage(request);
++    if (denied) return denied;
++    const validation = validateCreateLocationDraft(input);
++    if (!validation.success) return commandValidationFailure(validation.issues);
++
++    const tenantId = request.principal.tenantId;
++    const result = await this.unitOfWork.execute(this.context(request, "CreateLocation"), async ({ repositories }) => {
++      if (await repositories.locations.findByCode(tenantId, validation.data.code)) return "code_taken" as const;
++      return repositories.locations.create({
++        tenantId,
++        code: validation.data.code,
++        name: validation.data.name,
++        address: validation.data.address,
++        countryCode: validation.data.countryCode,
++        timezone: validation.data.timezone,
++        createdBy: request.principal.userId,
++      });
++    });
++
++    if (result === "code_taken") return commandConflict(`A location with code "${validation.data.code}" already exists.`);
++    return commandSuccess(Object.freeze({ state: "created" as const, location: result }));
++  }
++
++  async updateLocationDetails(
++    request: TrustedRequestContext,
++    input: { id: string; name: string; address: AddressInput; countryCode: string; timezone: string },
++  ): Promise<CommandResult<LocationUpdated>> {
++    const denied = this.requireManage(request);
++    if (denied) return denied;
++    const validation = validateUpdateLocationDetails(input);
++    if (!validation.success) return commandValidationFailure(validation.issues);
++
++    const tenantId = request.principal.tenantId;
++    const result = await this.unitOfWork.execute(this.context(request, "UpdateLocationDetails"), async ({ repositories }) => {
++      if (!(await repositories.locations.findById(tenantId, input.id))) return "not_found" as const;
++      return repositories.locations.updateDetails({
++        tenantId,
++        id: input.id,
++        name: validation.data.name,
++        address: validation.data.address,
++        countryCode: validation.data.countryCode,
++        timezone: validation.data.timezone,
++      });
++    });
++
++    if (result === "not_found") return commandValidationFailure([issue("id", "not_found", "This location no longer exists.")]);
++    return commandSuccess(Object.freeze({ state: "updated" as const, location: result }));
++  }
++
++  async archiveLocation(request: TrustedRequestContext, input: { id: string }): Promise<CommandResult<LocationArchived>> {
++    const denied = this.requireManage(request);
++    if (denied) return denied;
++
++    const tenantId = request.principal.tenantId;
++    const result = await this.unitOfWork.execute(this.context(request, "ArchiveLocation"), async ({ repositories }) => {
++      const existing = await repositories.locations.findById(tenantId, input.id);
++      if (!existing) return "not_found" as const;
++      if (existing.status === "ARCHIVED") return "already_archived" as const;
++      return repositories.locations.archive(tenantId, input.id);
++    });
++
++    if (result === "not_found") return commandValidationFailure([issue("id", "not_found", "This location no longer exists.")]);
++    if (result === "already_archived") return commandConflict("This location is already archived.");
++    return commandSuccess(Object.freeze({ state: "archived" as const, location: result }));
++  }
++
++  private requireManage(request: TrustedRequestContext): CommandResult<never> | undefined {
++    return hasPermission(createTenantContext(request), "organization.manage")
++      ? undefined
++      : commandAuthorizationFailure("You are not authorized to manage locations.");
++  }
++
++  private context(request: TrustedRequestContext, commandName: string): UnitOfWorkContext {
++    return {
++      tenantId: request.principal.tenantId,
++      correlationId: request.correlationId,
++      requestId: request.correlationId,
++      actorUserId: request.principal.userId,
++      commandName,
++    };
++  }
++}
+diff --git a/src/platform/organization/location-structure.test.ts b/src/platform/organization/location-structure.test.ts
+new file mode 100644
+index 0000000..1b00cbc
+--- /dev/null
++++ b/src/platform/organization/location-structure.test.ts
+@@ -0,0 +1,63 @@
++import { readFileSync, readdirSync } from "node:fs";
++import { join, relative } from "node:path";
++import { describe, expect, it } from "vitest";
++import { ORG_UNIT_KINDS } from "@/platform/organization/org-unit";
++
++/**
++ * Structural guards (ADR-012 §5): there is exactly ONE Location aggregate and
++ * ONE write entry point, Location is never modeled as an OrgUnit `kind`, and
++ * Employee.workLocation stays legacy — it must never regain authoritative
++ * status by being re-declared as a source of truth elsewhere.
++ */
++const REPO_ROOT = join(__dirname, "..", "..", "..");
++
++function sourceFiles(): { path: string; content: string }[] {
++  const walk = (dir: string): string[] =>
++    readdirSync(dir, { withFileTypes: true }).flatMap((entry) => {
++      const full = join(dir, entry.name);
++      if (entry.isDirectory()) return entry.name === "node_modules" || entry.name === ".next" ? [] : walk(full);
++      if (/\.(ts|tsx)$/.test(entry.name) && !/\.test\.tsx?$/.test(entry.name)) return [full];
++      return [];
++    });
++  return walk(join(REPO_ROOT, "src")).map((absolute) => ({
++    path: relative(REPO_ROOT, absolute).split("\\").join("/"),
++    content: readFileSync(absolute, "utf8"),
++  }));
++}
++
++describe("a single Location aggregate, orthogonal to OrgUnit", () => {
++  const files = sourceFiles();
++
++  it("declares the LocationRecord aggregate in exactly one file", () => {
++    const declarers = files.filter((f) => /(export\s+)?interface\s+LocationRecord\b/.test(f.content));
++    expect(declarers.map((f) => f.path)).toEqual(["src/platform/organization/location.ts"]);
++  });
++
++  it("declares the single write entry point (LocationService) in exactly one file", () => {
++    const services = files.filter((f) => /(export\s+)?class\s+LocationService\b/.test(f.content));
++    expect(services.map((f) => f.path)).toEqual(["src/platform/organization/location-service.ts"]);
++  });
++
++  it("keeps all Location domain code within the organization domain (no Location aggregate leaks into other domains)", () => {
++    const foreign = files.filter((f) => /interface\s+LocationRecord\b/.test(f.content) && !f.path.startsWith("src/platform/organization/"));
++    expect(foreign).toEqual([]);
++  });
++
++  it("never models Location as an OrgUnit kind", () => {
++    expect(ORG_UNIT_KINDS as readonly string[]).not.toContain("LOCATION");
++  });
++
++  it("gives OrgUnit no location-owning field (no locationId/locations on the OrgUnit record)", () => {
++    const orgUnitFile = files.find((f) => f.path === "src/platform/organization/org-unit.ts");
++    expect(orgUnitFile).toBeDefined();
++    expect(orgUnitFile!.content).not.toMatch(/\blocationId\b/);
++  });
++});
++
++describe("Employee.workLocation stays legacy", () => {
++  it("does not reintroduce a legacy-locations join or backfill from Employee.workLocation in this slice", () => {
++    const files = sourceFiles();
++    const backfill = files.filter((f) => f.path.startsWith("src/platform/organization/") && /workLocation/.test(f.content));
++    expect(backfill).toEqual([]);
++  });
++});
+diff --git a/src/platform/organization/location-write-transaction.ts b/src/platform/organization/location-write-transaction.ts
+new file mode 100644
+index 0000000..3d05dfb
+--- /dev/null
++++ b/src/platform/organization/location-write-transaction.ts
+@@ -0,0 +1,77 @@
++import { ServerEventIdGenerator, type DomainEvent, type DomainEventClock, type EventIdGenerator } from "@/platform/events/domain-event";
++import type { UnitOfWorkTransactionContext } from "@/platform/transactions/unit-of-work";
++import type {
++  CreateLocationInput,
++  LocationWriteRepository,
++  UpdateLocationDetailsInput,
++} from "@/platform/organization/location-repository";
++import type { LocationRecord } from "@/platform/organization/location";
++import {
++  createLocationArchivedEvent,
++  createLocationCreatedEvent,
++  createLocationUpdatedEvent,
++} from "@/platform/organization/location-events";
++
++const systemClock: DomainEventClock = { now: () => new Date().toISOString() };
++
++/**
++ * Transaction-scoped decorator around a LocationWriteRepository that buffers
++ * one DomainEvent per successful mutation, mirroring the OrgUnit/Assignment
++ * pattern so the Location UnitOfWork can commit writes, audits, and outbox
++ * messages atomically and release events only after that commit succeeds.
++ * Read methods (findById/findByCode) pass through and emit no event.
++ */
++export class LocationWriteTransaction implements LocationWriteRepository {
++  private readonly events: DomainEvent[] = [];
++
++  constructor(
++    private readonly repository: LocationWriteRepository,
++    private readonly context: UnitOfWorkTransactionContext,
++    private readonly eventIds: EventIdGenerator = new ServerEventIdGenerator(),
++    private readonly eventClock: DomainEventClock = systemClock,
++  ) {}
++
++  findById(tenantId: string, id: string): Promise<LocationRecord | undefined> {
++    this.assertTenant(tenantId);
++    return this.repository.findById(tenantId, id);
++  }
++
++  findByCode(tenantId: string, code: string): Promise<LocationRecord | undefined> {
++    this.assertTenant(tenantId);
++    return this.repository.findByCode(tenantId, code);
++  }
++
++  async create(input: CreateLocationInput): Promise<LocationRecord> {
++    this.assertTenant(input.tenantId);
++    const location = await this.repository.create(input);
++    this.events.push(createLocationCreatedEvent(location, this.eventContext(), this.eventIds, this.eventClock));
++    return location;
++  }
++
++  async updateDetails(input: UpdateLocationDetailsInput): Promise<LocationRecord> {
++    this.assertTenant(input.tenantId);
++    const location = await this.repository.updateDetails(input);
++    this.events.push(createLocationUpdatedEvent(location, this.eventContext(), this.eventIds, this.eventClock));
++    return location;
++  }
++
++  async archive(tenantId: string, id: string): Promise<LocationRecord> {
++    this.assertTenant(tenantId);
++    const location = await this.repository.archive(tenantId, id);
++    this.events.push(createLocationArchivedEvent(location, this.eventContext(), this.eventIds, this.eventClock));
++    return location;
++  }
++
++  pullEvents(): readonly DomainEvent[] { return this.events.splice(0, this.events.length); }
++  clearEvents(): void { this.events.length = 0; }
++
++  private eventContext(): Readonly<{ tenantId: string; correlationId: string }> {
++    return Object.freeze({ tenantId: this.context.tenantId, correlationId: this.context.correlationId });
++  }
++
++  private assertTenant(tenantId: string): void {
++    if (tenantId !== this.context.tenantId) {
++      throw Object.freeze({ code: "TENANT_MISMATCH", message: "Transaction access must use its trusted tenant." });
++    }
++  }
++}
+diff --git a/src/platform/organization/location.test.ts b/src/platform/organization/location.test.ts
+new file mode 100644
+index 0000000..79af390
+--- /dev/null
++++ b/src/platform/organization/location.test.ts
+@@ -0,0 +1,85 @@
++import { describe, expect, it } from "vitest";
++import { validateCreateLocationDraft, validateUpdateLocationDetails } from "@/platform/organization/location";
++
++const VALID_ADDRESS = { line1: "123 Ayala Ave", city: "Makati", region: "NCR", postalCode: "1226" };
++
++describe("validateCreateLocationDraft", () => {
++  it("accepts a valid draft and normalizes code (trim + uppercase) and country (uppercase)", () => {
++    const result = validateCreateLocationDraft({ code: " hq ", name: " Head Office ", address: VALID_ADDRESS, countryCode: "ph", timezone: "Asia/Manila" });
++    expect(result.success).toBe(true);
++    if (result.success) {
++      expect(result.data.code).toBe("HQ");
++      expect(result.data.name).toBe("Head Office");
++      expect(result.data.countryCode).toBe("PH");
++    }
++  });
++
++  it("trims optional address fields and omits empty ones", () => {
++    const result = validateCreateLocationDraft({ code: "HQ", name: "Head Office", address: { line1: " 123 Ayala Ave ", city: " Makati ", line2: "  ", region: "  " }, countryCode: "PH", timezone: "Asia/Manila" });
++    expect(result.success).toBe(true);
++    if (result.success) {
++      expect(result.data.address.line1).toBe("123 Ayala Ave");
++      expect(result.data.address.city).toBe("Makati");
++      expect(result.data.address).not.toHaveProperty("line2");
++      expect(result.data.address).not.toHaveProperty("region");
++    }
++  });
++
++  it("rejects a missing/blank name and code", () => {
++    const result = validateCreateLocationDraft({ code: "", name: "", address: VALID_ADDRESS, countryCode: "PH", timezone: "Asia/Manila" });
++    expect(result.success).toBe(false);
++    if (!result.success) {
++      expect(result.issues.some((i) => i.path.join(".") === "code" && i.code === "REQUIRED")).toBe(true);
++      expect(result.issues.some((i) => i.path.join(".") === "name" && i.code === "REQUIRED")).toBe(true);
++    }
++  });
++
++  it("rejects a malformed code", () => {
++    expect(validateCreateLocationDraft({ code: "has space", name: "X", address: VALID_ADDRESS, countryCode: "PH", timezone: "Asia/Manila" }).success).toBe(false);
++    expect(validateCreateLocationDraft({ code: "-bad", name: "X", address: VALID_ADDRESS, countryCode: "PH", timezone: "Asia/Manila" }).success).toBe(false);
++  });
++
++  it("rejects a missing address line1 or city", () => {
++    const result = validateCreateLocationDraft({ code: "HQ", name: "X", address: { line1: "", city: "" }, countryCode: "PH", timezone: "Asia/Manila" });
++    expect(result.success).toBe(false);
++    if (!result.success) {
++      expect(result.issues.some((i) => i.path.join(".") === "address.line1" && i.code === "REQUIRED")).toBe(true);
++      expect(result.issues.some((i) => i.path.join(".") === "address.city" && i.code === "REQUIRED")).toBe(true);
++    }
++  });
++
++  it("rejects a missing or malformed country code", () => {
++    expect(validateCreateLocationDraft({ code: "HQ", name: "X", address: VALID_ADDRESS, countryCode: "", timezone: "Asia/Manila" }).success).toBe(false);
++    expect(validateCreateLocationDraft({ code: "HQ", name: "X", address: VALID_ADDRESS, countryCode: "PHL", timezone: "Asia/Manila" }).success).toBe(false);
++    expect(validateCreateLocationDraft({ code: "HQ", name: "X", address: VALID_ADDRESS, countryCode: "1P", timezone: "Asia/Manila" }).success).toBe(false);
++  });
++
++  it("accepts well-known IANA time zones", () => {
++    for (const timezone of ["Asia/Manila", "Asia/Singapore", "America/Los_Angeles", "UTC"]) {
++      const result = validateCreateLocationDraft({ code: "HQ", name: "X", address: VALID_ADDRESS, countryCode: "PH", timezone });
++      expect(result.success, `expected ${timezone} to be valid`).toBe(true);
++    }
++  });
++
++  it("rejects a missing or unrecognized time zone", () => {
++    expect(validateCreateLocationDraft({ code: "HQ", name: "X", address: VALID_ADDRESS, countryCode: "PH", timezone: "" }).success).toBe(false);
++    const result = validateCreateLocationDraft({ code: "HQ", name: "X", address: VALID_ADDRESS, countryCode: "PH", timezone: "Mars/Olympus_Mons" });
++    expect(result.success).toBe(false);
++    if (!result.success) expect(result.issues.some((i) => i.path.join(".") === "timezone" && i.code === "UNSUPPORTED")).toBe(true);
++  });
++});
++
++describe("validateUpdateLocationDetails", () => {
++  it("accepts a valid update and never exposes a way to change identity (no id/code fields on the input type)", () => {
++    const result = validateUpdateLocationDetails({ name: "Head Office HQ", address: VALID_ADDRESS, countryCode: "PH", timezone: "Asia/Manila" });
++    expect(result.success).toBe(true);
++    if (result.success) expect(Object.keys(result.data)).toEqual(["name", "address", "countryCode", "timezone"]);
++  });
++
++  it("rejects the same invalid inputs as create (name, address, country, timezone)", () => {
++    expect(validateUpdateLocationDetails({ name: "", address: VALID_ADDRESS, countryCode: "PH", timezone: "Asia/Manila" }).success).toBe(false);
++    expect(validateUpdateLocationDetails({ name: "X", address: { line1: "", city: "" }, countryCode: "PH", timezone: "Asia/Manila" }).success).toBe(false);
++    expect(validateUpdateLocationDetails({ name: "X", address: VALID_ADDRESS, countryCode: "ZZZ", timezone: "Asia/Manila" }).success).toBe(false);
++    expect(validateUpdateLocationDetails({ name: "X", address: VALID_ADDRESS, countryCode: "PH", timezone: "not/a/zone" }).success).toBe(false);
++  });
++});
+diff --git a/src/platform/organization/location.ts b/src/platform/organization/location.ts
+new file mode 100644
+index 0000000..7615b56
+--- /dev/null
++++ b/src/platform/organization/location.ts
+@@ -0,0 +1,190 @@
++import { invalid, issue, valid, type ValidationIssue, type ValidationResult } from "@/platform/validation";
++
++/**
++ * Location — a physical or recognized work site (ADR-012 §5). A dimension
++ * orthogonal to the OrgUnit tree: a department may operate across several
++ * locations, and a location may host people from many org units. Location is
++ * never a node in the hierarchy and never an OrgUnit `kind`.
++ *
++ * `id` and `code` are stable identity — immutable and never reused. A rename
++ * changes the display name only. Locations are archived, never hard-deleted;
++ * an archived location remains historically resolvable but cannot be reused
++ * under a new identity and is excluded from active-only listings.
++ */
++
++export const LOCATION_STATUSES = ["ACTIVE", "ARCHIVED"] as const;
++export type LocationStatus = (typeof LOCATION_STATUSES)[number];
++
++/**
++ * A location's street address. A value object with no identity or lifecycle
++ * of its own — it lives only as part of a Location. Deliberately loose about
++ * shape (no state/province required, no postal-code format enforced) so the
++ * model works outside the Philippines; this is normalization, not a global
++ * address-validation engine.
++ */
++export interface Address {
++  line1: string;
++  line2?: string;
++  city: string;
++  region?: string;
++  postalCode?: string;
++}
++
++export interface AddressInput {
++  line1?: string;
++  line2?: string;
++  city?: string;
++  region?: string;
++  postalCode?: string;
++}
++
++/** Immutable read record of one location. */
++export interface LocationRecord {
++  id: string;
++  tenantId: string;
++  code: string;
++  name: string;
++  address: Address;
++  /** ISO 3166-1 alpha-2, e.g. "PH", "SG", "US". */
++  countryCode: string;
++  /** IANA time zone identifier, e.g. "Asia/Manila". */
++  timezone: string;
++  status: LocationStatus;
++  createdAt: string;
++  createdBy: string;
++  updatedAt: string;
++  archivedAt?: string;
++}
++
++const CODE_PATTERN = /^[A-Z0-9][A-Z0-9._-]{0,49}$/;
++const COUNTRY_CODE_PATTERN = /^[A-Z]{2}$/;
++
++function isValidCountryCode(value: string): boolean {
++  return COUNTRY_CODE_PATTERN.test(value);
++}
++
++/**
++ * IANA identifiers are validated using the runtime's own time zone database
++ * (`Intl.DateTimeFormat` throws for an unrecognized zone) rather than a
++ * hand-maintained registry — the same technique Configuration's general
++ * company settings use, reimplemented here rather than imported, since
++ * Organization must never depend on Configuration (ADR-012 §4).
++ */
++function isValidTimeZone(value: string): boolean {
++  try {
++    new Intl.DateTimeFormat("en-US", { timeZone: value });
++    return true;
++  } catch {
++    return false;
++  }
++}
++
++function validateAddress(input: AddressInput, path: string): { issues: ValidationIssue[]; address?: Address } {
++  const issues: ValidationIssue[] = [];
++  const line1 = input.line1?.trim();
++  const city = input.city?.trim();
++  if (!line1) issues.push(issue(`${path}.line1`, "REQUIRED", "An address line is required."));
++  if (!city) issues.push(issue(`${path}.city`, "REQUIRED", "A city is required."));
++  if (issues.length > 0) return { issues };
++  return {
++    issues,
++    address: {
++      line1: line1!,
++      city: city!,
++      ...(input.line2?.trim() ? { line2: input.line2.trim() } : {}),
++      ...(input.region?.trim() ? { region: input.region.trim() } : {}),
++      ...(input.postalCode?.trim() ? { postalCode: input.postalCode.trim() } : {}),
++    },
++  };
++}
++
++export interface CreateLocationDraft {
++  code: string;
++  name: string;
++  address: AddressInput;
++  countryCode: string;
++  timezone: string;
++}
++
++export interface ValidatedCreateLocationDraft {
++  code: string;
++  name: string;
++  address: Address;
++  countryCode: string;
++  timezone: string;
++}
++
++/**
++ * Server-authoritative validation for a new location's own fields. The code
++ * is normalized (trimmed + upper-cased) so "HQ" and "hq" can never become two
++ * distinct locations. Uniqueness is enforced by the write service against
++ * live data, not here.
++ */
++export function validateCreateLocationDraft(input: CreateLocationDraft): ValidationResult<ValidatedCreateLocationDraft> {
++  const issues = [];
++  const normalizedCode = input.code?.trim().toUpperCase() ?? "";
++  if (!normalizedCode) issues.push(issue("code", "REQUIRED", "A short, stable code is required."));
++  else if (!CODE_PATTERN.test(normalizedCode)) issues.push(issue("code", "INVALID_FORMAT", "Code must be 1-50 characters: letters, numbers, dot, dash, or underscore, starting with a letter or number."));
++  if (!input.name?.trim()) issues.push(issue("name", "REQUIRED", "A name is required."));
++
++  const normalizedCountry = input.countryCode?.trim().toUpperCase() ?? "";
++  if (!normalizedCountry) issues.push(issue("countryCode", "REQUIRED", "A country is required."));
++  else if (!isValidCountryCode(normalizedCountry)) issues.push(issue("countryCode", "INVALID_FORMAT", `"${input.countryCode}" is not a valid two-letter ISO country code.`));
++
++  if (!input.timezone?.trim()) issues.push(issue("timezone", "REQUIRED", "A time zone is required."));
++  else if (!isValidTimeZone(input.timezone)) issues.push(issue("timezone", "UNSUPPORTED", `"${input.timezone}" is not a recognized IANA time zone.`));
++
++  const addressResult = validateAddress(input.address ?? {}, "address");
++  issues.push(...addressResult.issues);
++
++  if (issues.length > 0) return invalid(issues);
++  return valid({
++    code: normalizedCode,
++    name: input.name!.trim(),
++    address: addressResult.address!,
++    countryCode: normalizedCountry,
++    timezone: input.timezone!,
++  });
++}
++
++export interface UpdateLocationDetailsInput {
++  name: string;
++  address: AddressInput;
++  countryCode: string;
++  timezone: string;
++}
++
++export interface ValidatedLocationDetails {
++  name: string;
++  address: Address;
++  countryCode: string;
++  timezone: string;
++}
++
++/**
++ * Validates the mutable descriptive attributes of a location — name,
++ * address, country, and time zone. Identity (id, code) is never part of this
++ * input; there is deliberately no way to change it.
++ */
++export function validateUpdateLocationDetails(input: UpdateLocationDetailsInput): ValidationResult<ValidatedLocationDetails> {
++  const issues = [];
++  if (!input.name?.trim()) issues.push(issue("name", "REQUIRED", "A name is required."));
++
++  const normalizedCountry = input.countryCode?.trim().toUpperCase() ?? "";
++  if (!normalizedCountry) issues.push(issue("countryCode", "REQUIRED", "A country is required."));
++  else if (!isValidCountryCode(normalizedCountry)) issues.push(issue("countryCode", "INVALID_FORMAT", `"${input.countryCode}" is not a valid two-letter ISO country code.`));
++
++  if (!input.timezone?.trim()) issues.push(issue("timezone", "REQUIRED", "A time zone is required."));
++  else if (!isValidTimeZone(input.timezone)) issues.push(issue("timezone", "UNSUPPORTED", `"${input.timezone}" is not a recognized IANA time zone.`));
++
++  const addressResult = validateAddress(input.address ?? {}, "address");
++  issues.push(...addressResult.issues);
++
++  if (issues.length > 0) return invalid(issues);
++  return valid({
++    name: input.name!.trim(),
++    address: addressResult.address!,
++    countryCode: normalizedCountry,
++    timezone: input.timezone!,
++  });
++}
+diff --git a/src/platform/organization/prisma-location-read-repository.ts b/src/platform/organization/prisma-location-read-repository.ts
+new file mode 100644
+index 0000000..55f481e
+--- /dev/null
++++ b/src/platform/organization/prisma-location-read-repository.ts
+@@ -0,0 +1,69 @@
++import type { PrismaClient } from "@prisma/client";
++import { hasPermission, type TenantContext } from "@/platform/context";
++import { AuthorizationError } from "@/platform/errors";
++import type { LocationReadRepository } from "@/platform/organization/location-repository";
++import type { Address, LocationRecord, LocationStatus } from "@/platform/organization/location";
++
++export type PrismaLocationReadClient = Pick<PrismaClient, "location">;
++
++function requireOrganizationView(context: TenantContext): void {
++  if (!hasPermission(context, "organization.view")) throw new AuthorizationError();
++}
++
++function toRecord(value: {
++  id: string; tenantId: string; code: string; name: string;
++  addressLine1: string; addressLine2: string | null; city: string; region: string | null; postalCode: string | null;
++  countryCode: string; timezone: string; status: string;
++  createdAt: Date; createdBy: string; updatedAt: Date; archivedAt: Date | null;
++}): LocationRecord {
++  const address: Address = {
++    line1: value.addressLine1,
++    city: value.city,
++    ...(value.addressLine2 ? { line2: value.addressLine2 } : {}),
++    ...(value.region ? { region: value.region } : {}),
++    ...(value.postalCode ? { postalCode: value.postalCode } : {}),
++  };
++  return Object.freeze({
++    id: value.id,
++    tenantId: value.tenantId,
++    code: value.code,
++    name: value.name,
++    address,
++    countryCode: value.countryCode,
++    timezone: value.timezone,
++    status: value.status as LocationStatus,
++    createdAt: value.createdAt.toISOString(),
++    createdBy: value.createdBy,
++    updatedAt: value.updatedAt.toISOString(),
++    ...(value.archivedAt ? { archivedAt: value.archivedAt.toISOString() } : {}),
++  });
++}
++
++/** Read-only, tenant-scoped. Every method requires organization.view. */
++export class PrismaLocationReadRepository implements LocationReadRepository {
++  constructor(private readonly prisma: PrismaLocationReadClient) {}
++
++  async getById(context: TenantContext, id: string): Promise<LocationRecord | undefined> {
++    requireOrganizationView(context);
++    const location = await this.prisma.location.findFirst({ where: { tenantId: context.tenantId, id } });
++    return location ? toRecord(location) : undefined;
++  }
++
++  async getByCode(context: TenantContext, code: string): Promise<LocationRecord | undefined> {
++    requireOrganizationView(context);
++    const location = await this.prisma.location.findUnique({ where: { tenantId_code: { tenantId: context.tenantId, code } } });
++    return location ? toRecord(location) : undefined;
++  }
++
++  async listActive(context: TenantContext): Promise<LocationRecord[]> {
++    requireOrganizationView(context);
++    const locations = await this.prisma.location.findMany({ where: { tenantId: context.tenantId, status: "ACTIVE" }, orderBy: [{ name: "asc" }, { code: "asc" }] });
++    return locations.map(toRecord);
++  }
++
++  async listAll(context: TenantContext): Promise<LocationRecord[]> {
++    requireOrganizationView(context);
++    const locations = await this.prisma.location.findMany({ where: { tenantId: context.tenantId }, orderBy: [{ name: "asc" }, { code: "asc" }] });
++    return locations.map(toRecord);
++  }
++}
+diff --git a/src/platform/organization/prisma-location-unit-of-work.ts b/src/platform/organization/prisma-location-unit-of-work.ts
+new file mode 100644
+index 0000000..f73a9a6
+--- /dev/null
++++ b/src/platform/organization/prisma-location-unit-of-work.ts
+@@ -0,0 +1,74 @@
++import { randomUUID } from "node:crypto";
++import type { Prisma } from "@prisma/client";
++import { AuditRecordFactory } from "@/platform/auditing/audit-record-factory";
++import { ServerAuditIdGenerator } from "@/platform/auditing/audit-record";
++import type { AuditCollector } from "@/platform/auditing/audit-collector";
++import type { ImmutableAuditRecordRepository } from "@/platform/auditing/immutable-audit-record-repository";
++import type { DomainEventCollector } from "@/platform/events/domain-event-collector";
++import { PrismaAuditRecordRepository } from "@/platform/auditing/prisma-audit-record-repository";
++import { PrismaOutboxRepository } from "@/platform/outbox/prisma-outbox-repository";
++import type { OutboxRepository } from "@/platform/outbox/outbox-repository";
++import { toOutboxMessage } from "@/platform/outbox/outbox-message";
++import { PrismaLocationWriteRepository } from "@/platform/organization/prisma-location-write-repository";
++import { LocationWriteTransaction } from "@/platform/organization/location-write-transaction";
++import type { LocationTransactionRepositories } from "@/platform/organization/location-repository";
++import type { UnitOfWork, UnitOfWorkContext, UnitOfWorkTransaction } from "@/platform/transactions/unit-of-work";
++import type { DomainEvent } from "@/platform/events/domain-event";
++
++/** A Prisma client able to own an interactive transaction spanning location, audit, and outbox tables. */
++export type PrismaLocationTransactionRunner = Readonly<{
++  $transaction<T>(fn: (client: Prisma.TransactionClient) => Promise<T>): Promise<T>;
++}>;
++
++/**
++ * Durable transaction coordinator for locations. Mirrors
++ * PrismaOrgUnitUnitOfWork: location writes, audit records, and outbox
++ * messages commit atomically inside one Prisma $transaction; domain events
++ * are released to their collector only after that commit succeeds.
++ */
++export class PrismaLocationUnitOfWork implements UnitOfWork<LocationTransactionRepositories> {
++  constructor(
++    private readonly prisma: PrismaLocationTransactionRunner,
++    private readonly eventCollector: DomainEventCollector,
++    private readonly auditCollector: AuditCollector,
++    private readonly auditRecords: AuditRecordFactory = new AuditRecordFactory(new ServerAuditIdGenerator(), { now: () => new Date().toISOString() }),
++    private readonly transactionIds: { next(): string } = { next: () => randomUUID() },
++    private readonly auditRepositoryFactory: (client: ConstructorParameters<typeof PrismaAuditRecordRepository>[0]) => ImmutableAuditRecordRepository = (client) => new PrismaAuditRecordRepository(client),
++    private readonly outboxRepositoryFactory: (client: ConstructorParameters<typeof PrismaOutboxRepository>[0]) => OutboxRepository = (client) => new PrismaOutboxRepository(client),
++  ) {}
++
++  async execute<TResult>(
++    context: UnitOfWorkContext,
++    operation: (transaction: UnitOfWorkTransaction<LocationTransactionRepositories>) => Promise<TResult>,
++  ): Promise<TResult> {
++    const transactionContext = Object.freeze({ ...context, transactionId: this.transactionIds.next() });
++    const committed = await this.prisma.$transaction(async (client) => {
++      const locations = new LocationWriteTransaction(new PrismaLocationWriteRepository(client), transactionContext);
++      const transaction = Object.freeze({ context: transactionContext, repositories: Object.freeze({ locations }) });
++      const result = await operation(transaction);
++      const events = locations.pullEvents();
++      const records = this.createAuditRecords(transactionContext, events);
++      await this.auditRepositoryFactory(client).append(records);
++      const messages = events.map(toOutboxMessage);
++      await this.outboxRepositoryFactory(client).append(messages);
++      return Object.freeze({ result, events, records, messages });
++    });
++
++    this.eventCollector.collect(committed.events);
++    this.auditCollector.collect(committed.records);
++    return committed.result;
++  }
++
++  private createAuditRecords(context: UnitOfWorkTransaction<LocationTransactionRepositories>["context"], events: readonly DomainEvent[]) {
++    const { actorUserId, requestId, commandName } = context;
++    if (!actorUserId || !requestId || !commandName) return [];
++    return events.map((event) => this.auditRecords.organizationEvent({
++      tenantId: context.tenantId,
++      actorUserId,
++      requestId,
++      correlationId: context.correlationId,
++      transactionId: context.transactionId,
++      commandName,
++    }, event));
++  }
++}
+diff --git a/src/platform/organization/prisma-location-write-repository.ts b/src/platform/organization/prisma-location-write-repository.ts
+new file mode 100644
+index 0000000..525230c
+--- /dev/null
++++ b/src/platform/organization/prisma-location-write-repository.ts
+@@ -0,0 +1,101 @@
++import type { Prisma } from "@prisma/client";
++import type {
++  CreateLocationInput,
++  LocationWriteRepository,
++  UpdateLocationDetailsInput,
++} from "@/platform/organization/location-repository";
++import type { Address, LocationRecord, LocationStatus } from "@/platform/organization/location";
++
++export type PrismaLocationWriteClient = Pick<Prisma.TransactionClient, "location">;
++
++function toRecord(value: {
++  id: string; tenantId: string; code: string; name: string;
++  addressLine1: string; addressLine2: string | null; city: string; region: string | null; postalCode: string | null;
++  countryCode: string; timezone: string; status: string;
++  createdAt: Date; createdBy: string; updatedAt: Date; archivedAt: Date | null;
++}): LocationRecord {
++  const address: Address = {
++    line1: value.addressLine1,
++    city: value.city,
++    ...(value.addressLine2 ? { line2: value.addressLine2 } : {}),
++    ...(value.region ? { region: value.region } : {}),
++    ...(value.postalCode ? { postalCode: value.postalCode } : {}),
++  };
++  return Object.freeze({
++    id: value.id,
++    tenantId: value.tenantId,
++    code: value.code,
++    name: value.name,
++    address,
++    countryCode: value.countryCode,
++    timezone: value.timezone,
++    status: value.status as LocationStatus,
++    createdAt: value.createdAt.toISOString(),
++    createdBy: value.createdBy,
++    updatedAt: value.updatedAt.toISOString(),
++    ...(value.archivedAt ? { archivedAt: value.archivedAt.toISOString() } : {}),
++  });
++}
++
++/**
++ * Write-side adapter, used only inside a Location write transaction. Tenant
++ * scoping is on every query's where clause. There is no id/code mutation and
++ * no delete by design.
++ */
++export class PrismaLocationWriteRepository implements LocationWriteRepository {
++  constructor(private readonly prisma: PrismaLocationWriteClient) {}
++
++  async findById(tenantId: string, id: string): Promise<LocationRecord | undefined> {
++    const location = await this.prisma.location.findFirst({ where: { tenantId, id } });
++    return location ? toRecord(location) : undefined;
++  }
++
++  async findByCode(tenantId: string, code: string): Promise<LocationRecord | undefined> {
++    const location = await this.prisma.location.findUnique({ where: { tenantId_code: { tenantId, code } } });
++    return location ? toRecord(location) : undefined;
++  }
++
++  async create(input: CreateLocationInput): Promise<LocationRecord> {
++    const location = await this.prisma.location.create({
++      data: {
++        tenantId: input.tenantId,
++        code: input.code,
++        name: input.name,
++        addressLine1: input.address.line1,
++        addressLine2: input.address.line2 ?? null,
++        city: input.address.city,
++        region: input.address.region ?? null,
++        postalCode: input.address.postalCode ?? null,
++        countryCode: input.countryCode,
++        timezone: input.timezone,
++        createdBy: input.createdBy,
++      },
++    });
++    return toRecord(location);
++  }
++
++  async updateDetails(input: UpdateLocationDetailsInput): Promise<LocationRecord> {
++    const updated = await this.prisma.location.update({
++      where: { tenantId_id: { tenantId: input.tenantId, id: input.id } },
++      data: {
++        name: input.name,
++        addressLine1: input.address.line1,
++        addressLine2: input.address.line2 ?? null,
++        city: input.address.city,
++        region: input.address.region ?? null,
++        postalCode: input.address.postalCode ?? null,
++        countryCode: input.countryCode,
++        timezone: input.timezone,
++      },
++    });
++    return toRecord(updated);
++  }
++
++  async archive(tenantId: string, id: string): Promise<LocationRecord> {
++    const updated = await this.prisma.location.update({
++      where: { tenantId_id: { tenantId, id } },
++      data: { status: "ARCHIVED", archivedAt: new Date() },
++    });
++    return toRecord(updated);
++  }
++}
+-- 
+2.43.0
+

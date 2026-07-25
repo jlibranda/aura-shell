@@ -1,0 +1,1737 @@
+From 824f80b944892fb9c417502a7978ab8162077fcd Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Fri, 24 Jul 2026 13:23:20 +0000
+Subject: [PATCH] Epic 7B.1: OrgUnit Foundation (ADR-012)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Implements the OrgUnit aggregate — the recursive, single-parent, typed
+organizational node — as the foundation of the Organization domain. No
+Assignment, Location, or LegalEntity (deferred per ADR-012).
+
+Aggregate & hierarchy:
+- One typed OrgUnit (kind in DIVISION/BUSINESS_UNIT/DEPARTMENT/BRANCH/TEAM),
+  never a table per level. Strict single-parent tree; pure helpers for tree
+  building, descendant collection, and cycle detection.
+- Immutable id + code, no hard delete (archive only) — IDs never reused.
+
+Persistence & integrity:
+- Prisma OrgUnit model + migration. Tenant isolation is enforced at the DB by
+  a composite (tenant_id, parent_id) -> (tenant_id, org_unit_id) foreign key,
+  so a parent can never be cross-tenant. CHECK constraints for valid kind,
+  valid status, and no self-parent; unique (tenant, code).
+- Read + write repository ports with Prisma and in-memory implementations;
+  reads require organization.view.
+
+Write path (audit + outbox reused):
+- OrgUnit write-transaction buffers one domain event per mutation; a
+  PrismaOrgUnitUnitOfWork (mirroring the configuration UoW) commits the unit,
+  audit record, and outbox message atomically. Additive
+  AuditRecordFactory.organizationEvent. A single OrgUnitService owns the
+  structural invariants enforced in-transaction — unique code, parent
+  existence, and cycle prevention — gated by a new organization.manage
+  permission.
+
+Also folds the three role->permission derivations (hasPermission, production,
+development) onto one source of truth (permissionsForRoles) so new permissions
+no longer need three edits.
+
+Architecture fitness: registry-style import rules protecting the read-only
+read model, the peer-domain boundary (Configuration and Organization must not
+couple), and client isolation; plus a structural test asserting a single
+OrgUnit aggregate and single hierarchy implementation.
+
+Tests: +31 (aggregate/validation/tree/cycle, service permission/audit/outbox/
+cycle/tenant-isolation/rollback, structure, and a real-DB integration test for
+atomic audit+outbox, DB guards, hierarchy, and tenant isolation). Full suite
+358 unit + 15 integration green; lint, typecheck, build, fitness pass.
+
+Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_012xkyMKxXWptQtBxJmKLszv
+---
+ .../migration.sql                             |  44 +++++
+ prisma/schema.prisma                          |  31 ++++
+ .../architecture/import-boundaries.test.ts    |  22 +++
+ .../architecture/import-boundaries.ts         |  42 +++++
+ src/platform/auditing/audit-record-factory.ts |  19 +++
+ .../auth/production-request-context.ts        |  39 +----
+ src/platform/context.ts                       |  25 ++-
+ src/platform/development-session.ts           |   5 +-
+ .../in-memory-org-unit-repository.ts          | 107 ++++++++++++
+ .../in-memory-org-unit-unit-of-work.ts        |  55 ++++++
+ src/platform/organization/org-unit-events.ts  |  47 ++++++
+ .../org-unit-platform.integration.test.ts     | 111 ++++++++++++
+ .../organization/org-unit-repository.ts       |  57 +++++++
+ .../organization/org-unit-service.test.ts     | 159 ++++++++++++++++++
+ src/platform/organization/org-unit-service.ts | 120 +++++++++++++
+ .../organization/org-unit-structure.test.ts   |  46 +++++
+ .../org-unit-write-transaction.ts             |  91 ++++++++++
+ src/platform/organization/org-unit.test.ts    |  80 +++++++++
+ src/platform/organization/org-unit.ts         | 118 +++++++++++++
+ .../prisma-org-unit-read-repository.ts        |  58 +++++++
+ .../prisma-org-unit-unit-of-work.ts           |  74 ++++++++
+ .../prisma-org-unit-write-repository.ts       |  74 ++++++++
+ 22 files changed, 1385 insertions(+), 39 deletions(-)
+ create mode 100644 prisma/migrations/20260724083226_organization_org_unit/migration.sql
+ create mode 100644 src/platform/organization/in-memory-org-unit-repository.ts
+ create mode 100644 src/platform/organization/in-memory-org-unit-unit-of-work.ts
+ create mode 100644 src/platform/organization/org-unit-events.ts
+ create mode 100644 src/platform/organization/org-unit-platform.integration.test.ts
+ create mode 100644 src/platform/organization/org-unit-repository.ts
+ create mode 100644 src/platform/organization/org-unit-service.test.ts
+ create mode 100644 src/platform/organization/org-unit-service.ts
+ create mode 100644 src/platform/organization/org-unit-structure.test.ts
+ create mode 100644 src/platform/organization/org-unit-write-transaction.ts
+ create mode 100644 src/platform/organization/org-unit.test.ts
+ create mode 100644 src/platform/organization/org-unit.ts
+ create mode 100644 src/platform/organization/prisma-org-unit-read-repository.ts
+ create mode 100644 src/platform/organization/prisma-org-unit-unit-of-work.ts
+ create mode 100644 src/platform/organization/prisma-org-unit-write-repository.ts
+
+diff --git a/prisma/migrations/20260724083226_organization_org_unit/migration.sql b/prisma/migrations/20260724083226_organization_org_unit/migration.sql
+new file mode 100644
+index 0000000..970ba38
+--- /dev/null
++++ b/prisma/migrations/20260724083226_organization_org_unit/migration.sql
+@@ -0,0 +1,44 @@
++-- CreateTable
++CREATE TABLE "org_units" (
++    "org_unit_id" TEXT NOT NULL,
++    "tenant_id" TEXT NOT NULL,
++    "code" TEXT NOT NULL,
++    "name" TEXT NOT NULL,
++    "kind" TEXT NOT NULL,
++    "parent_id" TEXT,
++    "status" TEXT NOT NULL DEFAULT 'ACTIVE',
++    "created_at" TIMESTAMPTZ(6) NOT NULL DEFAULT CURRENT_TIMESTAMP,
++    "created_by" TEXT NOT NULL,
++    "updated_at" TIMESTAMPTZ(6) NOT NULL,
++
++    CONSTRAINT "org_units_pkey" PRIMARY KEY ("org_unit_id")
++);
++
++-- CreateIndex
++CREATE INDEX "org_units_tenant_id_parent_id_idx" ON "org_units"("tenant_id", "parent_id");
++
++-- CreateIndex
++CREATE INDEX "org_units_tenant_id_status_idx" ON "org_units"("tenant_id", "status");
++
++-- CreateIndex
++CREATE UNIQUE INDEX "org_units_tenant_id_org_unit_id_key" ON "org_units"("tenant_id", "org_unit_id");
++
++-- CreateIndex
++CREATE UNIQUE INDEX "org_units_tenant_id_code_key" ON "org_units"("tenant_id", "code");
++
++-- AddForeignKey
++ALTER TABLE "org_units" ADD CONSTRAINT "org_units_tenant_id_fkey" FOREIGN KEY ("tenant_id") REFERENCES "tenants"("tenant_id") ON DELETE RESTRICT ON UPDATE CASCADE;
++
++-- AddForeignKey
++ALTER TABLE "org_units" ADD CONSTRAINT "org_units_tenant_id_parent_id_fkey" FOREIGN KEY ("tenant_id", "parent_id") REFERENCES "org_units"("tenant_id", "org_unit_id") ON DELETE RESTRICT ON UPDATE CASCADE;
++
++-- Valid kind values only (single typed aggregate; one recursive node, never a table per level).
++ALTER TABLE "org_units" ADD CONSTRAINT "org_units_kind_check" CHECK (kind IN ('DIVISION', 'BUSINESS_UNIT', 'DEPARTMENT', 'BRANCH', 'TEAM'));
++
++-- Valid lifecycle status only.
++ALTER TABLE "org_units" ADD CONSTRAINT "org_units_status_check" CHECK (status IN ('ACTIVE', 'ARCHIVED'));
++
++-- A unit can never be its own parent (the trivial cycle). Deeper cycles are
++-- prevented in the write service, which rejects reparenting a unit beneath one
++-- of its own descendants (computed in-transaction against the live tree).
++ALTER TABLE "org_units" ADD CONSTRAINT "org_units_no_self_parent_check" CHECK (parent_id IS NULL OR parent_id <> org_unit_id);
+diff --git a/prisma/schema.prisma b/prisma/schema.prisma
+index e8c70e6..9f95a27 100644
+--- a/prisma/schema.prisma
++++ b/prisma/schema.prisma
+@@ -21,6 +21,7 @@ model Tenant {
+   sessions                     Session[]
+   configurationDefinitions     ConfigurationDefinition[]
+   configurationVersions        ConfigurationVersion[]
++  orgUnits                     OrgUnit[]
+ 
+   @@map("tenants")
+ }
+@@ -80,6 +81,36 @@ model ConfigurationVersion {
+   @@map("configuration_versions")
+ }
+ 
++/// OrgUnit — the single, recursive, typed organizational node (Epic 7B.1,
++/// ADR-012). One aggregate differentiated by `kind`; never a table per level.
++/// A strict single-parent tree: `parentId` is null for a root and otherwise
++/// names one parent in the same tenant, enforced by the composite
++/// (tenant_id, parent_id) -> (tenant_id, org_unit_id) foreign key. `id` and
++/// `code` are stable identity — immutable and never reused. Not a versioned
++/// entity: it is mutable structural master data (rename, move, archive), with
++/// history captured in the immutable audit trail, not in per-row versions.
++model OrgUnit {
++  id        String    @id @default(uuid()) @map("org_unit_id")
++  tenantId  String    @map("tenant_id")
++  code      String    @map("code")
++  name      String    @map("name")
++  kind      String    @map("kind")
++  parentId  String?   @map("parent_id")
++  status    String    @default("ACTIVE") @map("status")
++  createdAt DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
++  createdBy String    @map("created_by")
++  updatedAt DateTime  @updatedAt @map("updated_at") @db.Timestamptz(6)
++  tenant    Tenant    @relation(fields: [tenantId], references: [id], onDelete: Restrict, onUpdate: Cascade)
++  parent    OrgUnit?  @relation("OrgUnitHierarchy", fields: [tenantId, parentId], references: [tenantId, id], onDelete: Restrict, onUpdate: Cascade)
++  children  OrgUnit[] @relation("OrgUnitHierarchy")
++
++  @@unique([tenantId, id])
++  @@unique([tenantId, code])
++  @@index([tenantId, parentId])
++  @@index([tenantId, status])
++  @@map("org_units")
++}
++
+ /// The platform login identity (Epic 6 Slice 6M0.1). Deliberately separate
+ /// from Employee: Employee is HR record data, not authentication data, and
+ /// a User is not guaranteed to correspond to an Employee row.
+diff --git a/src/platform/architecture/import-boundaries.test.ts b/src/platform/architecture/import-boundaries.test.ts
+index 7c76195..a8d4bd1 100644
+--- a/src/platform/architecture/import-boundaries.test.ts
++++ b/src/platform/architecture/import-boundaries.test.ts
+@@ -189,6 +189,28 @@ describe("import boundary fitness rules (fixtures prove each rule actually catch
+     const file: SourceFile = { path: "src/platform/configuration/registry/configuration-registry-service.ts", content: `import { hasPermission } from "@/platform/context";\nimport type { ConfigurationReadRepository } from "@/platform/configuration/configuration-repository";\nimport { CONFIGURATION_MANIFEST } from "@/platform/configuration/registry/configuration-manifest";\n` };
+     expect(scanImportBoundaries([file])).toHaveLength(0);
+   });
++
++  it("flags the organization read repository importing the org write side (read model must stay read-only)", () => {
++    const file: SourceFile = { path: "src/platform/organization/prisma-org-unit-read-repository.ts", content: `import { OrgUnitService } from "@/platform/organization/org-unit-service";\n` };
++    expect(scanImportBoundaries([file])).toContainEqual({ path: file.path, rule: "organization-read-repository-must-not-import-write-side", matchedImport: "@/platform/organization/org-unit-service" });
++  });
++
++  it("flags a client component importing the org unit service (ADR-012 server composition)", () => {
++    const file: SourceFile = { path: "src/components/organization/bad-client.tsx", content: `"use client";\nimport { OrgUnitService } from "@/platform/organization/org-unit-service";\n` };
++    expect(scanImportBoundaries([file])).toContainEqual({ path: file.path, rule: "client-components-must-not-import-organization-server-composition", matchedImport: "@/platform/organization/org-unit-service" });
++  });
++
++  it("flags Configuration importing Organization, and Organization importing Configuration (peer domains must not couple)", () => {
++    const configToOrg: SourceFile = { path: "src/platform/configuration/bad.ts", content: `import { buildOrgUnitTree } from "@/platform/organization/org-unit";\n` };
++    const orgToConfig: SourceFile = { path: "src/platform/organization/bad.ts", content: `import { CONFIGURATION_MANIFEST } from "@/platform/configuration/registry/configuration-manifest";\n` };
++    expect(scanImportBoundaries([configToOrg])).toContainEqual({ path: configToOrg.path, rule: "configuration-must-not-import-organization", matchedImport: "@/platform/organization/org-unit" });
++    expect(scanImportBoundaries([orgToConfig])).toContainEqual({ path: orgToConfig.path, rule: "organization-must-not-import-configuration", matchedImport: "@/platform/configuration/registry/configuration-manifest" });
++  });
++
++  it("does not flag the legitimate org read repository reading through Prisma with a permission gate", () => {
++    const file: SourceFile = { path: "src/platform/organization/prisma-org-unit-read-repository.ts", content: `import type { PrismaClient } from "@prisma/client";\nimport { hasPermission } from "@/platform/context";\nimport type { OrgUnitReadRepository } from "@/platform/organization/org-unit-repository";\n` };
++    expect(scanImportBoundaries([file])).toHaveLength(0);
++  });
+ });
+ 
+ describe("import boundary fitness rules — real codebase scan", () => {
+diff --git a/src/platform/architecture/import-boundaries.ts b/src/platform/architecture/import-boundaries.ts
+index 1a13905..7eb2517 100644
+--- a/src/platform/architecture/import-boundaries.ts
++++ b/src/platform/architecture/import-boundaries.ts
+@@ -45,6 +45,10 @@ const isAuthPlatformCode = (file: SourceFile) => file.path.startsWith("src/platf
+ // The Configuration Registry (ADR-011) is a read-side platform capability.
+ const isConfigurationRegistry = (file: SourceFile) => file.path.startsWith("src/platform/configuration/registry/");
+ const isConfigurationManifest = (file: SourceFile) => file.path === "src/platform/configuration/registry/configuration-manifest.ts";
++// The Organization domain (ADR-012) is a peer domain — never coupled to Configuration.
++const isConfigurationCode = (file: SourceFile) => file.path.startsWith("src/platform/configuration/");
++const isOrganizationCode = (file: SourceFile) => file.path.startsWith("src/platform/organization/");
++const isOrganizationReadRepository = (file: SourceFile) => file.path === "src/platform/organization/prisma-org-unit-read-repository.ts";
+ 
+ const WRITE_RUNTIME_IMPORTS = [
+   /^@prisma\/client/,
+@@ -94,6 +98,22 @@ const CONFIGURATION_PERSISTENCE_IMPORTS = [
+ 
+ const WRITE_RUNTIME_MODULE_IMPORTS = [/platform\/people\/commands\//, /platform\/submissions\//, /durable-application-runtime/];
+ 
++// The Organization write side (ADR-012). The read repository — and any client —
++// must never reach these; writes go only through the OrgUnit service + UnitOfWork.
++const ORGANIZATION_WRITE_SIDE_IMPORTS = [
++  /platform\/organization\/prisma-org-unit-write-repository/,
++  /platform\/organization\/org-unit-write-transaction/,
++  /platform\/organization\/prisma-org-unit-unit-of-work/,
++  /platform\/organization\/in-memory-org-unit-unit-of-work/,
++  /platform\/organization\/org-unit-service/,
++];
++
++// Server-only Organization composition a client component must never import.
++const ORGANIZATION_SERVER_ONLY_IMPORTS = [
++  ...ORGANIZATION_WRITE_SIDE_IMPORTS,
++  /platform\/organization\/prisma-org-unit-read-repository/,
++];
++
+ // Anything that lets a caller obtain or construct a TrustedRequestContext —
+ // blocking these imports blocks constructing/supplying tenant, roles, or
+ // permissions from the client just as effectively as blocking the fields.
+@@ -185,6 +205,28 @@ export const RULES: Rule[] = [
+     appliesTo: isConfigurationManifest,
+     forbidden: CONFIGURATION_PERSISTENCE_IMPORTS,
+   },
++  {
++    name: "organization-read-repository-must-not-import-write-side",
++    appliesTo: isOrganizationReadRepository,
++    forbidden: ORGANIZATION_WRITE_SIDE_IMPORTS,
++  },
++  {
++    name: "client-components-must-not-import-organization-server-composition",
++    appliesTo: isClientComponent,
++    forbidden: ORGANIZATION_SERVER_ONLY_IMPORTS,
++  },
++  {
++    // ADR-012: Organization and Configuration are peer domains and must not
++    // couple. Configuration never owns hierarchy; Organization never owns policy.
++    name: "configuration-must-not-import-organization",
++    appliesTo: isConfigurationCode,
++    forbidden: [/platform\/organization\//],
++  },
++  {
++    name: "organization-must-not-import-configuration",
++    appliesTo: isOrganizationCode,
++    forbidden: [/platform\/configuration\//],
++  },
+ ];
+ 
+ /** Pure scan: given source files, returns every boundary violation found. Deterministic, no filesystem access. */
+diff --git a/src/platform/auditing/audit-record-factory.ts b/src/platform/auditing/audit-record-factory.ts
+index 5eab564..8b0ecf0 100644
+--- a/src/platform/auditing/audit-record-factory.ts
++++ b/src/platform/auditing/audit-record-factory.ts
+@@ -50,4 +50,23 @@ export class AuditRecordFactory {
+       metadata: Object.freeze({ ...event.payload }),
+     });
+   }
++
++  /** Organization structure audits (org unit created/renamed/moved/archived). */
++  organizationEvent(context: AuditContext, event: DomainEvent): AuditRecord {
++    return Object.freeze({
++      auditId: this.ids.next(),
++      occurredAt: this.clock.now(),
++      tenantId: context.tenantId,
++      actorUserId: context.actorUserId,
++      requestId: context.requestId,
++      correlationId: context.correlationId,
++      transactionId: context.transactionId,
++      commandName: context.commandName,
++      eventName: event.eventName,
++      aggregateType: event.aggregateType,
++      aggregateId: event.aggregateId,
++      result: "SUCCESS" as const,
++      metadata: Object.freeze({ ...event.payload }),
++    });
++  }
+ }
+diff --git a/src/platform/auth/production-request-context.ts b/src/platform/auth/production-request-context.ts
+index 84951e7..a4a338b 100644
+--- a/src/platform/auth/production-request-context.ts
++++ b/src/platform/auth/production-request-context.ts
+@@ -1,4 +1,4 @@
+-import type { Permission, PlatformRole } from "@/platform/context";
++import { permissionsForRoles, type PlatformRole } from "@/platform/context";
+ import { logger } from "@/platform/observability/logger";
+ import { getRequestCorrelationId } from "@/platform/observability/request-context";
+ import { createProductionAuthRuntime } from "@/platform/auth/production-auth-runtime";
+@@ -13,39 +13,12 @@ function toKnownRoles(roles: readonly string[]): PlatformRole[] {
+ }
+ 
+ /**
+- * Mirrors the rule already embedded in context.ts's hasPermission() so the
+- * command pipeline's separate PermissionSet check (which reads
+- * TrustedRequestContext.permissions directly, not via hasPermission()) stays
+- * consistent with it. Duplicated deliberately rather than editing the
+- * existing, tested, preserved hasPermission() implementation.
++ * The verified PermissionSet is derived from the single role→permission source
++ * of truth in context.ts (permissionsForRoles), so the command pipeline's
++ * PermissionSet check and hasPermission() can never disagree, and new
++ * permissions (e.g. organization.*) require no change here.
+  */
+-function derivePermissionsFromRoles(roles: readonly PlatformRole[]): Permission[] {
+-  const permissions = new Set<Permission>();
+-  if (roles.includes("hr_admin") || roles.includes("hr_operations")) {
+-    permissions.add("people.read");
+-    permissions.add("people.write");
+-    permissions.add("people.government_ids.read");
+-    permissions.add("people.employee.hire");
+-  }
+-  if (roles.includes("payroll")) permissions.add("people.government_ids.read");
+-
+-  if (roles.includes("hr_admin")) {
+-    permissions.add("settings.view");
+-    permissions.add("settings.manage");
+-    permissions.add("settings.publish");
+-    permissions.add("settings.audit.view");
+-  }
+-  if (roles.includes("hr_operations")) {
+-    permissions.add("settings.view");
+-    permissions.add("settings.manage");
+-  }
+-  if (roles.includes("payroll")) permissions.add("settings.view");
+-  if (roles.includes("auditor")) {
+-    permissions.add("settings.view");
+-    permissions.add("settings.audit.view");
+-  }
+-  return [...permissions];
+-}
++const derivePermissionsFromRoles = permissionsForRoles;
+ 
+ /**
+  * Resolves a verified production TrustedRequestContext from the session
+diff --git a/src/platform/context.ts b/src/platform/context.ts
+index 714e67f..d1c2175 100644
+--- a/src/platform/context.ts
++++ b/src/platform/context.ts
+@@ -7,7 +7,9 @@ export type Permission =
+   | "settings.view"
+   | "settings.manage"
+   | "settings.publish"
+-  | "settings.audit.view";
++  | "settings.audit.view"
++  | "organization.view"
++  | "organization.manage";
+ 
+ /** The canonical runtime list of every platform permission, for validation and enumeration. */
+ export const ALL_PERMISSIONS: readonly Permission[] = Object.freeze([
+@@ -19,6 +21,8 @@ export const ALL_PERMISSIONS: readonly Permission[] = Object.freeze([
+   "settings.manage",
+   "settings.publish",
+   "settings.audit.view",
++  "organization.view",
++  "organization.manage",
+ ]);
+ 
+ /** Type guard: is an arbitrary string a recognized platform permission? */
+@@ -56,10 +60,10 @@ export interface TenantContext {
+  * pre-existing coarse hr_admin/hr_operations(/payroll for government IDs) rule.
+  */
+ const ROLE_PERMISSIONS: Readonly<Record<PlatformRole, readonly Permission[]>> = Object.freeze({
+-  hr_admin: ["people.read", "people.write", "people.government_ids.read", "people.employee.hire", "settings.view", "settings.manage", "settings.publish", "settings.audit.view"],
+-  hr_operations: ["people.read", "people.write", "people.government_ids.read", "people.employee.hire", "settings.view", "settings.manage"],
+-  payroll: ["people.government_ids.read", "settings.view"],
+-  auditor: ["settings.view", "settings.audit.view"],
++  hr_admin: ["people.read", "people.write", "people.government_ids.read", "people.employee.hire", "settings.view", "settings.manage", "settings.publish", "settings.audit.view", "organization.view", "organization.manage"],
++  hr_operations: ["people.read", "people.write", "people.government_ids.read", "people.employee.hire", "settings.view", "settings.manage", "organization.view"],
++  payroll: ["people.government_ids.read", "settings.view", "organization.view"],
++  auditor: ["settings.view", "settings.audit.view", "organization.view"],
+   manager: [],
+   employee: [],
+ });
+@@ -67,3 +71,14 @@ const ROLE_PERMISSIONS: Readonly<Record<PlatformRole, readonly Permission[]>> =
+ export function hasPermission(context: TenantContext, permission: Permission): boolean {
+   return context.roles.some((role) => ROLE_PERMISSIONS[role].includes(permission));
+ }
++
++/**
++ * The union of permissions granted by a set of roles — the single source of
++ * truth used both here (hasPermission) and by the production/development
++ * identity adapters, so the two can never drift as new permissions are added.
++ */
++export function permissionsForRoles(roles: readonly PlatformRole[]): Permission[] {
++  const permissions = new Set<Permission>();
++  for (const role of roles) for (const permission of ROLE_PERMISSIONS[role]) permissions.add(permission);
++  return [...permissions];
++}
+diff --git a/src/platform/development-session.ts b/src/platform/development-session.ts
+index d8d9df1..898550f 100644
+--- a/src/platform/development-session.ts
++++ b/src/platform/development-session.ts
+@@ -1,3 +1,4 @@
++import { permissionsForRoles } from "@/platform/context";
+ import { ApplicationError } from "@/platform/errors";
+ import { getRequestCorrelationId } from "@/platform/observability/request-context";
+ import { createTrustedRequestContext, type TrustedRequestContext } from "@/platform/runtime-context";
+@@ -5,13 +6,15 @@ import { createTrustedRequestContext, type TrustedRequestContext } from "@/platf
+ /**
+  * Local-only server adapter. It is the sole temporary source of runtime
+  * identity until an external identity provider is introduced in a later slice.
++ * The development hr_admin gets exactly the permissions its roles grant via the
++ * single role→permission source of truth, so new permissions need no change here.
+  */
+ export function getDevelopmentRequestContext(): TrustedRequestContext {
+   if (process.env.NODE_ENV === "production") throw new ApplicationError("DEVELOPMENT_SESSION_UNAVAILABLE", "A verified production request context is required to access this runtime screen.");
+   return createTrustedRequestContext({
+     principal: { subjectId: "development-subject-hr-admin", userId: "development-hr-admin", tenantId: "nw-ph", displayName: "Development HR Admin", email: "development.hr@example.invalid", authenticationMethod: "development-adapter", authenticatedAt: "2026-01-01T00:00:00.000Z" },
+     roles: ["hr_admin"],
+-    permissions: ["people.read", "people.write", "people.government_ids.read", "people.employee.hire", "settings.view", "settings.manage", "settings.publish", "settings.audit.view"],
++    permissions: permissionsForRoles(["hr_admin"]),
+     actorProvenance: "development_adapter",
+     correlationId: getRequestCorrelationId(),
+   });
+diff --git a/src/platform/organization/in-memory-org-unit-repository.ts b/src/platform/organization/in-memory-org-unit-repository.ts
+new file mode 100644
+index 0000000..116e59e
+--- /dev/null
++++ b/src/platform/organization/in-memory-org-unit-repository.ts
+@@ -0,0 +1,107 @@
++import { randomUUID } from "node:crypto";
++import { hasPermission, type TenantContext } from "@/platform/context";
++import { AuthorizationError } from "@/platform/errors";
++import type {
++  CreateOrgUnitInput,
++  MoveOrgUnitInput,
++  OrgUnitReadRepository,
++  OrgUnitWriteRepository,
++  RenameOrgUnitInput,
++} from "@/platform/organization/org-unit-repository";
++import type { OrgUnitRecord } from "@/platform/organization/org-unit";
++
++function requireOrganizationView(context: TenantContext): void {
++  if (!hasPermission(context, "organization.view")) throw new AuthorizationError();
++}
++
++/** Shared in-process store so a test can write via one repository and read via the other. */
++export class OrgUnitStore {
++  readonly units: OrgUnitRecord[] = [];
++}
++
++export class InMemoryOrgUnitWriteRepository implements OrgUnitWriteRepository {
++  constructor(private readonly store: OrgUnitStore = new OrgUnitStore()) {}
++
++  async findById(tenantId: string, id: string): Promise<OrgUnitRecord | undefined> {
++    return this.store.units.find((u) => u.tenantId === tenantId && u.id === id);
++  }
++
++  async findByCode(tenantId: string, code: string): Promise<OrgUnitRecord | undefined> {
++    return this.store.units.find((u) => u.tenantId === tenantId && u.code === code);
++  }
++
++  async listAll(tenantId: string): Promise<OrgUnitRecord[]> {
++    return this.store.units.filter((u) => u.tenantId === tenantId);
++  }
++
++  async create(input: CreateOrgUnitInput): Promise<OrgUnitRecord> {
++    const now = new Date().toISOString();
++    const unit: OrgUnitRecord = Object.freeze({
++      id: randomUUID(),
++      tenantId: input.tenantId,
++      code: input.code,
++      name: input.name,
++      kind: input.kind,
++      ...(input.parentId ? { parentId: input.parentId } : {}),
++      status: "ACTIVE" as const,
++      createdAt: now,
++      createdBy: input.createdBy,
++      updatedAt: now,
++    });
++    this.store.units.push(unit);
++    return unit;
++  }
++
++  async rename(input: RenameOrgUnitInput): Promise<OrgUnitRecord> {
++    return this.replace(input.tenantId, input.id, (u) => ({ ...u, name: input.name }));
++  }
++
++  async move(input: MoveOrgUnitInput): Promise<OrgUnitRecord> {
++    return this.replace(input.tenantId, input.id, (u) => {
++      const next = { ...u };
++      if (input.parentId) next.parentId = input.parentId;
++      else delete next.parentId;
++      return next;
++    });
++  }
++
++  async archive(tenantId: string, id: string): Promise<OrgUnitRecord> {
++    return this.replace(tenantId, id, (u) => ({ ...u, status: "ARCHIVED" as const }));
++  }
++
++  private replace(tenantId: string, id: string, mutate: (u: OrgUnitRecord) => OrgUnitRecord): OrgUnitRecord {
++    const index = this.store.units.findIndex((u) => u.tenantId === tenantId && u.id === id);
++    if (index === -1) throw new Error(`org unit ${id} not found for tenant ${tenantId}`);
++    const updated = Object.freeze({ ...mutate(this.store.units[index]), updatedAt: new Date(Date.now() + 1).toISOString() });
++    this.store.units[index] = updated;
++    return updated;
++  }
++}
++
++export class InMemoryOrgUnitReadRepository implements OrgUnitReadRepository {
++  constructor(private readonly store: OrgUnitStore) {}
++
++  async getById(context: TenantContext, id: string): Promise<OrgUnitRecord | undefined> {
++    requireOrganizationView(context);
++    return this.store.units.find((u) => u.tenantId === context.tenantId && u.id === id);
++  }
++
++  async getByCode(context: TenantContext, code: string): Promise<OrgUnitRecord | undefined> {
++    requireOrganizationView(context);
++    return this.store.units.find((u) => u.tenantId === context.tenantId && u.code === code);
++  }
++
++  async listChildren(context: TenantContext, parentId: string | null): Promise<OrgUnitRecord[]> {
++    requireOrganizationView(context);
++    return this.store.units
++      .filter((u) => u.tenantId === context.tenantId && (parentId === null ? !u.parentId : u.parentId === parentId))
++      .sort((a, b) => a.name.localeCompare(b.name) || a.code.localeCompare(b.code));
++  }
++
++  async listAll(context: TenantContext): Promise<OrgUnitRecord[]> {
++    requireOrganizationView(context);
++    return this.store.units
++      .filter((u) => u.tenantId === context.tenantId)
++      .sort((a, b) => a.name.localeCompare(b.name) || a.code.localeCompare(b.code));
++  }
++}
+diff --git a/src/platform/organization/in-memory-org-unit-unit-of-work.ts b/src/platform/organization/in-memory-org-unit-unit-of-work.ts
+new file mode 100644
+index 0000000..8914d7b
+--- /dev/null
++++ b/src/platform/organization/in-memory-org-unit-unit-of-work.ts
+@@ -0,0 +1,55 @@
++import { randomUUID } from "node:crypto";
++import type { UnitOfWork, UnitOfWorkContext, UnitOfWorkTransaction } from "@/platform/transactions/unit-of-work";
++import { InMemoryDomainEventCollector, type DomainEventCollector } from "@/platform/events/domain-event-collector";
++import { InMemoryAuditCollector, type AuditCollector } from "@/platform/auditing/audit-collector";
++import { AuditRecordFactory } from "@/platform/auditing/audit-record-factory";
++import { ServerAuditIdGenerator } from "@/platform/auditing/audit-record";
++import { OrgUnitStore, InMemoryOrgUnitWriteRepository } from "@/platform/organization/in-memory-org-unit-repository";
++import { OrgUnitWriteTransaction } from "@/platform/organization/org-unit-write-transaction";
++import type { OrgUnitTransactionRepositories } from "@/platform/organization/org-unit-repository";
++
++/** In-memory transaction coordinator for server-side tests and development only. */
++export class InMemoryOrgUnitUnitOfWork implements UnitOfWork<OrgUnitTransactionRepositories> {
++  constructor(
++    private readonly store: OrgUnitStore = new OrgUnitStore(),
++    private readonly eventCollector: DomainEventCollector = new InMemoryDomainEventCollector(),
++    private readonly auditCollector: AuditCollector = new InMemoryAuditCollector(),
++    private readonly auditRecords: AuditRecordFactory = new AuditRecordFactory(new ServerAuditIdGenerator(), { now: () => new Date().toISOString() }),
++    private readonly transactionIds: { next(): string } = { next: () => randomUUID() },
++  ) {}
++
++  getStore(): OrgUnitStore { return this.store; }
++
++  async execute<TResult>(
++    context: UnitOfWorkContext,
++    operation: (transaction: UnitOfWorkTransaction<OrgUnitTransactionRepositories>) => Promise<TResult>,
++  ): Promise<TResult> {
++    const transactionContext = Object.freeze({ ...context, transactionId: this.transactionIds.next() });
++    const snapshot = [...this.store.units];
++    const orgUnits = new OrgUnitWriteTransaction(new InMemoryOrgUnitWriteRepository(this.store), transactionContext);
++    const transaction = Object.freeze({ context: transactionContext, repositories: Object.freeze({ orgUnits }) });
++
++    try {
++      const result = await operation(transaction);
++      const events = orgUnits.pullEvents();
++      this.eventCollector.collect(events);
++      const { actorUserId, requestId, commandName } = transactionContext;
++      if (actorUserId && requestId && commandName) {
++        this.auditCollector.collect(events.map((event) => this.auditRecords.organizationEvent({
++          tenantId: transactionContext.tenantId,
++          actorUserId,
++          requestId,
++          correlationId: transactionContext.correlationId,
++          transactionId: transactionContext.transactionId,
++          commandName,
++        }, event)));
++      }
++      return result;
++    } catch (error) {
++      this.store.units.length = 0;
++      this.store.units.push(...snapshot);
++      orgUnits.clearEvents();
++      throw error;
++    }
++  }
++}
+diff --git a/src/platform/organization/org-unit-events.ts b/src/platform/organization/org-unit-events.ts
+new file mode 100644
+index 0000000..8512da5
+--- /dev/null
++++ b/src/platform/organization/org-unit-events.ts
+@@ -0,0 +1,47 @@
++import { createDomainEvent, type DomainEvent, type DomainEventClock, type EventIdGenerator } from "@/platform/events/domain-event";
++import type { OrgUnitRecord } from "@/platform/organization/org-unit";
++
++type EventContext = Readonly<{ tenantId: string; correlationId: string }>;
++
++function orgUnitEvent(
++  eventName: string,
++  unit: OrgUnitRecord,
++  context: EventContext,
++  ids: EventIdGenerator,
++  clock: DomainEventClock,
++  extraPayload: Readonly<Record<string, unknown>> = {},
++): DomainEvent {
++  return createDomainEvent({
++    eventName,
++    aggregateType: "org_unit",
++    aggregateId: unit.id,
++    tenantId: context.tenantId,
++    correlationId: context.correlationId,
++    requestId: context.correlationId,
++    version: 1,
++    payload: {
++      orgUnitId: unit.id,
++      code: unit.code,
++      kind: unit.kind,
++      ...(unit.parentId ? { parentId: unit.parentId } : {}),
++      status: unit.status,
++      ...extraPayload,
++    },
++  }, ids, clock);
++}
++
++export function createOrgUnitCreatedEvent(unit: OrgUnitRecord, context: EventContext, ids: EventIdGenerator, clock: DomainEventClock): DomainEvent {
++  return orgUnitEvent("organization.org_unit.created", unit, context, ids, clock);
++}
++
++export function createOrgUnitRenamedEvent(unit: OrgUnitRecord, context: EventContext, ids: EventIdGenerator, clock: DomainEventClock): DomainEvent {
++  return orgUnitEvent("organization.org_unit.renamed", unit, context, ids, clock);
++}
++
++export function createOrgUnitMovedEvent(unit: OrgUnitRecord, context: EventContext, ids: EventIdGenerator, clock: DomainEventClock): DomainEvent {
++  return orgUnitEvent("organization.org_unit.moved", unit, context, ids, clock, { parentId: unit.parentId ?? null });
++}
++
++export function createOrgUnitArchivedEvent(unit: OrgUnitRecord, context: EventContext, ids: EventIdGenerator, clock: DomainEventClock): DomainEvent {
++  return orgUnitEvent("organization.org_unit.archived", unit, context, ids, clock);
++}
+diff --git a/src/platform/organization/org-unit-platform.integration.test.ts b/src/platform/organization/org-unit-platform.integration.test.ts
+new file mode 100644
+index 0000000..724c71e
+--- /dev/null
++++ b/src/platform/organization/org-unit-platform.integration.test.ts
+@@ -0,0 +1,111 @@
++import { randomUUID } from "node:crypto";
++import { afterAll, describe, expect, it } from "vitest";
++import { getPrismaClient } from "@/platform/persistence/prisma-client";
++import { PrismaOrgUnitUnitOfWork } from "@/platform/organization/prisma-org-unit-unit-of-work";
++import { PrismaOrgUnitReadRepository } from "@/platform/organization/prisma-org-unit-read-repository";
++import { InMemoryDomainEventCollector } from "@/platform/events/domain-event-collector";
++import { InMemoryAuditCollector } from "@/platform/auditing/audit-collector";
++import { OrgUnitService } from "@/platform/organization/org-unit-service";
++import { createTrustedRequestContext } from "@/platform/runtime-context";
++import { PermissionSet, type TenantContext } from "@/platform/context";
++
++/**
++ * Real-Postgres coverage for what an in-memory suite cannot verify: actual
++ * $transaction atomicity (org-unit + audit + outbox commit together), the
++ * DB-level guards (kind CHECK, self-parent CHECK, tenant-scoped parent FK,
++ * unique code), and real tenant-isolated queries.
++ */
++describe("org unit platform (integration)", () => {
++  const prisma = getPrismaClient();
++  const tenantA = `test-tenant-7b1-${randomUUID()}`;
++  const tenantB = `test-tenant-7b1-${randomUUID()}`;
++
++  afterAll(async () => {
++    await prisma.orgUnit.deleteMany({ where: { tenantId: { in: [tenantA, tenantB] } } }).catch(() => undefined);
++    await prisma.tenant.deleteMany({ where: { id: { in: [tenantA, tenantB] } } }).catch(() => undefined);
++  });
++
++  async function seedTenant(tenantId: string) {
++    await prisma.tenant.upsert({ where: { id: tenantId }, create: { id: tenantId }, update: {} });
++  }
++
++  function request(tenantId: string) {
++    return createTrustedRequestContext({
++      principal: { subjectId: "s", userId: "user-1", tenantId, authenticationMethod: "test", authenticatedAt: "2026-01-01T00:00:00.000Z" },
++      roles: ["hr_admin"],
++      permissions: ["organization.view", "organization.manage"],
++      actorProvenance: "server_verified",
++      correlationId: "corr-1",
++    });
++  }
++
++  function readContext(tenantId: string): TenantContext {
++    return { tenantId, actorId: "user-1", actorName: "A", roles: ["hr_admin"], permissions: new PermissionSet(["organization.view"]), correlationId: "c", authenticationMethod: "test", actorProvenance: "server_verified" };
++  }
++
++  it("commits the org unit, audit record, and outbox message atomically on create", async () => {
++    await seedTenant(tenantA);
++    const events = new InMemoryDomainEventCollector();
++    const audit = new InMemoryAuditCollector();
++    const service = new OrgUnitService(new PrismaOrgUnitUnitOfWork(prisma, events, audit));
++
++    const code = `FIN-${randomUUID().slice(0, 8)}`.toUpperCase();
++    const result = await service.createOrgUnit(request(tenantA), { code, name: "Finance", kind: "DIVISION" });
++    expect(result.kind).toBe("success");
++    if (result.kind !== "success") return;
++
++    const dbUnit = await prisma.orgUnit.findUniqueOrThrow({ where: { id: result.value.unit.id } });
++    expect(dbUnit.kind).toBe("DIVISION");
++    const dbAudit = await prisma.auditRecord.findFirst({ where: { aggregateId: result.value.unit.id, eventName: "organization.org_unit.created" } });
++    expect(dbAudit).not.toBeNull();
++    const dbOutbox = await prisma.outboxMessage.findFirst({ where: { aggregateId: result.value.unit.id, eventName: "organization.org_unit.created" } });
++    expect(dbOutbox).not.toBeNull();
++    expect(dbOutbox?.tenantId).toBe(tenantA);
++  });
++
++  it("builds and reads a real parent-child hierarchy, tenant-scoped", async () => {
++    await seedTenant(tenantA);
++    const service = new OrgUnitService(new PrismaOrgUnitUnitOfWork(prisma, new InMemoryDomainEventCollector(), new InMemoryAuditCollector()));
++    const suffix = randomUUID().slice(0, 8).toUpperCase();
++    const root = await service.createOrgUnit(request(tenantA), { code: `ROOT-${suffix}`, name: "Root", kind: "DIVISION" });
++    if (root.kind !== "success") throw new Error("root create failed");
++    const child = await service.createOrgUnit(request(tenantA), { code: `CH-${suffix}`, name: "Child", kind: "DEPARTMENT", parentId: root.value.unit.id });
++    expect(child.kind).toBe("success");
++    if (child.kind !== "success") return;
++
++    const reader = new PrismaOrgUnitReadRepository(prisma);
++    const children = await reader.listChildren(readContext(tenantA), root.value.unit.id);
++    expect(children.map((c) => c.id)).toContain(child.value.unit.id);
++    expect(await reader.getByCode(readContext(tenantA), `CH-${suffix}`)).toBeDefined();
++  });
++
++  it("the database rejects an invalid kind and a self-parent (DB-level guards)", async () => {
++    await seedTenant(tenantA);
++    const id = randomUUID();
++    await expect(prisma.orgUnit.create({ data: { id, tenantId: tenantA, code: `BAD-${id.slice(0, 6)}`, name: "Bad", kind: "GUILD", createdBy: "tester" } })).rejects.toThrow();
++
++    const good = await prisma.orgUnit.create({ data: { tenantId: tenantA, code: `SELF-${id.slice(0, 6)}`, name: "Self", kind: "TEAM", createdBy: "tester" } });
++    await expect(prisma.orgUnit.update({ where: { id: good.id }, data: { parentId: good.id } })).rejects.toThrow();
++  });
++
++  it("the database rejects a duplicate code within a tenant", async () => {
++    await seedTenant(tenantA);
++    const code = `UNIQ-${randomUUID().slice(0, 8)}`.toUpperCase();
++    await prisma.orgUnit.create({ data: { tenantId: tenantA, code, name: "One", kind: "TEAM", createdBy: "tester" } });
++    await expect(prisma.orgUnit.create({ data: { tenantId: tenantA, code, name: "Two", kind: "TEAM", createdBy: "tester" } })).rejects.toThrow();
++  });
++
++  it("keeps org units strictly tenant-isolated in reads", async () => {
++    await seedTenant(tenantA);
++    await seedTenant(tenantB);
++    const service = new OrgUnitService(new PrismaOrgUnitUnitOfWork(prisma, new InMemoryDomainEventCollector(), new InMemoryAuditCollector()));
++    const code = `ISO-${randomUUID().slice(0, 8)}`.toUpperCase();
++    const created = await service.createOrgUnit(request(tenantA), { code, name: "A only", kind: "DIVISION" });
++    if (created.kind !== "success") throw new Error("create failed");
++
++    const reader = new PrismaOrgUnitReadRepository(prisma);
++    expect(await reader.getByCode(readContext(tenantA), code)).toBeDefined();
++    expect(await reader.getByCode(readContext(tenantB), code)).toBeUndefined();
++    expect(await reader.getById(readContext(tenantB), created.value.unit.id)).toBeUndefined();
++  });
++});
+diff --git a/src/platform/organization/org-unit-repository.ts b/src/platform/organization/org-unit-repository.ts
+new file mode 100644
+index 0000000..bfbbd12
+--- /dev/null
++++ b/src/platform/organization/org-unit-repository.ts
+@@ -0,0 +1,57 @@
++import type { TenantContext } from "@/platform/context";
++import type { OrgUnitKind, OrgUnitRecord } from "@/platform/organization/org-unit";
++
++export interface CreateOrgUnitInput {
++  tenantId: string;
++  code: string;
++  name: string;
++  kind: OrgUnitKind;
++  parentId?: string;
++  createdBy: string;
++}
++
++export interface RenameOrgUnitInput {
++  tenantId: string;
++  id: string;
++  name: string;
++}
++
++export interface MoveOrgUnitInput {
++  tenantId: string;
++  id: string;
++  /** The new parent, or null to make this a root. */
++  parentId: string | null;
++}
++
++/**
++ * Server-only write port for org units. Used only inside a tenant-scoped write
++ * transaction. `id` and `code` are immutable — there is deliberately no method
++ * to change them (ADR-012 §12). There is no delete: a unit is archived, never
++ * removed, so identifiers are never reused.
++ */
++export interface OrgUnitWriteRepository {
++  findById(tenantId: string, id: string): Promise<OrgUnitRecord | undefined>;
++  findByCode(tenantId: string, code: string): Promise<OrgUnitRecord | undefined>;
++  /** All units for the tenant — the adjacency list the write service uses to enforce hierarchy invariants in-transaction. */
++  listAll(tenantId: string): Promise<OrgUnitRecord[]>;
++  create(input: CreateOrgUnitInput): Promise<OrgUnitRecord>;
++  rename(input: RenameOrgUnitInput): Promise<OrgUnitRecord>;
++  move(input: MoveOrgUnitInput): Promise<OrgUnitRecord>;
++  archive(tenantId: string, id: string): Promise<OrgUnitRecord>;
++}
++
++/** Transaction-scoped repositories exposed to the org-unit write service via UnitOfWork.execute(). */
++export type OrgUnitTransactionRepositories = Readonly<{ orgUnits: OrgUnitWriteRepository }>;
++
++/**
++ * Server-only read port. Read-only, tenant-scoped, used outside any write
++ * transaction. Every method requires organization.view.
++ */
++export interface OrgUnitReadRepository {
++  getById(context: TenantContext, id: string): Promise<OrgUnitRecord | undefined>;
++  getByCode(context: TenantContext, code: string): Promise<OrgUnitRecord | undefined>;
++  /** Direct children of a parent, or the roots when parentId is null. */
++  listChildren(context: TenantContext, parentId: string | null): Promise<OrgUnitRecord[]>;
++  /** The full adjacency list for the tenant, from which the tree is built (ADR-012 §10 — adjacency now, closure table later). */
++  listAll(context: TenantContext): Promise<OrgUnitRecord[]>;
++}
+diff --git a/src/platform/organization/org-unit-service.test.ts b/src/platform/organization/org-unit-service.test.ts
+new file mode 100644
+index 0000000..dbe3431
+--- /dev/null
++++ b/src/platform/organization/org-unit-service.test.ts
+@@ -0,0 +1,159 @@
++import { describe, expect, it } from "vitest";
++import { createTrustedRequestContext, type TrustedRequestContext } from "@/platform/runtime-context";
++import type { Permission, PlatformRole } from "@/platform/context";
++import { InMemoryAuditCollector } from "@/platform/auditing/audit-collector";
++import { InMemoryDomainEventCollector } from "@/platform/events/domain-event-collector";
++import { InMemoryOrgUnitUnitOfWork } from "@/platform/organization/in-memory-org-unit-unit-of-work";
++import { InMemoryOrgUnitReadRepository } from "@/platform/organization/in-memory-org-unit-repository";
++import { OrgUnitService } from "@/platform/organization/org-unit-service";
++
++function requestFor(roles: readonly PlatformRole[], permissions: readonly Permission[] = [], tenantId = "tenant-a"): TrustedRequestContext {
++  return createTrustedRequestContext({
++    principal: { subjectId: "s-1", userId: "user-1", tenantId, authenticationMethod: "test", authenticatedAt: "2026-01-01T00:00:00.000Z" },
++    roles,
++    permissions,
++    actorProvenance: "server_verified",
++    correlationId: "corr-1",
++  });
++}
++
++function harness() {
++  const audit = new InMemoryAuditCollector();
++  const events = new InMemoryDomainEventCollector();
++  const unitOfWork = new InMemoryOrgUnitUnitOfWork(undefined, events, audit);
++  const service = new OrgUnitService(unitOfWork);
++  const readContext = (tenantId: string) => ({ tenantId, actorId: "user-1", actorName: "A", roles: ["hr_admin"] as PlatformRole[], permissions: { has: () => true, toArray: () => [] } as never, correlationId: "c", authenticationMethod: "test", actorProvenance: "server_verified" as const });
++  const reader = new InMemoryOrgUnitReadRepository(unitOfWork.getStore());
++  return { service, audit, events, unitOfWork, reader, readContext };
++}
++
++const MANAGE: Permission[] = ["organization.view", "organization.manage"];
++
++describe("OrgUnitService — authorization", () => {
++  it("denies create without organization.manage", async () => {
++    const { service } = harness();
++    const result = await service.createOrgUnit(requestFor(["employee"], []), { code: "FIN", name: "Finance", kind: "DEPARTMENT" });
++    expect(result.kind).toBe("authorization_failure");
++  });
++
++  it("denies move and archive without organization.manage", async () => {
++    const { service } = harness();
++    const request = requestFor(["payroll"], ["organization.view"]);
++    expect((await service.moveOrgUnit(request, { id: "x", parentId: null })).kind).toBe("authorization_failure");
++    expect((await service.archiveOrgUnit(request, { id: "x" })).kind).toBe("authorization_failure");
++  });
++});
++
++describe("OrgUnitService — create", () => {
++  it("creates a root org unit and audits + emits an outbox-eligible event", async () => {
++    const { service, audit, events } = harness();
++    const result = await service.createOrgUnit(requestFor(["hr_admin"], MANAGE), { code: "FIN", name: "Finance", kind: "DIVISION" });
++    expect(result.kind).toBe("success");
++    if (result.kind === "success") expect(result.value.unit.parentId).toBeUndefined();
++    expect(events.list().map((e) => e.eventName)).toEqual(["organization.org_unit.created"]);
++    expect(audit.list()).toHaveLength(1);
++    expect(audit.list()[0].eventName).toBe("organization.org_unit.created");
++    // Safe metadata only — code/kind/status, never anything sensitive.
++    expect(audit.list()[0].metadata).toHaveProperty("code", "FIN");
++  });
++
++  it("rejects a duplicate code as a conflict", async () => {
++    const { service } = harness();
++    const request = requestFor(["hr_admin"], MANAGE);
++    await service.createOrgUnit(request, { code: "FIN", name: "Finance", kind: "DIVISION" });
++    const dup = await service.createOrgUnit(request, { code: "FIN", name: "Finance 2", kind: "DEPARTMENT" });
++    expect(dup.kind).toBe("conflict");
++  });
++
++  it("rejects a child whose parent does not exist", async () => {
++    const { service } = harness();
++    const result = await service.createOrgUnit(requestFor(["hr_admin"], MANAGE), { code: "TEAM1", name: "Team", kind: "TEAM", parentId: "ghost" });
++    expect(result.kind).toBe("validation_failure");
++  });
++
++  it("returns validation failure for an invalid kind without writing", async () => {
++    const { service, unitOfWork } = harness();
++    const result = await service.createOrgUnit(requestFor(["hr_admin"], MANAGE), { code: "X", name: "X", kind: "GUILD" });
++    expect(result.kind).toBe("validation_failure");
++    expect(unitOfWork.getStore().units).toHaveLength(0);
++  });
++});
++
++describe("OrgUnitService — hierarchy: rename, move, cycle, archive", () => {
++  async function seedTree() {
++    const h = harness();
++    const request = requestFor(["hr_admin"], MANAGE);
++    const root = await h.service.createOrgUnit(request, { code: "ROOT", name: "Root", kind: "DIVISION" });
++    if (root.kind !== "success") throw new Error("seed root failed");
++    const a = await h.service.createOrgUnit(request, { code: "A", name: "A", kind: "DEPARTMENT", parentId: root.value.unit.id });
++    const b = await h.service.createOrgUnit(request, { code: "B", name: "B", kind: "TEAM", parentId: a.kind === "success" ? a.value.unit.id : undefined });
++    if (a.kind !== "success" || b.kind !== "success") throw new Error("seed children failed");
++    return { ...h, request, rootId: root.value.unit.id, aId: a.value.unit.id, bId: b.value.unit.id };
++  }
++
++  it("renames a unit (name changes, code stays as immutable identity)", async () => {
++    const { service, request, aId } = await seedTree();
++    const result = await service.renameOrgUnit(request, { id: aId, name: "Accounting" });
++    expect(result.kind).toBe("success");
++    if (result.kind === "success") { expect(result.value.unit.name).toBe("Accounting"); expect(result.value.unit.code).toBe("A"); }
++  });
++
++  it("moves a unit to a new parent", async () => {
++    const { service, request, rootId, bId } = await seedTree();
++    const result = await service.moveOrgUnit(request, { id: bId, parentId: rootId });
++    expect(result.kind).toBe("success");
++    if (result.kind === "success") expect(result.value.unit.parentId).toBe(rootId);
++  });
++
++  it("moves a unit to a root (null parent)", async () => {
++    const { service, request, aId } = await seedTree();
++    const result = await service.moveOrgUnit(request, { id: aId, parentId: null });
++    expect(result.kind).toBe("success");
++    if (result.kind === "success") expect(result.value.unit.parentId).toBeUndefined();
++  });
++
++  it("rejects moving a unit under itself (cycle)", async () => {
++    const { service, request, aId } = await seedTree();
++    expect((await service.moveOrgUnit(request, { id: aId, parentId: aId })).kind).toBe("conflict");
++  });
++
++  it("rejects moving a unit under one of its own descendants (cycle)", async () => {
++    const { service, request, aId, bId } = await seedTree();
++    // b is a descendant of a; moving a under b would create a cycle.
++    expect((await service.moveOrgUnit(request, { id: aId, parentId: bId })).kind).toBe("conflict");
++  });
++
++  it("archives a unit (soft lifecycle — never a hard delete)", async () => {
++    const { service, request, bId, events } = await seedTree();
++    const result = await service.archiveOrgUnit(request, { id: bId });
++    expect(result.kind).toBe("success");
++    if (result.kind === "success") expect(result.value.unit.status).toBe("ARCHIVED");
++    expect(events.list().some((e) => e.eventName === "organization.org_unit.archived")).toBe(true);
++  });
++});
++
++describe("OrgUnitService — tenant isolation", () => {
++  it("does not let tenant B rename or read tenant A's unit", async () => {
++    const { service, reader } = harness();
++    const created = await service.createOrgUnit(requestFor(["hr_admin"], MANAGE, "tenant-a"), { code: "FIN", name: "Finance", kind: "DIVISION" });
++    if (created.kind !== "success") throw new Error("create failed");
++
++    // Tenant B renaming tenant A's unit -> not found (scoped away).
++    const asB = requestFor(["hr_admin"], MANAGE, "tenant-b");
++    const rename = await service.renameOrgUnit(asB, { id: created.value.unit.id, name: "Hijacked" });
++    expect(rename.kind).toBe("validation_failure");
++
++    // Tenant B reading -> absent.
++    const bContext = { tenantId: "tenant-b", actorId: "u", actorName: "u", roles: ["hr_admin"] as PlatformRole[], permissions: { has: () => true, toArray: () => [] } as never, correlationId: "c", authenticationMethod: "test", actorProvenance: "server_verified" as const };
++    expect(await reader.getById(bContext, created.value.unit.id)).toBeUndefined();
++  });
++});
++
++describe("OrgUnitService — transaction rollback", () => {
++  it("releases no events/audit when the operation is rejected before writing (invalid kind)", async () => {
++    const { service, audit, events } = harness();
++    await service.createOrgUnit(requestFor(["hr_admin"], MANAGE), { code: "X", name: "X", kind: "NONSENSE" });
++    expect(events.list()).toHaveLength(0);
++    expect(audit.list()).toHaveLength(0);
++  });
++});
+diff --git a/src/platform/organization/org-unit-service.ts b/src/platform/organization/org-unit-service.ts
+new file mode 100644
+index 0000000..ed231e7
+--- /dev/null
++++ b/src/platform/organization/org-unit-service.ts
+@@ -0,0 +1,120 @@
++import { hasPermission } from "@/platform/context";
++import { commandAuthorizationFailure, commandConflict, commandSuccess, commandValidationFailure, type CommandResult } from "@/platform/commands/command-result";
++import { issue } from "@/platform/validation";
++import { createTenantContext, type TrustedRequestContext } from "@/platform/runtime-context";
++import type { UnitOfWork, UnitOfWorkContext } from "@/platform/transactions/unit-of-work";
++import type { OrgUnitTransactionRepositories } from "@/platform/organization/org-unit-repository";
++import { validateCreateOrgUnitDraft, validateOrgUnitName, wouldCreateCycle, type OrgUnitRecord } from "@/platform/organization/org-unit";
++
++export type OrgUnitCreated = Readonly<{ state: "created"; unit: OrgUnitRecord }>;
++export type OrgUnitRenamed = Readonly<{ state: "renamed"; unit: OrgUnitRecord }>;
++export type OrgUnitMoved = Readonly<{ state: "moved"; unit: OrgUnitRecord }>;
++export type OrgUnitArchived = Readonly<{ state: "archived"; unit: OrgUnitRecord }>;
++
++/**
++ * The single write entry point for org units. It is genuinely required (not a
++ * speculative service): it owns the structural invariants that must be enforced
++ * against the live tree *inside the write transaction* — unique code, parent
++ * existence, and cycle prevention (ADR-012 §6, §12) — and it produces audit and
++ * outbox atomically through the UnitOfWork. Every mutation requires
++ * organization.manage; tenant identity comes only from the trusted request.
++ */
++export class OrgUnitService {
++  constructor(private readonly unitOfWork: UnitOfWork<OrgUnitTransactionRepositories>) {}
++
++  async createOrgUnit(request: TrustedRequestContext, input: { code: string; name: string; kind: string; parentId?: string }): Promise<CommandResult<OrgUnitCreated>> {
++    const denied = this.requireManage(request);
++    if (denied) return denied;
++    const validation = validateCreateOrgUnitDraft(input);
++    if (!validation.success) return commandValidationFailure(validation.issues);
++
++    const tenantId = request.principal.tenantId;
++    const result = await this.unitOfWork.execute(this.context(request, "CreateOrgUnit"), async ({ repositories }) => {
++      if (await repositories.orgUnits.findByCode(tenantId, validation.data.code)) return "code_taken" as const;
++      if (input.parentId) {
++        const parent = await repositories.orgUnits.findById(tenantId, input.parentId);
++        if (!parent) return "parent_not_found" as const;
++      }
++      return repositories.orgUnits.create({
++        tenantId,
++        code: validation.data.code,
++        name: validation.data.name,
++        kind: validation.data.kind,
++        parentId: input.parentId,
++        createdBy: request.principal.userId,
++      });
++    });
++
++    if (result === "code_taken") return commandConflict(`An org unit with code "${validation.data.code}" already exists.`);
++    if (result === "parent_not_found") return commandValidationFailure([issue("parentId", "not_found", "The chosen parent org unit does not exist.")]);
++    return commandSuccess(Object.freeze({ state: "created" as const, unit: result }));
++  }
++
++  async renameOrgUnit(request: TrustedRequestContext, input: { id: string; name: string }): Promise<CommandResult<OrgUnitRenamed>> {
++    const denied = this.requireManage(request);
++    if (denied) return denied;
++    const validation = validateOrgUnitName(input.name);
++    if (!validation.success) return commandValidationFailure(validation.issues);
++
++    const tenantId = request.principal.tenantId;
++    const result = await this.unitOfWork.execute(this.context(request, "RenameOrgUnit"), async ({ repositories }) => {
++      if (!(await repositories.orgUnits.findById(tenantId, input.id))) return "not_found" as const;
++      return repositories.orgUnits.rename({ tenantId, id: input.id, name: validation.data });
++    });
++
++    if (result === "not_found") return commandValidationFailure([issue("id", "not_found", "This org unit no longer exists.")]);
++    return commandSuccess(Object.freeze({ state: "renamed" as const, unit: result }));
++  }
++
++  async moveOrgUnit(request: TrustedRequestContext, input: { id: string; parentId: string | null }): Promise<CommandResult<OrgUnitMoved>> {
++    const denied = this.requireManage(request);
++    if (denied) return denied;
++
++    const tenantId = request.principal.tenantId;
++    const result = await this.unitOfWork.execute(this.context(request, "MoveOrgUnit"), async ({ repositories }) => {
++      if (!(await repositories.orgUnits.findById(tenantId, input.id))) return "not_found" as const;
++      if (input.parentId) {
++        const parent = await repositories.orgUnits.findById(tenantId, input.parentId);
++        if (!parent) return "parent_not_found" as const;
++        const all = await repositories.orgUnits.listAll(tenantId);
++        if (wouldCreateCycle(all, input.id, input.parentId)) return "cycle" as const;
++      }
++      return repositories.orgUnits.move({ tenantId, id: input.id, parentId: input.parentId });
++    });
++
++    if (result === "not_found") return commandValidationFailure([issue("id", "not_found", "This org unit no longer exists.")]);
++    if (result === "parent_not_found") return commandValidationFailure([issue("parentId", "not_found", "The chosen parent org unit does not exist.")]);
++    if (result === "cycle") return commandConflict("An org unit cannot be moved beneath itself or one of its descendants.");
++    return commandSuccess(Object.freeze({ state: "moved" as const, unit: result }));
++  }
++
++  async archiveOrgUnit(request: TrustedRequestContext, input: { id: string }): Promise<CommandResult<OrgUnitArchived>> {
++    const denied = this.requireManage(request);
++    if (denied) return denied;
++
++    const tenantId = request.principal.tenantId;
++    const result = await this.unitOfWork.execute(this.context(request, "ArchiveOrgUnit"), async ({ repositories }) => {
++      if (!(await repositories.orgUnits.findById(tenantId, input.id))) return "not_found" as const;
++      return repositories.orgUnits.archive(tenantId, input.id);
++    });
++
++    if (result === "not_found") return commandValidationFailure([issue("id", "not_found", "This org unit no longer exists.")]);
++    return commandSuccess(Object.freeze({ state: "archived" as const, unit: result }));
++  }
++
++  private requireManage(request: TrustedRequestContext): CommandResult<never> | undefined {
++    return hasPermission(createTenantContext(request), "organization.manage")
++      ? undefined
++      : commandAuthorizationFailure("You are not authorized to manage the organization structure.");
++  }
++
++  private context(request: TrustedRequestContext, commandName: string): UnitOfWorkContext {
++    return {
++      tenantId: request.principal.tenantId,
++      correlationId: request.correlationId,
++      requestId: request.correlationId,
++      actorUserId: request.principal.userId,
++      commandName,
++    };
++  }
++}
+diff --git a/src/platform/organization/org-unit-structure.test.ts b/src/platform/organization/org-unit-structure.test.ts
+new file mode 100644
+index 0000000..28176e4
+--- /dev/null
++++ b/src/platform/organization/org-unit-structure.test.ts
+@@ -0,0 +1,46 @@
++import { readFileSync, readdirSync } from "node:fs";
++import { join, relative } from "node:path";
++import { describe, expect, it } from "vitest";
++
++/**
++ * Structural guards (ADR-012): there is exactly ONE OrgUnit aggregate and ONE
++ * hierarchy implementation. These catch the specific failure mode the ADR
++ * rejects — a second org-unit type or a parallel tree/cycle implementation
++ * drifting away from the canonical one.
++ */
++const REPO_ROOT = join(__dirname, "..", "..", "..");
++
++function sourceFiles(): { path: string; content: string }[] {
++  const walk = (dir: string): string[] =>
++    readdirSync(dir, { withFileTypes: true }).flatMap((entry) => {
++      const full = join(dir, entry.name);
++      if (entry.isDirectory()) return entry.name === "node_modules" || entry.name === ".next" ? [] : walk(full);
++      if (/\.(ts|tsx)$/.test(entry.name) && !/\.test\.tsx?$/.test(entry.name)) return [full];
++      return [];
++    });
++  return walk(join(REPO_ROOT, "src")).map((absolute) => ({
++    path: relative(REPO_ROOT, absolute).split("\\").join("/"),
++    content: readFileSync(absolute, "utf8"),
++  }));
++}
++
++describe("a single OrgUnit aggregate and a single hierarchy implementation", () => {
++  const files = sourceFiles();
++
++  it("declares the OrgUnitRecord aggregate in exactly one file", () => {
++    const declarers = files.filter((f) => /(export\s+)?interface\s+OrgUnitRecord\b/.test(f.content));
++    expect(declarers.map((f) => f.path)).toEqual(["src/platform/organization/org-unit.ts"]);
++  });
++
++  it("declares the hierarchy helpers (tree build + cycle detection) in exactly one file", () => {
++    const treeBuilders = files.filter((f) => /export\s+function\s+buildOrgUnitTree\b/.test(f.content));
++    const cycleCheckers = files.filter((f) => /export\s+function\s+wouldCreateCycle\b/.test(f.content));
++    expect(treeBuilders.map((f) => f.path)).toEqual(["src/platform/organization/org-unit.ts"]);
++    expect(cycleCheckers.map((f) => f.path)).toEqual(["src/platform/organization/org-unit.ts"]);
++  });
++
++  it("keeps all OrgUnit domain code within the organization domain (no OrgUnit aggregate leaks into other domains)", () => {
++    const foreign = files.filter((f) => /interface\s+OrgUnitRecord\b/.test(f.content) && !f.path.startsWith("src/platform/organization/"));
++    expect(foreign).toEqual([]);
++  });
++});
+diff --git a/src/platform/organization/org-unit-write-transaction.ts b/src/platform/organization/org-unit-write-transaction.ts
+new file mode 100644
+index 0000000..3b720fe
+--- /dev/null
++++ b/src/platform/organization/org-unit-write-transaction.ts
+@@ -0,0 +1,91 @@
++import { ServerEventIdGenerator, type DomainEvent, type DomainEventClock, type EventIdGenerator } from "@/platform/events/domain-event";
++import type { UnitOfWorkTransactionContext } from "@/platform/transactions/unit-of-work";
++import type {
++  CreateOrgUnitInput,
++  MoveOrgUnitInput,
++  OrgUnitWriteRepository,
++  RenameOrgUnitInput,
++} from "@/platform/organization/org-unit-repository";
++import type { OrgUnitRecord } from "@/platform/organization/org-unit";
++import {
++  createOrgUnitArchivedEvent,
++  createOrgUnitCreatedEvent,
++  createOrgUnitMovedEvent,
++  createOrgUnitRenamedEvent,
++} from "@/platform/organization/org-unit-events";
++
++const systemClock: DomainEventClock = { now: () => new Date().toISOString() };
++
++/**
++ * Transaction-scoped decorator around an OrgUnitWriteRepository that buffers one
++ * DomainEvent per successful mutation, mirroring the configuration/employee
++ * pattern so the OrgUnit UnitOfWork can commit writes, audits, and outbox
++ * messages atomically and release events only after that commit succeeds.
++ * Read methods (findById/findByCode/listAll) pass through and emit no event.
++ */
++export class OrgUnitWriteTransaction implements OrgUnitWriteRepository {
++  private readonly events: DomainEvent[] = [];
++
++  constructor(
++    private readonly repository: OrgUnitWriteRepository,
++    private readonly context: UnitOfWorkTransactionContext,
++    private readonly eventIds: EventIdGenerator = new ServerEventIdGenerator(),
++    private readonly eventClock: DomainEventClock = systemClock,
++  ) {}
++
++  findById(tenantId: string, id: string): Promise<OrgUnitRecord | undefined> {
++    this.assertTenant(tenantId);
++    return this.repository.findById(tenantId, id);
++  }
++
++  findByCode(tenantId: string, code: string): Promise<OrgUnitRecord | undefined> {
++    this.assertTenant(tenantId);
++    return this.repository.findByCode(tenantId, code);
++  }
++
++  listAll(tenantId: string): Promise<OrgUnitRecord[]> {
++    this.assertTenant(tenantId);
++    return this.repository.listAll(tenantId);
++  }
++
++  async create(input: CreateOrgUnitInput): Promise<OrgUnitRecord> {
++    this.assertTenant(input.tenantId);
++    const unit = await this.repository.create(input);
++    this.events.push(createOrgUnitCreatedEvent(unit, this.eventContext(), this.eventIds, this.eventClock));
++    return unit;
++  }
++
++  async rename(input: RenameOrgUnitInput): Promise<OrgUnitRecord> {
++    this.assertTenant(input.tenantId);
++    const unit = await this.repository.rename(input);
++    this.events.push(createOrgUnitRenamedEvent(unit, this.eventContext(), this.eventIds, this.eventClock));
++    return unit;
++  }
++
++  async move(input: MoveOrgUnitInput): Promise<OrgUnitRecord> {
++    this.assertTenant(input.tenantId);
++    const unit = await this.repository.move(input);
++    this.events.push(createOrgUnitMovedEvent(unit, this.eventContext(), this.eventIds, this.eventClock));
++    return unit;
++  }
++
++  async archive(tenantId: string, id: string): Promise<OrgUnitRecord> {
++    this.assertTenant(tenantId);
++    const unit = await this.repository.archive(tenantId, id);
++    this.events.push(createOrgUnitArchivedEvent(unit, this.eventContext(), this.eventIds, this.eventClock));
++    return unit;
++  }
++
++  pullEvents(): readonly DomainEvent[] { return this.events.splice(0, this.events.length); }
++  clearEvents(): void { this.events.length = 0; }
++
++  private eventContext(): Readonly<{ tenantId: string; correlationId: string }> {
++    return Object.freeze({ tenantId: this.context.tenantId, correlationId: this.context.correlationId });
++  }
++
++  private assertTenant(tenantId: string): void {
++    if (tenantId !== this.context.tenantId) {
++      throw Object.freeze({ code: "TENANT_MISMATCH", message: "Transaction access must use its trusted tenant." });
++    }
++  }
++}
+diff --git a/src/platform/organization/org-unit.test.ts b/src/platform/organization/org-unit.test.ts
+new file mode 100644
+index 0000000..94a61b8
+--- /dev/null
++++ b/src/platform/organization/org-unit.test.ts
+@@ -0,0 +1,80 @@
++import { describe, expect, it } from "vitest";
++import {
++  buildOrgUnitTree,
++  collectDescendantIds,
++  validateCreateOrgUnitDraft,
++  wouldCreateCycle,
++  type OrgUnitRecord,
++} from "@/platform/organization/org-unit";
++
++function unit(id: string, parentId?: string, name = id): OrgUnitRecord {
++  return Object.freeze({
++    id, tenantId: "t1", code: id.toUpperCase(), name, kind: "DEPARTMENT", ...(parentId ? { parentId } : {}),
++    status: "ACTIVE", createdAt: "2026-01-01T00:00:00.000Z", createdBy: "actor", updatedAt: "2026-01-01T00:00:00.000Z",
++  });
++}
++
++describe("validateCreateOrgUnitDraft", () => {
++  it("accepts a valid draft and normalizes code (trim + uppercase) and name", () => {
++    const result = validateCreateOrgUnitDraft({ code: " fin ", name: " Finance ", kind: "DEPARTMENT" });
++    expect(result.success).toBe(true);
++    if (result.success) { expect(result.data.code).toBe("FIN"); expect(result.data.name).toBe("Finance"); }
++  });
++
++  it("rejects a missing/blank name and code", () => {
++    const result = validateCreateOrgUnitDraft({ code: "", name: "", kind: "DEPARTMENT" });
++    expect(result.success).toBe(false);
++    if (!result.success) {
++      expect(result.issues.some((i) => i.path.join(".") === "code" && i.code === "REQUIRED")).toBe(true);
++      expect(result.issues.some((i) => i.path.join(".") === "name" && i.code === "REQUIRED")).toBe(true);
++    }
++  });
++
++  it("rejects an unsupported kind", () => {
++    const result = validateCreateOrgUnitDraft({ code: "X1", name: "X", kind: "GUILD" });
++    expect(result.success).toBe(false);
++    if (!result.success) expect(result.issues.some((i) => i.path.join(".") === "kind" && i.code === "UNSUPPORTED")).toBe(true);
++  });
++
++  it("rejects a malformed code", () => {
++    expect(validateCreateOrgUnitDraft({ code: "has space", name: "X", kind: "TEAM" }).success).toBe(false);
++    expect(validateCreateOrgUnitDraft({ code: "-bad", name: "X", kind: "TEAM" }).success).toBe(false);
++  });
++});
++
++describe("buildOrgUnitTree", () => {
++  it("assembles a single-parent tree with roots and ordered children", () => {
++    const units = [unit("a", undefined, "Alpha"), unit("b", "a", "Bravo"), unit("c", "a", "Charlie"), unit("d", "b", "Delta")];
++    const tree = buildOrgUnitTree(units);
++    expect(tree.map((n) => n.id)).toEqual(["a"]);
++    expect(tree[0].children.map((n) => n.id)).toEqual(["b", "c"]); // ordered by name
++    expect(tree[0].children[0].children.map((n) => n.id)).toEqual(["d"]);
++  });
++
++  it("treats a unit whose parent is absent from the set as a root", () => {
++    const tree = buildOrgUnitTree([unit("orphan", "missing")]);
++    expect(tree.map((n) => n.id)).toEqual(["orphan"]);
++  });
++});
++
++describe("collectDescendantIds / wouldCreateCycle", () => {
++  const units = [unit("root"), unit("a", "root"), unit("b", "a"), unit("c", "b"), unit("x", "root")];
++
++  it("collects all transitive descendants of a node", () => {
++    expect([...collectDescendantIds(units, "a")].sort()).toEqual(["b", "c"]);
++    expect([...collectDescendantIds(units, "c")]).toEqual([]);
++  });
++
++  it("detects a cycle when a node is moved under itself", () => {
++    expect(wouldCreateCycle(units, "a", "a")).toBe(true);
++  });
++
++  it("detects a cycle when a node is moved under one of its descendants", () => {
++    expect(wouldCreateCycle(units, "a", "c")).toBe(true); // c is under a
++  });
++
++  it("permits a move that does not create a cycle", () => {
++    expect(wouldCreateCycle(units, "a", "x")).toBe(false); // x is a sibling subtree
++    expect(wouldCreateCycle(units, "c", "x")).toBe(false);
++  });
++});
+diff --git a/src/platform/organization/org-unit.ts b/src/platform/organization/org-unit.ts
+new file mode 100644
+index 0000000..ca0b144
+--- /dev/null
++++ b/src/platform/organization/org-unit.ts
+@@ -0,0 +1,118 @@
++import { invalid, issue, valid, type ValidationResult } from "@/platform/validation";
++
++/**
++ * OrgUnit — the single, recursive, typed organizational node (ADR-012 §5).
++ * One aggregate differentiated by `kind`; there is never a table or type per
++ * level. The hierarchy is a strict single-parent tree (ADR-012 §6): `parentId`
++ * is null for a root and otherwise names exactly one parent in the same tenant.
++ */
++
++export const ORG_UNIT_KINDS = ["DIVISION", "BUSINESS_UNIT", "DEPARTMENT", "BRANCH", "TEAM"] as const;
++export type OrgUnitKind = (typeof ORG_UNIT_KINDS)[number];
++
++export const ORG_UNIT_STATUSES = ["ACTIVE", "ARCHIVED"] as const;
++export type OrgUnitStatus = (typeof ORG_UNIT_STATUSES)[number];
++
++/** Immutable read record of one org unit. `id` and `code` are stable identity — never changed, never reused (ADR-012 §12). */
++export interface OrgUnitRecord {
++  id: string;
++  tenantId: string;
++  code: string;
++  name: string;
++  kind: OrgUnitKind;
++  parentId?: string;
++  status: OrgUnitStatus;
++  createdAt: string;
++  createdBy: string;
++  updatedAt: string;
++}
++
++const CODE_PATTERN = /^[A-Z0-9][A-Z0-9._-]{0,49}$/;
++
++export interface CreateOrgUnitDraft {
++  code: string;
++  name: string;
++  kind: string;
++  parentId?: string;
++}
++
++/**
++ * Server-authoritative validation for a new org unit's own fields. The code is
++ * normalized (trimmed + upper-cased) so "FIN" and "fin" can never become two
++ * distinct units. Structural invariants (parent existence, cycles) are enforced
++ * by the write service against the live tree, not here.
++ */
++export function validateCreateOrgUnitDraft(input: CreateOrgUnitDraft): ValidationResult<CreateOrgUnitDraft & { kind: OrgUnitKind }> {
++  const issues = [];
++  const normalizedCode = input.code?.trim().toUpperCase() ?? "";
++  if (!normalizedCode) issues.push(issue("code", "REQUIRED", "A short, stable code is required."));
++  else if (!CODE_PATTERN.test(normalizedCode)) issues.push(issue("code", "INVALID_FORMAT", "Code must be 1-50 characters: letters, numbers, dot, dash, or underscore, starting with a letter or number."));
++  if (!input.name?.trim()) issues.push(issue("name", "REQUIRED", "A name is required."));
++  if (!input.kind) issues.push(issue("kind", "REQUIRED", "An organization unit kind is required."));
++  else if (!(ORG_UNIT_KINDS as readonly string[]).includes(input.kind)) issues.push(issue("kind", "UNSUPPORTED", `"${input.kind}" is not a supported org unit kind.`));
++  return issues.length ? invalid(issues) : valid({ ...input, code: normalizedCode, name: input.name.trim(), kind: input.kind as OrgUnitKind });
++}
++
++export function validateOrgUnitName(name: string): ValidationResult<string> {
++  return name?.trim() ? valid(name.trim()) : invalid([issue("name", "REQUIRED", "A name is required.")]);
++}
++
++/* -------------------------------------------------------------------------- */
++/* Pure hierarchy helpers — adjacency in, structure out. No I/O.              */
++/* -------------------------------------------------------------------------- */
++
++export interface OrgUnitTreeNode extends OrgUnitRecord {
++  children: OrgUnitTreeNode[];
++}
++
++/**
++ * Builds the single-parent tree from a flat, tenant-scoped adjacency list.
++ * Roots are units with no parent (or whose parent is absent from the set).
++ * Children are ordered by name then code for a deterministic display order.
++ */
++export function buildOrgUnitTree(units: readonly OrgUnitRecord[]): OrgUnitTreeNode[] {
++  const nodes = new Map<string, OrgUnitTreeNode>();
++  for (const unit of units) nodes.set(unit.id, { ...unit, children: [] });
++  const roots: OrgUnitTreeNode[] = [];
++  for (const node of nodes.values()) {
++    const parent = node.parentId ? nodes.get(node.parentId) : undefined;
++    if (parent) parent.children.push(node);
++    else roots.push(node);
++  }
++  const sort = (list: OrgUnitTreeNode[]) => {
++    list.sort((a, b) => a.name.localeCompare(b.name) || a.code.localeCompare(b.code));
++    for (const child of list) sort(child.children);
++  };
++  sort(roots);
++  return roots;
++}
++
++/** The set of ids strictly below `rootId` in the adjacency list (its descendants, not itself). */
++export function collectDescendantIds(units: readonly OrgUnitRecord[], rootId: string): Set<string> {
++  const childrenByParent = new Map<string, string[]>();
++  for (const unit of units) {
++    if (!unit.parentId) continue;
++    const list = childrenByParent.get(unit.parentId) ?? [];
++    list.push(unit.id);
++    childrenByParent.set(unit.parentId, list);
++  }
++  const descendants = new Set<string>();
++  const stack = [...(childrenByParent.get(rootId) ?? [])];
++  while (stack.length > 0) {
++    const id = stack.pop()!;
++    if (descendants.has(id)) continue; // defensive against a pre-existing cycle in stored data
++    descendants.add(id);
++    for (const child of childrenByParent.get(id) ?? []) stack.push(child);
++  }
++  return descendants;
++}
++
++/**
++ * Would setting `unitId`'s parent to `newParentId` create a cycle? True if the
++ * new parent is the unit itself or any of its current descendants. This is the
++ * single-parent-tree invariant (ADR-012 §6, §12) checked against the live tree.
++ */
++export function wouldCreateCycle(units: readonly OrgUnitRecord[], unitId: string, newParentId: string): boolean {
++  if (unitId === newParentId) return true;
++  return collectDescendantIds(units, unitId).has(newParentId);
++}
+diff --git a/src/platform/organization/prisma-org-unit-read-repository.ts b/src/platform/organization/prisma-org-unit-read-repository.ts
+new file mode 100644
+index 0000000..bd3dfb6
+--- /dev/null
++++ b/src/platform/organization/prisma-org-unit-read-repository.ts
+@@ -0,0 +1,58 @@
++import type { PrismaClient } from "@prisma/client";
++import { hasPermission, type TenantContext } from "@/platform/context";
++import { AuthorizationError } from "@/platform/errors";
++import type { OrgUnitReadRepository } from "@/platform/organization/org-unit-repository";
++import type { OrgUnitKind, OrgUnitRecord, OrgUnitStatus } from "@/platform/organization/org-unit";
++
++export type PrismaOrgUnitReadClient = Pick<PrismaClient, "orgUnit">;
++
++function requireOrganizationView(context: TenantContext): void {
++  if (!hasPermission(context, "organization.view")) throw new AuthorizationError();
++}
++
++function toRecord(value: {
++  id: string; tenantId: string; code: string; name: string; kind: string; parentId: string | null;
++  status: string; createdAt: Date; createdBy: string; updatedAt: Date;
++}): OrgUnitRecord {
++  return Object.freeze({
++    id: value.id,
++    tenantId: value.tenantId,
++    code: value.code,
++    name: value.name,
++    kind: value.kind as OrgUnitKind,
++    ...(value.parentId ? { parentId: value.parentId } : {}),
++    status: value.status as OrgUnitStatus,
++    createdAt: value.createdAt.toISOString(),
++    createdBy: value.createdBy,
++    updatedAt: value.updatedAt.toISOString(),
++  });
++}
++
++/** Read-only, tenant-scoped. Every method requires organization.view. */
++export class PrismaOrgUnitReadRepository implements OrgUnitReadRepository {
++  constructor(private readonly prisma: PrismaOrgUnitReadClient) {}
++
++  async getById(context: TenantContext, id: string): Promise<OrgUnitRecord | undefined> {
++    requireOrganizationView(context);
++    const unit = await this.prisma.orgUnit.findFirst({ where: { tenantId: context.tenantId, id } });
++    return unit ? toRecord(unit) : undefined;
++  }
++
++  async getByCode(context: TenantContext, code: string): Promise<OrgUnitRecord | undefined> {
++    requireOrganizationView(context);
++    const unit = await this.prisma.orgUnit.findUnique({ where: { tenantId_code: { tenantId: context.tenantId, code } } });
++    return unit ? toRecord(unit) : undefined;
++  }
++
++  async listChildren(context: TenantContext, parentId: string | null): Promise<OrgUnitRecord[]> {
++    requireOrganizationView(context);
++    const units = await this.prisma.orgUnit.findMany({ where: { tenantId: context.tenantId, parentId }, orderBy: [{ name: "asc" }, { code: "asc" }] });
++    return units.map(toRecord);
++  }
++
++  async listAll(context: TenantContext): Promise<OrgUnitRecord[]> {
++    requireOrganizationView(context);
++    const units = await this.prisma.orgUnit.findMany({ where: { tenantId: context.tenantId }, orderBy: [{ name: "asc" }, { code: "asc" }] });
++    return units.map(toRecord);
++  }
++}
+diff --git a/src/platform/organization/prisma-org-unit-unit-of-work.ts b/src/platform/organization/prisma-org-unit-unit-of-work.ts
+new file mode 100644
+index 0000000..9ee9505
+--- /dev/null
++++ b/src/platform/organization/prisma-org-unit-unit-of-work.ts
+@@ -0,0 +1,74 @@
++import { randomUUID } from "node:crypto";
++import type { Prisma } from "@prisma/client";
++import { AuditRecordFactory } from "@/platform/auditing/audit-record-factory";
++import { ServerAuditIdGenerator } from "@/platform/auditing/audit-record";
++import type { AuditCollector } from "@/platform/auditing/audit-collector";
++import type { ImmutableAuditRecordRepository } from "@/platform/auditing/immutable-audit-record-repository";
++import type { DomainEventCollector } from "@/platform/events/domain-event-collector";
++import { PrismaAuditRecordRepository } from "@/platform/auditing/prisma-audit-record-repository";
++import { PrismaOutboxRepository } from "@/platform/outbox/prisma-outbox-repository";
++import type { OutboxRepository } from "@/platform/outbox/outbox-repository";
++import { toOutboxMessage } from "@/platform/outbox/outbox-message";
++import { PrismaOrgUnitWriteRepository } from "@/platform/organization/prisma-org-unit-write-repository";
++import { OrgUnitWriteTransaction } from "@/platform/organization/org-unit-write-transaction";
++import type { OrgUnitTransactionRepositories } from "@/platform/organization/org-unit-repository";
++import type { UnitOfWork, UnitOfWorkContext, UnitOfWorkTransaction } from "@/platform/transactions/unit-of-work";
++import type { DomainEvent } from "@/platform/events/domain-event";
++
++/** A Prisma client able to own an interactive transaction spanning org-unit, audit, and outbox tables. */
++export type PrismaOrgUnitTransactionRunner = Readonly<{
++  $transaction<T>(fn: (client: Prisma.TransactionClient) => Promise<T>): Promise<T>;
++}>;
++
++/**
++ * Durable transaction coordinator for the organization structure. Mirrors
++ * PrismaConfigurationUnitOfWork: org-unit writes, audit records, and outbox
++ * messages commit atomically inside one Prisma $transaction; domain events are
++ * released to their collector only after that commit succeeds.
++ */
++export class PrismaOrgUnitUnitOfWork implements UnitOfWork<OrgUnitTransactionRepositories> {
++  constructor(
++    private readonly prisma: PrismaOrgUnitTransactionRunner,
++    private readonly eventCollector: DomainEventCollector,
++    private readonly auditCollector: AuditCollector,
++    private readonly auditRecords: AuditRecordFactory = new AuditRecordFactory(new ServerAuditIdGenerator(), { now: () => new Date().toISOString() }),
++    private readonly transactionIds: { next(): string } = { next: () => randomUUID() },
++    private readonly auditRepositoryFactory: (client: ConstructorParameters<typeof PrismaAuditRecordRepository>[0]) => ImmutableAuditRecordRepository = (client) => new PrismaAuditRecordRepository(client),
++    private readonly outboxRepositoryFactory: (client: ConstructorParameters<typeof PrismaOutboxRepository>[0]) => OutboxRepository = (client) => new PrismaOutboxRepository(client),
++  ) {}
++
++  async execute<TResult>(
++    context: UnitOfWorkContext,
++    operation: (transaction: UnitOfWorkTransaction<OrgUnitTransactionRepositories>) => Promise<TResult>,
++  ): Promise<TResult> {
++    const transactionContext = Object.freeze({ ...context, transactionId: this.transactionIds.next() });
++    const committed = await this.prisma.$transaction(async (client) => {
++      const orgUnits = new OrgUnitWriteTransaction(new PrismaOrgUnitWriteRepository(client), transactionContext);
++      const transaction = Object.freeze({ context: transactionContext, repositories: Object.freeze({ orgUnits }) });
++      const result = await operation(transaction);
++      const events = orgUnits.pullEvents();
++      const records = this.createAuditRecords(transactionContext, events);
++      await this.auditRepositoryFactory(client).append(records);
++      const messages = events.map(toOutboxMessage);
++      await this.outboxRepositoryFactory(client).append(messages);
++      return Object.freeze({ result, events, records, messages });
++    });
++
++    this.eventCollector.collect(committed.events);
++    this.auditCollector.collect(committed.records);
++    return committed.result;
++  }
++
++  private createAuditRecords(context: UnitOfWorkTransaction<OrgUnitTransactionRepositories>["context"], events: readonly DomainEvent[]) {
++    const { actorUserId, requestId, commandName } = context;
++    if (!actorUserId || !requestId || !commandName) return [];
++    return events.map((event) => this.auditRecords.organizationEvent({
++      tenantId: context.tenantId,
++      actorUserId,
++      requestId,
++      correlationId: context.correlationId,
++      transactionId: context.transactionId,
++      commandName,
++    }, event));
++  }
++}
+diff --git a/src/platform/organization/prisma-org-unit-write-repository.ts b/src/platform/organization/prisma-org-unit-write-repository.ts
+new file mode 100644
+index 0000000..68a090e
+--- /dev/null
++++ b/src/platform/organization/prisma-org-unit-write-repository.ts
+@@ -0,0 +1,74 @@
++import type { Prisma } from "@prisma/client";
++import type {
++  CreateOrgUnitInput,
++  MoveOrgUnitInput,
++  OrgUnitWriteRepository,
++  RenameOrgUnitInput,
++} from "@/platform/organization/org-unit-repository";
++import type { OrgUnitKind, OrgUnitRecord, OrgUnitStatus } from "@/platform/organization/org-unit";
++
++export type PrismaOrgUnitWriteClient = Pick<Prisma.TransactionClient, "orgUnit">;
++
++function toRecord(value: {
++  id: string; tenantId: string; code: string; name: string; kind: string; parentId: string | null;
++  status: string; createdAt: Date; createdBy: string; updatedAt: Date;
++}): OrgUnitRecord {
++  return Object.freeze({
++    id: value.id,
++    tenantId: value.tenantId,
++    code: value.code,
++    name: value.name,
++    kind: value.kind as OrgUnitKind,
++    ...(value.parentId ? { parentId: value.parentId } : {}),
++    status: value.status as OrgUnitStatus,
++    createdAt: value.createdAt.toISOString(),
++    createdBy: value.createdBy,
++    updatedAt: value.updatedAt.toISOString(),
++  });
++}
++
++/**
++ * Write-side adapter, used only inside an OrgUnit write transaction. Tenant
++ * scoping is on every query's where clause. There is no id/code mutation and
++ * no delete by design (ADR-012 §12).
++ */
++export class PrismaOrgUnitWriteRepository implements OrgUnitWriteRepository {
++  constructor(private readonly prisma: PrismaOrgUnitWriteClient) {}
++
++  async findById(tenantId: string, id: string): Promise<OrgUnitRecord | undefined> {
++    const unit = await this.prisma.orgUnit.findFirst({ where: { tenantId, id } });
++    return unit ? toRecord(unit) : undefined;
++  }
++
++  async findByCode(tenantId: string, code: string): Promise<OrgUnitRecord | undefined> {
++    const unit = await this.prisma.orgUnit.findUnique({ where: { tenantId_code: { tenantId, code } } });
++    return unit ? toRecord(unit) : undefined;
++  }
++
++  async listAll(tenantId: string): Promise<OrgUnitRecord[]> {
++    const units = await this.prisma.orgUnit.findMany({ where: { tenantId } });
++    return units.map(toRecord);
++  }
++
++  async create(input: CreateOrgUnitInput): Promise<OrgUnitRecord> {
++    const unit = await this.prisma.orgUnit.create({
++      data: { tenantId: input.tenantId, code: input.code, name: input.name, kind: input.kind, parentId: input.parentId ?? null, createdBy: input.createdBy },
++    });
++    return toRecord(unit);
++  }
++
++  async rename(input: RenameOrgUnitInput): Promise<OrgUnitRecord> {
++    const updated = await this.prisma.orgUnit.update({ where: { tenantId_id: { tenantId: input.tenantId, id: input.id } }, data: { name: input.name } });
++    return toRecord(updated);
++  }
++
++  async move(input: MoveOrgUnitInput): Promise<OrgUnitRecord> {
++    const updated = await this.prisma.orgUnit.update({ where: { tenantId_id: { tenantId: input.tenantId, id: input.id } }, data: { parentId: input.parentId } });
++    return toRecord(updated);
++  }
++
++  async archive(tenantId: string, id: string): Promise<OrgUnitRecord> {
++    const updated = await this.prisma.orgUnit.update({ where: { tenantId_id: { tenantId, id } }, data: { status: "ARCHIVED" } });
++    return toRecord(updated);
++  }
++}
+-- 
+2.43.0
+
