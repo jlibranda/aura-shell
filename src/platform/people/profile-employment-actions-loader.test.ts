@@ -80,17 +80,23 @@ describe("toEmploymentPickerOptions", () => {
 });
 
 describe("toOrganizationPathSegments", () => {
-  it("carries the path through as id/name pairs, in the given order, regardless of kind", () => {
+  it("carries the path through as id/name/kind triples, in the given order — kind taken directly from the OrgUnit record, never derived from position", () => {
     const segments = toOrganizationPathSegments([
       orgUnit({ id: "root", name: "APAC", kind: "DIVISION" }),
       orgUnit({ id: "mid", name: "Philippines", kind: "BRANCH" }),
       orgUnit({ id: "leaf", name: "Payroll", kind: "TEAM" }),
     ]);
-    expect(segments).toEqual([{ id: "root", name: "APAC" }, { id: "mid", name: "Philippines" }, { id: "leaf", name: "Payroll" }]);
+    expect(segments).toEqual([
+      { id: "root", name: "APAC", kind: "DIVISION" },
+      { id: "mid", name: "Philippines", kind: "BRANCH" },
+      { id: "leaf", name: "Payroll", kind: "TEAM" },
+    ]);
   });
 
-  it("handles a single-node (flat) organization", () => {
-    expect(toOrganizationPathSegments([orgUnit({ id: "hr", name: "Human Resources", kind: "DIVISION" })])).toEqual([{ id: "hr", name: "Human Resources" }]);
+  it("handles a single-node (flat) organization, preserving whatever kind that node actually has", () => {
+    expect(toOrganizationPathSegments([orgUnit({ id: "hr", name: "Human Resources", kind: "BUSINESS_UNIT" })])).toEqual([
+      { id: "hr", name: "Human Resources", kind: "BUSINESS_UNIT" },
+    ]);
   });
 
   it("handles no placement at all", () => {

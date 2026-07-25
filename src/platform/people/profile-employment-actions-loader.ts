@@ -2,7 +2,7 @@ import { hasPermission } from "@/platform/context";
 import { resolveRequestContext } from "@/platform/auth/resolve-request-context";
 import { createOrganizationAdminRuntime } from "@/platform/organization/organization-admin-runtime";
 import type { AssignmentRecord } from "@/platform/organization/assignment";
-import type { OrgUnitRecord } from "@/platform/organization/org-unit";
+import type { OrgUnitKind, OrgUnitRecord } from "@/platform/organization/org-unit";
 import type { OrganizationEmployeeDirectoryEntry } from "@/platform/organization/organization-employee-directory";
 
 /**
@@ -14,6 +14,7 @@ import type { OrganizationEmployeeDirectoryEntry } from "@/platform/organization
 export interface OrganizationPathSegment {
   id: string;
   name: string;
+  kind: OrgUnitKind;
 }
 
 export interface EmploymentPickerOption {
@@ -51,9 +52,9 @@ const EMPTY_ACTIONS: EmploymentActionsViewModel = Object.freeze({
   organizationPath: [],
 });
 
-/** Pure: OrgUnitRecord path -> the minimal shape OrganizationPath renders. */
-export function toOrganizationPathSegments(path: readonly Pick<OrgUnitRecord, "id" | "name">[]): OrganizationPathSegment[] {
-  return path.map((unit) => ({ id: unit.id, name: unit.name }));
+/** Pure: OrgUnitRecord path -> the minimal shape OrganizationPath renders. kind comes straight from the OrgUnit record — never derived from depth or position. */
+export function toOrganizationPathSegments(path: readonly Pick<OrgUnitRecord, "id" | "name" | "kind">[]): OrganizationPathSegment[] {
+  return path.map((unit) => ({ id: unit.id, name: unit.name, kind: unit.kind }));
 }
 
 /** Pure history-row shaping: assignment history -> display rows, most recent first. */
