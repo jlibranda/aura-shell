@@ -4,14 +4,16 @@ import type { ProfileOverviewViewModel } from "@/platform/people/profile-runtime
 
 export function ProfileShell({
   overview,
+  backHref,
   children,
 }: {
   overview: ProfileOverviewViewModel;
+  backHref: string;
   children: React.ReactNode;
 }) {
   return (
     <div className="mx-auto max-w-5xl">
-      <ProfileHeader overview={overview} />
+      <ProfileHeader overview={overview} backHref={backHref} />
       <div className="mt-5"><ProfileNav employeeId={overview.employeeId} /></div>
       <div className="mt-6">{children}</div>
       <p className="mt-4 text-sm text-muted-foreground">Read-only runtime profile.</p>

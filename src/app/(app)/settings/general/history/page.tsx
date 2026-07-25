@@ -1,6 +1,7 @@
 import type { Metadata } from "next";
 import { History as HistoryIcon } from "lucide-react";
 import { AccessDenied } from "@/components/shared/access-denied";
+import { PageHeader } from "@/components/shared/page-header";
 import { GeneralSettingsHistoryTimeline } from "@/components/settings/general-settings-history-timeline";
 import { loadGeneralSettingsHistory } from "@/platform/configuration/general-settings-loader";
 
@@ -13,10 +14,7 @@ export default async function GeneralSettingsHistoryPage() {
 
   return (
     <div className="mx-auto max-w-3xl">
-      <div className="mb-6">
-        <h1 className="text-xl font-semibold tracking-tight text-foreground">Version history</h1>
-        <p className="mt-0.5 text-sm text-muted-foreground">Every draft, publish, and retirement of General Company Settings.</p>
-      </div>
+      <PageHeader title="Version history" description="Every draft, publish, and retirement of General Company Settings." backHref="/settings/general" />
       <GeneralSettingsHistoryTimeline versions={result.versions} />
       {result.versions.length === 0 ? (
         <div className="flex items-center gap-2 pt-2 text-sm text-muted-foreground">

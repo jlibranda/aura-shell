@@ -1,6 +1,7 @@
 import type { Metadata } from "next";
 import { notFound } from "next/navigation";
 import { AccessDenied } from "@/components/shared/access-denied";
+import { PageHeader } from "@/components/shared/page-header";
 import { Badge, Card } from "@/components/ui/primitives";
 import { loadGeneralSettingsVersion } from "@/platform/configuration/general-settings-loader";
 import { summarizeGeneralCompanySettings, type GeneralCompanySettingsPayload } from "@/platform/configuration/general-company-settings";
@@ -22,10 +23,7 @@ export default async function GeneralSettingsVersionPage({ params }: { params: {
 
   return (
     <div className="mx-auto max-w-3xl">
-      <div className="mb-6 flex items-center gap-2">
-        <h1 className="text-xl font-semibold tracking-tight text-foreground">Version {version.versionNumber}</h1>
-        <Badge tone={statusTone}>{statusLabel}</Badge>
-      </div>
+      <PageHeader title={`Version ${version.versionNumber}`} adornment={<Badge tone={statusTone}>{statusLabel}</Badge>} backHref="/settings/general/history" />
 
       <Card className="mb-4 p-5">
         <dl className="grid gap-4 sm:grid-cols-2">

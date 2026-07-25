@@ -8,6 +8,7 @@ import { Breadcrumbs } from "@/components/shell/breadcrumbs";
 import { CommandPalette } from "@/components/shell/command-palette";
 import { GlobalSearch } from "@/components/shell/global-search";
 import { CopilotDock } from "@/components/shell/copilot-dock";
+import { RouteHistoryTracker } from "@/components/shell/route-history-tracker";
 import { Sheet } from "@/components/ui/overlay";
 import { useUIStore, hydrateUIPreferences } from "@/stores/ui-store";
 import { useAuthStore } from "@/stores/auth-store";
@@ -85,6 +86,7 @@ export default function AppLayout({
 
   return (
     <div className="flex h-screen overflow-hidden bg-background">
+      <RouteHistoryTracker />
       <Sidebar />
 
       {/* Mobile navigation drawer */}

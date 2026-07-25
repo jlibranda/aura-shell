@@ -2,6 +2,7 @@ import type { Metadata } from "next";
 import Link from "next/link";
 import { CalendarClock, Settings2 } from "lucide-react";
 import { AccessDenied } from "@/components/shared/access-denied";
+import { PageHeader } from "@/components/shared/page-header";
 import { Badge, Card, EmptyState } from "@/components/ui/primitives";
 import { Button } from "@/components/ui/button";
 import { loadGeneralSettingsView } from "@/platform/configuration/general-settings-loader";
@@ -19,22 +20,23 @@ export default async function GeneralSettingsPage() {
 
   return (
     <div className="mx-auto max-w-3xl">
-      <div className="mb-6 flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
-        <div>
-          <h1 className="text-xl font-semibold tracking-tight text-foreground">General Company Settings</h1>
-          <p className="mt-0.5 text-sm text-muted-foreground">The tenant-level defaults future policies (Timekeeping, Payroll, Leave) will inherit from.</p>
-        </div>
-        <div className="flex gap-2">
-          <Link href="/settings/general/history" className="inline-flex h-9 items-center rounded-md border border-border bg-surface px-4 text-sm font-medium text-foreground hover:bg-surface-muted">
-            Version history
-          </Link>
-          {canManage ? (
-            <Button asChild>
-              <Link href="/settings/general/edit">{draft ? "Continue editing" : effective ? "Edit" : "Start setup"}</Link>
-            </Button>
-          ) : null}
-        </div>
-      </div>
+      <PageHeader
+        title="General Company Settings"
+        description="The tenant-level defaults future policies (Timekeeping, Payroll, Leave) will inherit from."
+        backHref="/settings"
+        actions={
+          <>
+            <Link href="/settings/general/history" className="inline-flex h-9 items-center rounded-md border border-border bg-surface px-4 text-sm font-medium text-foreground hover:bg-surface-muted">
+              Version history
+            </Link>
+            {canManage ? (
+              <Button asChild>
+                <Link href="/settings/general/edit">{draft ? "Continue editing" : effective ? "Edit" : "Start setup"}</Link>
+              </Button>
+            ) : null}
+          </>
+        }
+      />
 
       {draft ? (
         <Card className="mb-4 flex items-center justify-between gap-3 border-warning/30 bg-warning/5 p-4">
