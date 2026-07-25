@@ -11,7 +11,7 @@ export const dynamic = "force-dynamic";
 const SECTIONS = [
   { href: "/settings/organization/org-units", title: "Organization Units", description: "Divisions, business units, departments, branches, and teams.", icon: Building2 },
   { href: "/settings/organization/locations", title: "Locations", description: "Physical and recognized work sites.", icon: MapPin },
-  { href: "/settings/organization/assignments", title: "Employee Assignments", description: "Who is placed where, and who reports to whom.", icon: UserCog },
+  { href: "/settings/organization/assignments", title: "Assignment Diagnostics", description: "Tenant-wide placement oversight and correction — everyday transfers happen from an employee's profile.", icon: UserCog },
 ] as const;
 
 export default async function OrganizationOverviewPage() {

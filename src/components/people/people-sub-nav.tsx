@@ -2,24 +2,22 @@
 
 import Link from "next/link";
 import { usePathname } from "next/navigation";
-import { Users, Network, FolderClosed } from "lucide-react";
+import { Users, FolderClosed } from "lucide-react";
 import { cn } from "@/lib/utils";
 
+// "Organization" was deliberately removed from here (was /people/org, mock
+// data only — see next.config.js redirects). The real Organization surface
+// lives at Settings > Organization; per-employee placement lives on the
+// Employee Profile > Employment tab.
 const LINKS = [
   { href: "/people", label: "Directory", icon: Users, exactPrefixes: ["/people"] },
-  { href: "/people/org", label: "Organization", icon: Network, exactPrefixes: ["/people/org"] },
   { href: "/people/documents", label: "Documents", icon: FolderClosed, exactPrefixes: ["/people/documents"] },
 ];
 
 function isActive(pathname: string, href: string): boolean {
   if (href === "/people") {
-    // Directory owns /people and /people/[id], but not /org or /documents.
-    return (
-      pathname === "/people" ||
-      (pathname.startsWith("/people/") &&
-        !pathname.startsWith("/people/org") &&
-        !pathname.startsWith("/people/documents"))
-    );
+    // Directory owns /people and /people/[id], but not /documents.
+    return pathname === "/people" || (pathname.startsWith("/people/") && !pathname.startsWith("/people/documents"));
   }
   return pathname === href || pathname.startsWith(href + "/");
 }

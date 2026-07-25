@@ -10,7 +10,7 @@ import { ConfirmDialog } from "@/components/ui/confirm-dialog";
 import { FormField, Input, Label } from "@/components/ui/form";
 import { Select } from "@/components/ui/combobox";
 import { toast } from "@/components/ui/toast";
-import { commandErrorMessage, fieldErrorsFrom } from "@/components/settings/organization/command-result-helpers";
+import { commandErrorMessage, fieldErrorsFrom } from "@/components/shared/command-result-helpers";
 import { createOrgUnitAction, renameOrgUnitAction, moveOrgUnitAction, archiveOrgUnitAction } from "@/app/(app)/settings/organization/org-units/actions";
 import { ORG_UNIT_KINDS, type OrgUnitKind, type OrgUnitRecord, type OrgUnitTreeNode } from "@/platform/organization/org-unit";
 
