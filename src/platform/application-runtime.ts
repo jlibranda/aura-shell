@@ -5,8 +5,8 @@ import type { TrustedRequestContext } from "@/platform/runtime-context";
 import { createTenantContext } from "@/platform/runtime-context";
 import { PEOPLE_SERVICE } from "@/platform/tokens";
 import type { TenantContext } from "@/platform/context";
-import type { OrganizationReferenceService } from "@/platform/organization/organization-reference-service";
-import { ORGANIZATION_REFERENCE_SERVICE } from "@/platform/tokens";
+import type { OrganizationPlacementService } from "@/platform/people/read-models/organization-placement-service";
+import { ORGANIZATION_PLACEMENT_SERVICE } from "@/platform/tokens";
 import { CommandExecutionPipeline } from "@/platform/commands/command-execution-pipeline";
 import type { CommandResult } from "@/platform/commands/command-result";
 import type { CreateEmployeeCommand } from "@/platform/people/commands/create-employee-command";
@@ -18,7 +18,7 @@ import { EMPLOYEE_UNIT_OF_WORK } from "@/platform/tokens";
 export interface ApplicationRuntime {
   readonly context: TenantContext;
   readonly people: PeopleService;
-  readonly organizationReferences: OrganizationReferenceService;
+  readonly organizationPlacements: OrganizationPlacementService;
   readonly commands: Readonly<{
     executeCreateEmployee(command: CreateEmployeeCommand): Promise<CommandResult<CreateEmployeePreparation>>;
     executeInMemoryEmployeeCreate(command: CreateEmployeeCommand): Promise<CommandResult<InMemoryEmployeeCreation>>;
@@ -39,7 +39,7 @@ export function createApplicationRuntime(request: TrustedRequestContext, root: S
   return {
     context: createTenantContext(request),
     people: scope.resolve(PEOPLE_SERVICE),
-    organizationReferences: scope.resolve(ORGANIZATION_REFERENCE_SERVICE),
+    organizationPlacements: scope.resolve(ORGANIZATION_PLACEMENT_SERVICE),
     commands: Object.freeze({
       executeCreateEmployee: (command) => preparationCommands.execute<CreateEmployeeCommand, CreateEmployeePreparation>(request, command),
       executeInMemoryEmployeeCreate: (command) => inMemoryWriteCommands.execute<CreateEmployeeCommand, InMemoryEmployeeCreation>(request, command),

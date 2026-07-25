@@ -80,4 +80,11 @@ export class InMemoryAssignmentReadRepository implements AssignmentReadRepositor
       .filter((a) => a.tenantId === context.tenantId && a.personId === personId)
       .sort((a, b) => a.effectiveFrom.localeCompare(b.effectiveFrom));
   }
+
+  async listCurrentByManager(context: TenantContext, managerId: string): Promise<AssignmentRecord[]> {
+    requireOrganizationView(context);
+    return this.store.assignments
+      .filter((a) => a.tenantId === context.tenantId && a.managerId === managerId && a.isPrimary && !a.effectiveUntil)
+      .sort((a, b) => a.effectiveFrom.localeCompare(b.effectiveFrom));
+  }
 }

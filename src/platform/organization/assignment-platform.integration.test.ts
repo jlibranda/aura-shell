@@ -165,4 +165,31 @@ describe("assignment platform (integration)", () => {
       data: { tenantId: tenantA, personId, orgUnitId: foreignOrgUnit.id, effectiveFrom: new Date("2026-01-01"), createdBy: "tester" },
     })).rejects.toThrow();
   });
+
+  it("listCurrentByManager returns only that manager's currently open direct reports (Epic 7B.4)", async () => {
+    await seedTenant(tenantA);
+    const managerId = `emp-${randomUUID().slice(0, 8)}`;
+    const currentReportId = `emp-${randomUUID().slice(0, 8)}`;
+    const formerReportId = `emp-${randomUUID().slice(0, 8)}`;
+    const unrelatedManagerId = `emp-${randomUUID().slice(0, 8)}`;
+    await seedEmployee(tenantA, managerId);
+    await seedEmployee(tenantA, currentReportId);
+    await seedEmployee(tenantA, formerReportId);
+    await seedEmployee(tenantA, unrelatedManagerId);
+    const orgUnit = await seedOrgUnit(tenantA, randomUUID(), `OU-${randomUUID().slice(0, 8)}`.toUpperCase());
+
+    const service = new AssignmentService(new PrismaAssignmentUnitOfWork(prisma, new InMemoryDomainEventCollector(), new InMemoryAuditCollector()));
+    const current = await service.assignPrimary(request(tenantA), { personId: currentReportId, orgUnitId: orgUnit.id, managerId, effectiveFrom: "2026-01-01T00:00:00.000Z" });
+    if (current.kind !== "success") throw new Error("seed failed");
+
+    // A former report whose assignment to this manager has since ended must not appear.
+    const former = await service.assignPrimary(request(tenantA), { personId: formerReportId, orgUnitId: orgUnit.id, managerId, effectiveFrom: "2025-01-01T00:00:00.000Z" });
+    if (former.kind !== "success") throw new Error("seed failed");
+    await service.endAssignment(request(tenantA), { personId: formerReportId, effectiveUntil: "2025-06-01T00:00:00.000Z" });
+
+    const reader = new PrismaAssignmentReadRepository(prisma);
+    const reports = await reader.listCurrentByManager(readContext(tenantA), managerId);
+    expect(reports.map((a) => a.personId)).toEqual([currentReportId]);
+    expect(await reader.listCurrentByManager(readContext(tenantA), unrelatedManagerId)).toHaveLength(0);
+  });
 });

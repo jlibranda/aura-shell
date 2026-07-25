@@ -9,7 +9,7 @@ export async function loadRuntimeHireReferences(): Promise<RuntimeHireReferences
   const context = await resolveRequestContext();
   try {
     const runtime = createApplicationRuntime(context);
-    const [departments, teams, managers] = await Promise.all([runtime.organizationReferences.list(runtime.context, "department"), runtime.organizationReferences.list(runtime.context, "team"), runtime.organizationReferences.list(runtime.context, "manager")]);
+    const [departments, teams, managers] = await Promise.all([runtime.organizationPlacements.listOptions(runtime.context, "department"), runtime.organizationPlacements.listOptions(runtime.context, "team"), runtime.organizationPlacements.listOptions(runtime.context, "manager")]);
     return { departments, teams, managers };
   } catch { return emptyRuntimeHireReferences(); }
 }

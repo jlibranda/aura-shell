@@ -5,7 +5,7 @@ import { createPrismaPeopleReadRuntime, type PrismaPeopleReadRuntime } from "@/p
 import type { EmployeeContactReadModel, EmployeeProfileReadModel } from "@/platform/people/read-models/people-read-models";
 import type { EmployeeProfileReadRepository } from "@/platform/people/read-models/employee-profile-read-repository";
 import type { OrganizationSummaryDto } from "@/platform/organization/organization-reference-dtos";
-import type { OrganizationReferenceService } from "@/platform/organization/organization-reference-service";
+import type { OrganizationPlacementService } from "@/platform/people/read-models/organization-placement-service";
 
 export interface ProfileOverviewViewModel {
   employeeId: string;
@@ -116,17 +116,13 @@ export function toProfileEmploymentViewModel(
   };
 }
 
-async function loadOrganizationReferences(
-  references: OrganizationReferenceService,
+async function loadOrganizationPlacement(
+  organizationPlacements: OrganizationPlacementService,
   context: TenantContext,
   profile: EmployeeProfileReadModel,
 ): Promise<OrganizationSummaryDto> {
   try {
-    return await references.resolveSummary(context, {
-      departmentId: profile.departmentId,
-      teamId: profile.teamId,
-      managerId: profile.managerId,
-    });
+    return await organizationPlacements.resolvePlacementSummary(context, profile.id);
   } catch {
     return {};
   }
@@ -157,7 +153,7 @@ async function loadContact(
 }
 
 export async function aggregateRuntimeProfile(
-  runtime: Pick<PrismaPeopleReadRuntime, "context" | "profiles" | "organizationReferences">,
+  runtime: Pick<PrismaPeopleReadRuntime, "context" | "profiles" | "organizationPlacements">,
   employeeId: string,
 ): Promise<RuntimeProfilePageResult> {
   try {
@@ -165,7 +161,7 @@ export async function aggregateRuntimeProfile(
     if (!profile) return { kind: "not_found" };
     const [contactInformation, organization] = await Promise.all([
       loadContact(runtime.profiles, runtime.context, employeeId),
-      loadOrganizationReferences(runtime.organizationReferences, runtime.context, profile),
+      loadOrganizationPlacement(runtime.organizationPlacements, runtime.context, profile),
     ]);
     return {
       kind: "ready",

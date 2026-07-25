@@ -57,6 +57,14 @@ const isOrganizationReadRepository = (file: SourceFile) => ORGANIZATION_READ_REP
 // Location is a dimension orthogonal to the OrgUnit tree (ADR-012 §5) — never
 // a node within it, never owned by it. OrgUnit code must never reach into it.
 const isOrgUnitCode = (file: SourceFile) => file.path.startsWith("src/platform/organization/org-unit");
+// The Epic 7B.4 read-side query surface. It composes the three read
+// repositories only — never Prisma directly, never the write side.
+const isOrganizationQueryService = (file: SourceFile) => file.path === "src/platform/organization/organization-query-service.ts";
+// The People-side integration that turns Organization ids into display
+// names (replaces the retired organization-reference placeholder). It reads
+// through OrganizationQueryService and a minimal employee display lookup —
+// never the Organization write side.
+const isOrganizationPlacementImplementation = (file: SourceFile) => file.path === "src/platform/people/read-models/prisma-organization-placement-service.ts";
 
 const WRITE_RUNTIME_IMPORTS = [
   /^@prisma\/client/,
@@ -133,6 +141,9 @@ const ORGANIZATION_SERVER_ONLY_IMPORTS = [
   /platform\/organization\/prisma-org-unit-read-repository/,
   /platform\/organization\/prisma-assignment-read-repository/,
   /platform\/organization\/prisma-location-read-repository/,
+  /platform\/organization\/organization-query-service/,
+  /platform\/people\/read-models\/prisma-organization-placement-service/,
+  /platform\/people\/read-models\/prisma-employee-display-lookup/,
 ];
 
 // Anything that lets a caller obtain or construct a TrustedRequestContext —
@@ -254,6 +265,26 @@ export const RULES: Rule[] = [
     name: "org-unit-must-not-import-location",
     appliesTo: isOrgUnitCode,
     forbidden: [/platform\/organization\/location/],
+  },
+  {
+    // Epic 7B.4: every organizational query must go through the read
+    // repositories (which themselves resolve through Assignment) — never
+    // straight to Prisma. This is what keeps "queries must not bypass
+    // Assignment" mechanically true, not just a convention.
+    name: "organization-query-service-must-not-import-prisma-directly",
+    appliesTo: isOrganizationQueryService,
+    forbidden: [/^@prisma\/client/, /platform\/persistence\/prisma-client/],
+  },
+  {
+    // A read-only query surface must never be able to mutate an aggregate.
+    name: "organization-query-service-must-not-import-write-side",
+    appliesTo: isOrganizationQueryService,
+    forbidden: ORGANIZATION_WRITE_SIDE_IMPORTS,
+  },
+  {
+    name: "organization-placement-service-must-not-import-write-side",
+    appliesTo: isOrganizationPlacementImplementation,
+    forbidden: ORGANIZATION_WRITE_SIDE_IMPORTS,
   },
 ];
 

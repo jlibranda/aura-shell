@@ -50,4 +50,13 @@ export class PrismaAssignmentReadRepository implements AssignmentReadRepository 
     });
     return assignments.map(toRecord);
   }
+
+  async listCurrentByManager(context: TenantContext, managerId: string): Promise<AssignmentRecord[]> {
+    requireOrganizationView(context);
+    const assignments = await this.prisma.assignment.findMany({
+      where: { tenantId: context.tenantId, managerId, isPrimary: true, effectiveUntil: null },
+      orderBy: { effectiveFrom: "asc" },
+    });
+    return assignments.map(toRecord);
+  }
 }

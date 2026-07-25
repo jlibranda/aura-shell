@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import type { ApplicationRuntime } from "@/platform/application-runtime";
+import type { PrismaPeopleReadRuntime } from "@/platform/people/prisma-people-read-runtime";
 import type { EmployeeDirectoryDto } from "@/platform/people/application/people-dtos";
 import { resolveDirectoryRows, toPeopleDirectoryRow } from "@/platform/people/directory-runtime-loader";
 
@@ -22,15 +22,15 @@ describe("People directory runtime row mapping", () => {
   });
 
   it("uses resolved references without failing the listing when organization lookup is unavailable", async () => {
-    const organizationReferences = { resolveSummaries: vi.fn().mockRejectedValue(new Error("offline")) };
-    const runtime = { context: { tenantId: "nw-ph", actorId: "hr", actorName: "HR", roles: ["hr_admin"] }, organizationReferences } as unknown as Pick<ApplicationRuntime, "context" | "organizationReferences">;
+    const organizationPlacements = { resolvePlacementSummaries: vi.fn().mockRejectedValue(new Error("offline")) };
+    const runtime = { context: { tenantId: "nw-ph", actorId: "hr", actorName: "HR", roles: ["hr_admin"] }, organizationPlacements } as unknown as Pick<PrismaPeopleReadRuntime, "context" | "organizationPlacements">;
     await expect(resolveDirectoryRows(runtime, [employee])).resolves.toEqual([toPeopleDirectoryRow(employee)]);
   });
 
-  it("passes only department and manager identifiers to the organization runtime", async () => {
-    const organizationReferences = { resolveSummaries: vi.fn().mockResolvedValue([{ department: { id: "dep-fin", displayName: "Finance", type: "department" }, manager: { id: "emp-2", displayName: "Maria Santos", type: "manager" } }]) };
-    const runtime = { context: { tenantId: "nw-ph", actorId: "hr", actorName: "HR", roles: ["hr_admin"] }, organizationReferences } as unknown as Pick<ApplicationRuntime, "context" | "organizationReferences">;
+  it("passes only person identifiers to the organization runtime", async () => {
+    const organizationPlacements = { resolvePlacementSummaries: vi.fn().mockResolvedValue([{ department: { id: "dep-fin", displayName: "Finance", type: "department" }, manager: { id: "emp-2", displayName: "Maria Santos", type: "manager" } }]) };
+    const runtime = { context: { tenantId: "nw-ph", actorId: "hr", actorName: "HR", roles: ["hr_admin"] }, organizationPlacements } as unknown as Pick<PrismaPeopleReadRuntime, "context" | "organizationPlacements">;
     await expect(resolveDirectoryRows(runtime, [employee])).resolves.toMatchObject([{ department: "Finance", manager: "Maria Santos" }]);
-    expect(organizationReferences.resolveSummaries).toHaveBeenCalledWith(runtime.context, [{ departmentId: "dep-fin", managerId: "emp-2" }]);
+    expect(organizationPlacements.resolvePlacementSummaries).toHaveBeenCalledWith(runtime.context, [employee.id]);
   });
 });
