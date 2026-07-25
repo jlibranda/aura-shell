@@ -28,6 +28,11 @@ function revalidateEmployment(employeeId: string) {
  * optionally with a new manager. Dispatches to assignPrimary or transfer
  * depending on whether the employee already has a current placement — never
  * an independent end-then-create pair that could leave an invalid state.
+ *
+ * The Transfer drawer has no location field — a transfer is never supposed
+ * to silently clear an employee's assigned location, so the current
+ * placement's locationId is always carried forward unchanged. Change
+ * Location is the only action that sets a new one.
  */
 export async function transferEmployeeAction(input: {
   employeeId: string;
@@ -38,7 +43,7 @@ export async function transferEmployeeAction(input: {
   const request = await resolveRequestContext();
   const runtime = createOrganizationAdminRuntime(request);
   const current = await runtime.assignments.read.getCurrentForPerson(runtime.context, input.employeeId);
-  const commandInput = { personId: input.employeeId, orgUnitId: input.orgUnitId, managerId: input.managerId, effectiveFrom: input.effectiveFrom };
+  const commandInput = { personId: input.employeeId, orgUnitId: input.orgUnitId, managerId: input.managerId, locationId: current?.locationId, effectiveFrom: input.effectiveFrom };
   const result = current
     ? await runtime.assignments.service.transfer(request, commandInput)
     : await runtime.assignments.service.assignPrimary(request, commandInput);
@@ -47,10 +52,10 @@ export async function transferEmployeeAction(input: {
 }
 
 /**
- * Change Manager: keeps the employee's current organization unit, changes
- * only the manager. Requires an existing current placement — an employee
- * with none has no manager to change; Transfer establishes their first
- * placement instead.
+ * Change Manager: keeps the employee's current organization unit and
+ * location, changes only the manager. Requires an existing current
+ * placement — an employee with none has no manager to change; Transfer
+ * establishes their first placement instead.
  */
 export async function changeManagerAction(input: {
   employeeId: string;
@@ -69,6 +74,42 @@ export async function changeManagerAction(input: {
     personId: input.employeeId,
     orgUnitId: current.orgUnitId,
     managerId: input.managerId,
+    locationId: current.locationId,
+    effectiveFrom: input.effectiveFrom,
+  });
+  if (result.kind === "success") revalidateEmployment(input.employeeId);
+  return result;
+}
+
+/**
+ * Change Location: keeps the employee's current organization unit and
+ * manager, changes only the assigned Location. The exact same
+ * AssignmentService.transfer command as Transfer Employee and Change
+ * Manager — not a separate command — so it inherits the same overlap
+ * validation, audit, outbox, and history behavior. Requires an existing
+ * current placement, same as Change Manager.
+ */
+export async function changeLocationAction(input: {
+  employeeId: string;
+  locationId?: string;
+  effectiveFrom: string;
+}): Promise<CommandResult<AssignmentTransferred>> {
+  if (!input.locationId) {
+    return commandValidationFailure([issue("locationId", "required", "A location is required.")]);
+  }
+  const request = await resolveRequestContext();
+  const runtime = createOrganizationAdminRuntime(request);
+  const current = await runtime.assignments.read.getCurrentForPerson(runtime.context, input.employeeId);
+  if (!current) {
+    return commandValidationFailure([
+      issue("employeeId", "no_current_assignment", "This employee has no current placement. Transfer them into an organization unit first."),
+    ]);
+  }
+  const result = await runtime.assignments.service.transfer(request, {
+    personId: input.employeeId,
+    orgUnitId: current.orgUnitId,
+    managerId: current.managerId,
+    locationId: input.locationId,
     effectiveFrom: input.effectiveFrom,
   });
   if (result.kind === "success") revalidateEmployment(input.employeeId);

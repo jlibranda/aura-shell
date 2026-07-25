@@ -19,6 +19,8 @@ export interface AssignmentRecord {
   orgUnitId: string;
   /** The primary manager (an employee), when the person has one. */
   managerId?: string;
+  /** The assigned work Location, when the placement has one. Locations are orthogonal to the OrgUnit tree (ADR-012 §5) — this is a plain reference, never a hierarchy relationship. */
+  locationId?: string;
   /** Always true this slice; the column exists because "one PRIMARY at a time" is a permanent ADR-012 invariant. */
   isPrimary: boolean;
   /** Inclusive start of the placement window (ISO-8601). */
@@ -40,6 +42,7 @@ export interface AssignPrimaryInput {
   personId: string;
   orgUnitId: string;
   managerId?: string;
+  locationId?: string;
   effectiveFrom: string;
 }
 
@@ -57,6 +60,7 @@ export interface TransferInput {
   personId: string;
   orgUnitId: string;
   managerId?: string;
+  locationId?: string;
   effectiveFrom: string;
 }
 

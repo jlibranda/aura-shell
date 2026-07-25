@@ -7,6 +7,7 @@ import { ServerAuditIdGenerator } from "@/platform/auditing/audit-record";
 import { AssignmentStore, InMemoryAssignmentWriteRepository } from "@/platform/organization/in-memory-assignment-repository";
 import { AssignmentWriteTransaction } from "@/platform/organization/assignment-write-transaction";
 import { OrgUnitStore, InMemoryOrgUnitWriteRepository } from "@/platform/organization/in-memory-org-unit-repository";
+import { LocationStore, InMemoryLocationWriteRepository } from "@/platform/organization/in-memory-location-repository";
 import { InMemoryPersonExistenceRepository } from "@/platform/organization/in-memory-person-existence-repository";
 import type { AssignmentTransactionRepositories } from "@/platform/organization/assignment-repository";
 
@@ -25,11 +26,13 @@ export class InMemoryAssignmentUnitOfWork implements UnitOfWork<AssignmentTransa
     private readonly auditCollector: AuditCollector = new InMemoryAuditCollector(),
     private readonly auditRecords: AuditRecordFactory = new AuditRecordFactory(new ServerAuditIdGenerator(), { now: () => new Date().toISOString() }),
     private readonly transactionIds: { next(): string } = { next: () => randomUUID() },
+    private readonly locationStore: LocationStore = new LocationStore(),
   ) {}
 
   getStore(): AssignmentStore { return this.store; }
   getOrgUnitStore(): OrgUnitStore { return this.orgUnitStore; }
   getPeople(): InMemoryPersonExistenceRepository { return this.people; }
+  getLocationStore(): LocationStore { return this.locationStore; }
 
   async execute<TResult>(
     context: UnitOfWorkContext,
@@ -39,7 +42,8 @@ export class InMemoryAssignmentUnitOfWork implements UnitOfWork<AssignmentTransa
     const snapshot = [...this.store.assignments];
     const assignments = new AssignmentWriteTransaction(new InMemoryAssignmentWriteRepository(this.store), transactionContext);
     const orgUnits = new InMemoryOrgUnitWriteRepository(this.orgUnitStore);
-    const transaction = Object.freeze({ context: transactionContext, repositories: Object.freeze({ assignments, orgUnits, people: this.people }) });
+    const locations = new InMemoryLocationWriteRepository(this.locationStore);
+    const transaction = Object.freeze({ context: transactionContext, repositories: Object.freeze({ assignments, orgUnits, locations, people: this.people }) });
 
     try {
       const result = await operation(transaction);

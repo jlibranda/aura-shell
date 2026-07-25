@@ -17,6 +17,10 @@ function revalidateAssignments() {
  * reading the person's current placement first (their existing invariant
  * checks, not a new one) — the UI never issues an independent end-then-create
  * pair that could leave an invalid intermediate state.
+ *
+ * This form has no location field, so the current placement's locationId (if
+ * any) is always carried forward unchanged — a Settings-driven transfer must
+ * not silently clear an employee's assigned location.
  */
 export async function assignOrTransferAction(input: {
   personId: string;
@@ -27,7 +31,8 @@ export async function assignOrTransferAction(input: {
   const request = await resolveRequestContext();
   const runtime = createOrganizationAdminRuntime(request);
   const current = await runtime.assignments.read.getCurrentForPerson(runtime.context, input.personId);
-  const result = current ? await runtime.assignments.service.transfer(request, input) : await runtime.assignments.service.assignPrimary(request, input);
+  const commandInput = { ...input, locationId: current?.locationId };
+  const result = current ? await runtime.assignments.service.transfer(request, commandInput) : await runtime.assignments.service.assignPrimary(request, commandInput);
   if (result.kind === "success") revalidateAssignments();
   return result;
 }

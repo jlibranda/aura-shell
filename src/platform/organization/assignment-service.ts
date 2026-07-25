@@ -16,7 +16,7 @@ export type AssignmentAssigned = Readonly<{ state: "assigned"; assignment: Assig
 export type AssignmentTransferred = Readonly<{ state: "transferred"; previous: AssignmentRecord; assignment: AssignmentRecord }>;
 export type AssignmentEnded = Readonly<{ state: "ended"; assignment: AssignmentRecord }>;
 
-type PlacementInputCheck = "person_not_found" | "manager_not_found" | "org_unit_not_found" | undefined;
+type PlacementInputCheck = "person_not_found" | "manager_not_found" | "org_unit_not_found" | "location_not_found" | "location_archived" | undefined;
 
 /**
  * The single write entry point for placement. It owns the invariants that
@@ -34,7 +34,7 @@ export class AssignmentService {
   /** A person's first primary placement, or a future non-overlapping one. */
   async assignPrimary(
     request: TrustedRequestContext,
-    input: { personId: string; orgUnitId: string; managerId?: string; effectiveFrom: string },
+    input: { personId: string; orgUnitId: string; managerId?: string; locationId?: string; effectiveFrom: string },
   ): Promise<CommandResult<AssignmentAssigned>> {
     const denied = this.requireManage(request);
     if (denied) return denied;
@@ -53,6 +53,7 @@ export class AssignmentService {
         personId: validation.data.personId,
         orgUnitId: validation.data.orgUnitId,
         managerId: validation.data.managerId,
+        locationId: validation.data.locationId,
         effectiveFrom: validation.data.effectiveFrom,
         createdBy: request.principal.userId,
       });
@@ -62,6 +63,8 @@ export class AssignmentService {
       if (result === "person_not_found") return commandValidationFailure([issue("personId", "not_found", "This person does not exist.")]);
       if (result === "manager_not_found") return commandValidationFailure([issue("managerId", "not_found", "The chosen manager does not exist.")]);
       if (result === "org_unit_not_found") return commandValidationFailure([issue("orgUnitId", "not_found", "The chosen organization unit does not exist.")]);
+      if (result === "location_not_found") return commandValidationFailure([issue("locationId", "not_found", "The chosen location does not exist.")]);
+      if (result === "location_archived") return commandValidationFailure([issue("locationId", "archived", "The chosen location is archived and can no longer be assigned.")]);
       return commandConflict("This person already has a primary placement in force for the given period."); // overlap
     }
     return commandSuccess(Object.freeze({ state: "assigned" as const, assignment: result }));
@@ -70,7 +73,7 @@ export class AssignmentService {
   /** Ends the current primary placement and opens a new one, atomically. */
   async transfer(
     request: TrustedRequestContext,
-    input: { personId: string; orgUnitId: string; managerId?: string; effectiveFrom: string },
+    input: { personId: string; orgUnitId: string; managerId?: string; locationId?: string; effectiveFrom: string },
   ): Promise<CommandResult<AssignmentTransferred>> {
     const denied = this.requireManage(request);
     if (denied) return denied;
@@ -96,6 +99,7 @@ export class AssignmentService {
         personId: validation.data.personId,
         orgUnitId: validation.data.orgUnitId,
         managerId: validation.data.managerId,
+        locationId: validation.data.locationId,
         effectiveFrom: validation.data.effectiveFrom,
         createdBy: request.principal.userId,
       });
@@ -106,6 +110,8 @@ export class AssignmentService {
       if (result === "person_not_found") return commandValidationFailure([issue("personId", "not_found", "This person does not exist.")]);
       if (result === "manager_not_found") return commandValidationFailure([issue("managerId", "not_found", "The chosen manager does not exist.")]);
       if (result === "org_unit_not_found") return commandValidationFailure([issue("orgUnitId", "not_found", "The chosen organization unit does not exist.")]);
+      if (result === "location_not_found") return commandValidationFailure([issue("locationId", "not_found", "The chosen location does not exist.")]);
+      if (result === "location_archived") return commandValidationFailure([issue("locationId", "archived", "The chosen location is archived and can no longer be assigned.")]);
       if (result === "no_current_assignment") return commandValidationFailure([issue("personId", "no_current_assignment", "This person has no current placement to transfer from.")]);
       if (result === "invalid_transfer_date") return commandValidationFailure([issue("effectiveFrom", "INVALID_DATE", "The transfer date must be after the current placement's start date.")]);
       return commandConflict("This transfer would overlap another primary placement for this person."); // overlap
@@ -138,11 +144,16 @@ export class AssignmentService {
   private async checkPlacementInputs(
     repositories: AssignmentTransactionRepositories,
     tenantId: string,
-    data: { personId: string; orgUnitId: string; managerId?: string },
+    data: { personId: string; orgUnitId: string; managerId?: string; locationId?: string },
   ): Promise<PlacementInputCheck> {
     if (!(await repositories.people.existsById(tenantId, data.personId))) return "person_not_found";
     if (data.managerId && !(await repositories.people.existsById(tenantId, data.managerId))) return "manager_not_found";
     if (!(await repositories.orgUnits.findById(tenantId, data.orgUnitId))) return "org_unit_not_found";
+    if (data.locationId) {
+      const location = await repositories.locations.findById(tenantId, data.locationId);
+      if (!location) return "location_not_found";
+      if (location.status !== "ACTIVE") return "location_archived";
+    }
     return undefined;
   }
 

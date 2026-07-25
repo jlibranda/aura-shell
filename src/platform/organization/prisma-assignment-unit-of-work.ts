@@ -12,6 +12,7 @@ import { toOutboxMessage } from "@/platform/outbox/outbox-message";
 import { PrismaAssignmentWriteRepository } from "@/platform/organization/prisma-assignment-write-repository";
 import { AssignmentWriteTransaction } from "@/platform/organization/assignment-write-transaction";
 import { PrismaOrgUnitWriteRepository } from "@/platform/organization/prisma-org-unit-write-repository";
+import { PrismaLocationWriteRepository } from "@/platform/organization/prisma-location-write-repository";
 import { PrismaPersonExistenceRepository } from "@/platform/organization/prisma-person-existence-repository";
 import type { AssignmentTransactionRepositories } from "@/platform/organization/assignment-repository";
 import type { UnitOfWork, UnitOfWorkContext, UnitOfWorkTransaction } from "@/platform/transactions/unit-of-work";
@@ -49,8 +50,9 @@ export class PrismaAssignmentUnitOfWork implements UnitOfWork<AssignmentTransact
     const committed = await this.prisma.$transaction(async (client) => {
       const assignments = new AssignmentWriteTransaction(new PrismaAssignmentWriteRepository(client), transactionContext);
       const orgUnits = new PrismaOrgUnitWriteRepository(client);
+      const locations = new PrismaLocationWriteRepository(client);
       const people = new PrismaPersonExistenceRepository(client);
-      const transaction = Object.freeze({ context: transactionContext, repositories: Object.freeze({ assignments, orgUnits, people }) });
+      const transaction = Object.freeze({ context: transactionContext, repositories: Object.freeze({ assignments, orgUnits, locations, people }) });
       const result = await operation(transaction);
       const events = assignments.pullEvents();
       const records = this.createAuditRecords(transactionContext, events);

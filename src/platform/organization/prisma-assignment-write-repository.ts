@@ -9,7 +9,7 @@ import type { AssignmentRecord } from "@/platform/organization/assignment";
 export type PrismaAssignmentWriteClient = Pick<Prisma.TransactionClient, "assignment">;
 
 function toRecord(value: {
-  id: string; tenantId: string; personId: string; orgUnitId: string; managerId: string | null;
+  id: string; tenantId: string; personId: string; orgUnitId: string; managerId: string | null; locationId: string | null;
   isPrimary: boolean; effectiveFrom: Date; effectiveUntil: Date | null;
   createdAt: Date; createdBy: string; updatedAt: Date;
 }): AssignmentRecord {
@@ -19,6 +19,7 @@ function toRecord(value: {
     personId: value.personId,
     orgUnitId: value.orgUnitId,
     ...(value.managerId ? { managerId: value.managerId } : {}),
+    ...(value.locationId ? { locationId: value.locationId } : {}),
     isPrimary: value.isPrimary,
     effectiveFrom: value.effectiveFrom.toISOString(),
     ...(value.effectiveUntil ? { effectiveUntil: value.effectiveUntil.toISOString() } : {}),
@@ -60,6 +61,7 @@ export class PrismaAssignmentWriteRepository implements AssignmentWriteRepositor
         personId: input.personId,
         orgUnitId: input.orgUnitId,
         managerId: input.managerId ?? null,
+        locationId: input.locationId ?? null,
         effectiveFrom: new Date(input.effectiveFrom),
         createdBy: input.createdBy,
       },

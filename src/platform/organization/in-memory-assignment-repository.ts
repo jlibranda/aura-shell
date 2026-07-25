@@ -43,6 +43,7 @@ export class InMemoryAssignmentWriteRepository implements AssignmentWriteReposit
       personId: input.personId,
       orgUnitId: input.orgUnitId,
       ...(input.managerId ? { managerId: input.managerId } : {}),
+      ...(input.locationId ? { locationId: input.locationId } : {}),
       isPrimary: true,
       effectiveFrom: input.effectiveFrom,
       createdAt: now,

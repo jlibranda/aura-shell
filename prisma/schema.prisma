@@ -129,6 +129,12 @@ model Assignment {
   personId       String    @map("person_id")
   orgUnitId      String    @map("org_unit_id")
   managerId      String?   @map("manager_id")
+  /// The assigned work Location, when the placement has one (nullable —
+  /// most existing assignments predate this column, and Location assignment
+  /// is phased in per employee, not backfilled in bulk). Location is
+  /// orthogonal to the OrgUnit tree (ADR-012 §5): this is a plain reference,
+  /// never a hierarchy relationship.
+  locationId     String?   @map("location_id")
   isPrimary      Boolean   @default(true) @map("is_primary")
   effectiveFrom  DateTime  @map("effective_from") @db.Timestamptz(6)
   effectiveUntil DateTime? @map("effective_until") @db.Timestamptz(6)
@@ -139,9 +145,11 @@ model Assignment {
   person         Employee  @relation("AssignmentPerson", fields: [tenantId, personId], references: [tenantId, employeeId], onDelete: Restrict, onUpdate: Cascade)
   manager        Employee? @relation("AssignmentManager", fields: [tenantId, managerId], references: [tenantId, employeeId], onDelete: Restrict, onUpdate: Cascade)
   orgUnit        OrgUnit   @relation("OrgUnitAssignments", fields: [tenantId, orgUnitId], references: [tenantId, id], onDelete: Restrict, onUpdate: Cascade)
+  location       Location? @relation("AssignmentLocation", fields: [tenantId, locationId], references: [tenantId, id], onDelete: Restrict, onUpdate: Cascade)
 
   @@index([tenantId, personId, effectiveFrom])
   @@index([tenantId, orgUnitId])
+  @@index([tenantId, locationId])
   @@map("assignments")
 }
 
@@ -170,6 +178,7 @@ model Location {
   updatedAt    DateTime  @updatedAt @map("updated_at") @db.Timestamptz(6)
   archivedAt   DateTime? @map("archived_at") @db.Timestamptz(6)
   tenant       Tenant    @relation(fields: [tenantId], references: [id], onDelete: Restrict, onUpdate: Cascade)
+  assignments  Assignment[] @relation("AssignmentLocation")
 
   @@unique([tenantId, id])
   @@unique([tenantId, code])

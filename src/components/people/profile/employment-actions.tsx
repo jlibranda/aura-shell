@@ -2,7 +2,7 @@
 
 import { useState, useTransition } from "react";
 import { useRouter } from "next/navigation";
-import { ArrowRightLeft, UserCog, UserX } from "lucide-react";
+import { ArrowRightLeft, MapPin, UserCog, UserX } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Drawer, DrawerFooterActions } from "@/components/ui/drawer";
 import { Select } from "@/components/ui/combobox";
@@ -10,12 +10,13 @@ import { DatePicker } from "@/components/ui/date-picker";
 import { toast } from "@/components/ui/toast";
 import { ActionField, ActionReadonly } from "@/components/people/actions/action-field";
 import { fieldErrorsFrom } from "@/components/shared/command-result-helpers";
-import { transferEmployeeAction, changeManagerAction, endPlacementAction } from "@/app/(app)/people/[employeeId]/employment/actions";
+import { transferEmployeeAction, changeManagerAction, changeLocationAction, endPlacementAction } from "@/app/(app)/people/[employeeId]/employment/actions";
 import type { EmploymentActionsViewModel } from "@/platform/people/profile-employment-actions-loader";
 
 type DrawerState =
   | { mode: "transfer"; orgUnitId: string | null; managerId: string | null; effectiveFrom: string | null }
   | { mode: "change-manager"; managerId: string | null; effectiveFrom: string | null }
+  | { mode: "change-location"; locationId: string | null; effectiveFrom: string | null }
   | { mode: "end"; effectiveUntil: string | null };
 
 /**
@@ -43,8 +44,10 @@ export function EmploymentActions({
 
   const hasCurrentPlacement = Boolean(actions.currentOrgUnitId);
   const currentOrgUnitLabel = actions.orgUnitOptions.find((option) => option.id === actions.currentOrgUnitId)?.label;
+  const currentLocationLabel = actions.locationOptions.find((option) => option.id === actions.currentLocationId)?.label;
   const orgUnitSelectOptions = actions.orgUnitOptions.map((option) => ({ value: option.id, label: option.label }));
   const managerSelectOptions = actions.managerOptions.map((option) => ({ value: option.id, label: option.label }));
+  const locationSelectOptions = actions.locationOptions.map((option) => ({ value: option.id, label: option.label }));
 
   function openTransfer() {
     setErrors({});
@@ -53,6 +56,10 @@ export function EmploymentActions({
   function openChangeManager() {
     setErrors({});
     setDrawer({ mode: "change-manager", managerId: actions.currentManagerId ?? null, effectiveFrom: null });
+  }
+  function openChangeLocation() {
+    setErrors({});
+    setDrawer({ mode: "change-location", locationId: actions.currentLocationId ?? null, effectiveFrom: null });
   }
   function openEnd() {
     setErrors({});
@@ -67,13 +74,17 @@ export function EmploymentActions({
           ? await transferEmployeeAction({ employeeId, orgUnitId: drawer.orgUnitId ?? "", managerId: drawer.managerId ?? undefined, effectiveFrom: drawer.effectiveFrom ?? "" })
           : drawer.mode === "change-manager"
             ? await changeManagerAction({ employeeId, managerId: drawer.managerId ?? undefined, effectiveFrom: drawer.effectiveFrom ?? "" })
-            : await endPlacementAction({ employeeId, effectiveUntil: drawer.effectiveUntil ?? "" });
+            : drawer.mode === "change-location"
+              ? await changeLocationAction({ employeeId, locationId: drawer.locationId ?? undefined, effectiveFrom: drawer.effectiveFrom ?? "" })
+              : await endPlacementAction({ employeeId, effectiveUntil: drawer.effectiveUntil ?? "" });
 
       if (result.kind !== "success") {
         setErrors(fieldErrorsFrom(result));
         return;
       }
-      toast.success(drawer.mode === "transfer" ? "Employee transferred." : drawer.mode === "change-manager" ? "Manager changed." : "Placement ended.");
+      toast.success(
+        drawer.mode === "transfer" ? "Employee transferred." : drawer.mode === "change-manager" ? "Manager changed." : drawer.mode === "change-location" ? "Location changed." : "Placement ended.",
+      );
       setDrawer(null);
       router.refresh();
     });
@@ -92,6 +103,12 @@ export function EmploymentActions({
         </Button>
       ) : null}
       {hasCurrentPlacement ? (
+        <Button variant="outline" onClick={openChangeLocation}>
+          <MapPin className="mr-1.5 h-4 w-4" />
+          Change Location
+        </Button>
+      ) : null}
+      {hasCurrentPlacement ? (
         <Button variant="outline" onClick={openEnd}>
           <UserX className="mr-1.5 h-4 w-4" />
           End Placement
@@ -101,7 +118,15 @@ export function EmploymentActions({
       <Drawer
         open={drawer !== null}
         onClose={() => setDrawer(null)}
-        title={drawer?.mode === "transfer" ? "Transfer employee" : drawer?.mode === "change-manager" ? "Change manager" : "End placement"}
+        title={
+          drawer?.mode === "transfer"
+            ? "Transfer employee"
+            : drawer?.mode === "change-manager"
+              ? "Change manager"
+              : drawer?.mode === "change-location"
+                ? "Change location"
+                : "End placement"
+        }
         description={employeeName}
         isDirty={drawer !== null}
         footer={
@@ -140,6 +165,17 @@ export function EmploymentActions({
             {currentOrgUnitLabel ? <ActionReadonly label="Current organization" value={currentOrgUnitLabel} /> : null}
             <ActionField label="New reporting manager" hint="Optional — clear to remove the manager" error={errors.managerId}>
               {({ id }) => <Select id={id} value={drawer.managerId} onChange={(value) => setDrawer({ ...drawer, managerId: value })} options={managerSelectOptions} placeholder="No manager" />}
+            </ActionField>
+            <ActionField label="Effective from" required error={errors.effectiveFrom}>
+              {({ id }) => <DatePicker id={id} value={drawer.effectiveFrom} onChange={(value) => setDrawer({ ...drawer, effectiveFrom: value })} />}
+            </ActionField>
+          </div>
+        ) : drawer?.mode === "change-location" ? (
+          <div className="space-y-4">
+            {currentOrgUnitLabel ? <ActionReadonly label="Current organization" value={currentOrgUnitLabel} /> : null}
+            <ActionReadonly label="Current location" value={currentLocationLabel ?? "Not set"} />
+            <ActionField label="New location" required error={errors.locationId}>
+              {({ id }) => <Select id={id} value={drawer.locationId} onChange={(value) => setDrawer({ ...drawer, locationId: value })} options={locationSelectOptions} placeholder="Choose a location" />}
             </ActionField>
             <ActionField label="Effective from" required error={errors.effectiveFrom}>
               {({ id }) => <DatePicker id={id} value={drawer.effectiveFrom} onChange={(value) => setDrawer({ ...drawer, effectiveFrom: value })} />}
