@@ -23,6 +23,7 @@ model Tenant {
   configurationVersions        ConfigurationVersion[]
   orgUnits                     OrgUnit[]
   assignments                  Assignment[]
+  locations                    Location[]
 
   @@map("tenants")
 }
@@ -142,6 +143,38 @@ model Assignment {
   @@index([tenantId, personId, effectiveFrom])
   @@index([tenantId, orgUnitId])
   @@map("assignments")
+}
+
+/// Location — a physical or recognized work site (ADR-012 §5). A dimension
+/// orthogonal to the OrgUnit tree, not a node within it: never an OrgUnit
+/// `kind`, never owned by an OrgUnit. `id` and `code` are stable identity —
+/// immutable and never reused. A rename changes only the display name.
+/// Locations are archived, never hard-deleted; history lives in the audit
+/// trail, not in per-row versions. Address is a value object flattened onto
+/// this table (no independent lifecycle, per ADR-012 §5/§8).
+model Location {
+  id           String    @id @default(uuid()) @map("location_id")
+  tenantId     String    @map("tenant_id")
+  code         String    @map("code")
+  name         String    @map("name")
+  addressLine1 String    @map("address_line1")
+  addressLine2 String?   @map("address_line2")
+  city         String    @map("city")
+  region       String?   @map("region")
+  postalCode   String?   @map("postal_code")
+  countryCode  String    @map("country_code")
+  timezone     String    @map("timezone")
+  status       String    @default("ACTIVE") @map("status")
+  createdAt    DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
+  createdBy    String    @map("created_by")
+  updatedAt    DateTime  @updatedAt @map("updated_at") @db.Timestamptz(6)
+  archivedAt   DateTime? @map("archived_at") @db.Timestamptz(6)
+  tenant       Tenant    @relation(fields: [tenantId], references: [id], onDelete: Restrict, onUpdate: Cascade)
+
+  @@unique([tenantId, id])
+  @@unique([tenantId, code])
+  @@index([tenantId, status])
+  @@map("locations")
 }
 
 /// The platform login identity (Epic 6 Slice 6M0.1). Deliberately separate
