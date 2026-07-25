@@ -22,7 +22,7 @@ export type OrgUnitArchived = Readonly<{ state: "archived"; unit: OrgUnitRecord 
 export class OrgUnitService {
   constructor(private readonly unitOfWork: UnitOfWork<OrgUnitTransactionRepositories>) {}
 
-  async createOrgUnit(request: TrustedRequestContext, input: { code: string; name: string; kind: string; parentId?: string }): Promise<CommandResult<OrgUnitCreated>> {
+  async createOrgUnit(request: TrustedRequestContext, input: { legalEntityId: string; code: string; name: string; kind: string; parentId?: string }): Promise<CommandResult<OrgUnitCreated>> {
     const denied = this.requireManage(request);
     if (denied) return denied;
     const validation = validateCreateOrgUnitDraft(input);
@@ -31,12 +31,17 @@ export class OrgUnitService {
     const tenantId = request.principal.tenantId;
     const result = await this.unitOfWork.execute(this.context(request, "CreateOrgUnit"), async ({ repositories }) => {
       if (await repositories.orgUnits.findByCode(tenantId, validation.data.code)) return "code_taken" as const;
+      const legalEntity = await repositories.legalEntities.findById(tenantId, validation.data.legalEntityId);
+      if (!legalEntity) return "legal_entity_not_found" as const;
+      if (legalEntity.status !== "ACTIVE") return "legal_entity_archived" as const;
       if (input.parentId) {
         const parent = await repositories.orgUnits.findById(tenantId, input.parentId);
         if (!parent) return "parent_not_found" as const;
+        if (parent.legalEntityId !== validation.data.legalEntityId) return "cross_entity_parent" as const;
       }
       return repositories.orgUnits.create({
         tenantId,
+        legalEntityId: validation.data.legalEntityId,
         code: validation.data.code,
         name: validation.data.name,
         kind: validation.data.kind,
@@ -46,7 +51,10 @@ export class OrgUnitService {
     });
 
     if (result === "code_taken") return commandConflict(`An org unit with code "${validation.data.code}" already exists.`);
+    if (result === "legal_entity_not_found") return commandValidationFailure([issue("legalEntityId", "not_found", "The chosen legal entity does not exist.")]);
+    if (result === "legal_entity_archived") return commandValidationFailure([issue("legalEntityId", "archived", "The chosen legal entity is archived and can no longer receive new organization units.")]);
     if (result === "parent_not_found") return commandValidationFailure([issue("parentId", "not_found", "The chosen parent org unit does not exist.")]);
+    if (result === "cross_entity_parent") return commandValidationFailure([issue("parentId", "cross_entity", "The chosen parent belongs to a different legal entity. An org unit's parent must belong to the same legal entity.")]);
     return commandSuccess(Object.freeze({ state: "created" as const, unit: result }));
   }
 
@@ -72,10 +80,12 @@ export class OrgUnitService {
 
     const tenantId = request.principal.tenantId;
     const result = await this.unitOfWork.execute(this.context(request, "MoveOrgUnit"), async ({ repositories }) => {
-      if (!(await repositories.orgUnits.findById(tenantId, input.id))) return "not_found" as const;
+      const unit = await repositories.orgUnits.findById(tenantId, input.id);
+      if (!unit) return "not_found" as const;
       if (input.parentId) {
         const parent = await repositories.orgUnits.findById(tenantId, input.parentId);
         if (!parent) return "parent_not_found" as const;
+        if (parent.legalEntityId !== unit.legalEntityId) return "cross_entity_parent" as const;
         const all = await repositories.orgUnits.listAll(tenantId);
         if (wouldCreateCycle(all, input.id, input.parentId)) return "cycle" as const;
       }
@@ -84,6 +94,7 @@ export class OrgUnitService {
 
     if (result === "not_found") return commandValidationFailure([issue("id", "not_found", "This org unit no longer exists.")]);
     if (result === "parent_not_found") return commandValidationFailure([issue("parentId", "not_found", "The chosen parent org unit does not exist.")]);
+    if (result === "cross_entity_parent") return commandValidationFailure([issue("parentId", "cross_entity", "The chosen parent belongs to a different legal entity. An org unit cannot be moved across legal entities.")]);
     if (result === "cycle") return commandConflict("An org unit cannot be moved beneath itself or one of its descendants.");
     return commandSuccess(Object.freeze({ state: "moved" as const, unit: result }));
   }

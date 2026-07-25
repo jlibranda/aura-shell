@@ -13,6 +13,7 @@ import { toast } from "@/components/ui/toast";
 import { commandErrorMessage, fieldErrorsFrom } from "@/components/shared/command-result-helpers";
 import { createOrgUnitAction, renameOrgUnitAction, moveOrgUnitAction, archiveOrgUnitAction } from "@/app/(app)/settings/organization/org-units/actions";
 import { ORG_UNIT_KINDS, type OrgUnitKind, type OrgUnitRecord, type OrgUnitTreeNode } from "@/platform/organization/org-unit";
+import type { LegalEntityRecord } from "@/platform/organization/legal-entity";
 
 const KIND_LABELS: Record<OrgUnitKind, string> = {
   DIVISION: "Division",
@@ -29,7 +30,7 @@ type DrawerState = { mode: "create"; parentId?: string } | { mode: "rename"; uni
  * constraint) — the parent picker offers every unit, and an invalid move is
  * rejected server-side by OrgUnitService with a clear conflict message.
  */
-export function OrgUnitAdminView({ tree, flat, canManage }: { tree: OrgUnitTreeNode[]; flat: OrgUnitRecord[]; canManage: boolean }) {
+export function OrgUnitAdminView({ tree, flat, legalEntities, canManage }: { tree: OrgUnitTreeNode[]; flat: OrgUnitRecord[]; legalEntities: LegalEntityRecord[]; canManage: boolean }) {
   const router = useRouter();
   const [pending, startTransition] = useTransition();
   const [drawer, setDrawer] = useState<DrawerState | null>(null);
@@ -37,12 +38,15 @@ export function OrgUnitAdminView({ tree, flat, canManage }: { tree: OrgUnitTreeN
   const [expanded, setExpanded] = useState<Set<string>>(() => new Set(flat.map((unit) => unit.id)));
   const [errors, setErrors] = useState<Record<string, string>>({});
 
+  const [legalEntityId, setLegalEntityId] = useState<string | null>(null);
   const [code, setCode] = useState("");
   const [name, setName] = useState("");
   const [kind, setKind] = useState<string>("DEPARTMENT");
   const [parentId, setParentId] = useState<string | null>(null);
 
   function openCreate(underParentId?: string) {
+    const underParent = underParentId ? flat.find((unit) => unit.id === underParentId) : undefined;
+    setLegalEntityId(underParent?.legalEntityId ?? (legalEntities.length === 1 ? legalEntities[0].id : null));
     setCode("");
     setName("");
     setKind("DEPARTMENT");
@@ -75,7 +79,7 @@ export function OrgUnitAdminView({ tree, flat, canManage }: { tree: OrgUnitTreeN
     startTransition(async () => {
       const result =
         drawer.mode === "create"
-          ? await createOrgUnitAction({ code, name, kind, parentId: parentId ?? undefined })
+          ? await createOrgUnitAction({ legalEntityId: legalEntityId ?? "", code, name, kind, parentId: parentId ?? undefined })
           : drawer.mode === "rename"
             ? await renameOrgUnitAction({ id: drawer.unit.id, name })
             : await moveOrgUnitAction({ id: drawer.unit.id, parentId });
@@ -85,6 +89,10 @@ export function OrgUnitAdminView({ tree, flat, canManage }: { tree: OrgUnitTreeN
         return;
       }
       toast.success(drawer.mode === "create" ? "Org unit created." : drawer.mode === "rename" ? "Org unit renamed." : "Org unit moved.");
+      // A newly created or moved unit's parent defaults to collapsed (the expanded set is seeded once, at mount, from the units that already existed) — expand it so the unit is actually visible instead of silently hidden.
+      if ((drawer.mode === "create" || drawer.mode === "move") && parentId) {
+        setExpanded((prev) => new Set(prev).add(parentId));
+      }
       setDrawer(null);
       router.refresh();
     });
@@ -102,9 +110,19 @@ export function OrgUnitAdminView({ tree, flat, canManage }: { tree: OrgUnitTreeN
     });
   }
 
+  function changeCreateLegalEntity(nextLegalEntityId: string | null) {
+    setLegalEntityId(nextLegalEntityId);
+    const parent = parentId ? flat.find((unit) => unit.id === parentId) : undefined;
+    if (parent && parent.legalEntityId !== nextLegalEntityId) setParentId(null);
+  }
+
+  const entityScopedLegalEntityId = drawer?.mode === "create" ? legalEntityId : drawer?.mode === "move" ? drawer.unit.legalEntityId : null;
   const parentOptions = flat
     .filter((unit) => !(drawer?.mode === "move" && unit.id === drawer.unit.id))
+    .filter((unit) => !entityScopedLegalEntityId || unit.legalEntityId === entityScopedLegalEntityId)
     .map((unit) => ({ value: unit.id, label: `${unit.name} (${unit.code})` }));
+  const legalEntityOptions = legalEntities.map((entity) => ({ value: entity.id, label: `${entity.legalName} (${entity.code})` }));
+  const legalEntityCodeById = new Map(legalEntities.map((entity) => [entity.id, entity.code]));
 
   function renderNode(node: OrgUnitTreeNode, depth: number): React.ReactNode {
     const isExpanded = expanded.has(node.id);
@@ -119,7 +137,7 @@ export function OrgUnitAdminView({ tree, flat, canManage }: { tree: OrgUnitTreeN
             <span className="w-5 shrink-0" />
           )}
           <span className="flex-1 truncate text-sm text-foreground">
-            {node.name} <span className="text-xs text-muted-foreground">· {node.code} · {KIND_LABELS[node.kind]}</span>
+            {node.name} <span className="text-xs text-muted-foreground">· {node.code} · {KIND_LABELS[node.kind]}{depth === 0 ? ` · ${legalEntityCodeById.get(node.legalEntityId) ?? "Legal entity archived"}` : ""}</span>
           </span>
           <Badge tone={node.status === "ACTIVE" ? "success" : "neutral"}>{node.status === "ACTIVE" ? "Active" : "Archived"}</Badge>
           {canManage && node.status === "ACTIVE" ? (
@@ -192,6 +210,9 @@ export function OrgUnitAdminView({ tree, flat, canManage }: { tree: OrgUnitTreeN
         ) : null}
         {drawer?.mode === "create" ? (
           <div className="space-y-4">
+            <FormField label="Legal entity" error={errors.legalEntityId}>
+              {({ id }) => <Select id={id} value={legalEntityId} onChange={changeCreateLegalEntity} clearable={false} options={legalEntityOptions} placeholder="Select a legal entity" />}
+            </FormField>
             <FormField label="Code" error={errors.code}>
               {({ id }) => <Input id={id} value={code} onChange={(event) => setCode(event.target.value)} placeholder="e.g. FIN" />}
             </FormField>

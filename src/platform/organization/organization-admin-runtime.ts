@@ -7,15 +7,19 @@ import { OrganizationQueryService } from "@/platform/organization/organization-q
 import { OrgUnitService } from "@/platform/organization/org-unit-service";
 import { LocationService } from "@/platform/organization/location-service";
 import { AssignmentService } from "@/platform/organization/assignment-service";
+import { LegalEntityService } from "@/platform/organization/legal-entity-service";
 import { PrismaOrgUnitUnitOfWork } from "@/platform/organization/prisma-org-unit-unit-of-work";
 import { PrismaLocationUnitOfWork } from "@/platform/organization/prisma-location-unit-of-work";
 import { PrismaAssignmentUnitOfWork } from "@/platform/organization/prisma-assignment-unit-of-work";
+import { PrismaLegalEntityUnitOfWork } from "@/platform/organization/prisma-legal-entity-unit-of-work";
 import { PrismaOrgUnitReadRepository } from "@/platform/organization/prisma-org-unit-read-repository";
 import { PrismaLocationReadRepository } from "@/platform/organization/prisma-location-read-repository";
 import { PrismaAssignmentReadRepository } from "@/platform/organization/prisma-assignment-read-repository";
+import { PrismaLegalEntityReadRepository } from "@/platform/organization/prisma-legal-entity-read-repository";
 import type { OrgUnitReadRepository } from "@/platform/organization/org-unit-repository";
 import type { LocationReadRepository } from "@/platform/organization/location-repository";
 import type { AssignmentReadRepository } from "@/platform/organization/assignment-repository";
+import type { LegalEntityReadRepository } from "@/platform/organization/legal-entity-repository";
 import type { OrganizationEmployeeDirectory } from "@/platform/organization/organization-employee-directory";
 import { PrismaOrganizationEmployeeDirectory } from "@/platform/organization/prisma-organization-employee-directory";
 
@@ -35,6 +39,7 @@ export interface OrganizationAdminRuntime {
   readonly orgUnits: { readonly read: OrgUnitReadRepository; readonly service: OrgUnitService };
   readonly locations: { readonly read: LocationReadRepository; readonly service: LocationService };
   readonly assignments: { readonly read: AssignmentReadRepository; readonly service: AssignmentService };
+  readonly legalEntities: { readonly read: LegalEntityReadRepository; readonly service: LegalEntityService };
   readonly employees: OrganizationEmployeeDirectory;
 }
 
@@ -47,6 +52,7 @@ export function createOrganizationAdminRuntime(request: TrustedRequestContext): 
   const orgUnitRead = new PrismaOrgUnitReadRepository(prisma);
   const locationRead = new PrismaLocationReadRepository(prisma);
   const assignmentRead = new PrismaAssignmentReadRepository(prisma);
+  const legalEntityRead = new PrismaLegalEntityReadRepository(prisma);
 
   return Object.freeze({
     context: createTenantContext(request),
@@ -62,6 +68,10 @@ export function createOrganizationAdminRuntime(request: TrustedRequestContext): 
     assignments: Object.freeze({
       read: assignmentRead,
       service: new AssignmentService(new PrismaAssignmentUnitOfWork(prisma, eventCollector, auditCollector)),
+    }),
+    legalEntities: Object.freeze({
+      read: legalEntityRead,
+      service: new LegalEntityService(new PrismaLegalEntityUnitOfWork(prisma, eventCollector, auditCollector)),
     }),
     employees: new PrismaOrganizationEmployeeDirectory(prisma),
   });

@@ -34,6 +34,12 @@ export interface EmploymentHistoryRow {
   effectiveUntil?: string;
 }
 
+export interface EmploymentLegalEntitySummary {
+  id: string;
+  legalName: string;
+  code: string;
+}
+
 export interface EmploymentActionsViewModel {
   /** Gates whether Transfer/Change Manager/End Placement render at all. The
    *  underlying AssignmentService re-checks organization.manage server-side
@@ -49,6 +55,8 @@ export interface EmploymentActionsViewModel {
   history: EmploymentHistoryRow[];
   /** Root -> assigned unit, for the canonical OrganizationPath component. Empty when there's no current placement. */
   organizationPath: OrganizationPathSegment[];
+  /** The current placement's employer of record (Assignment.legalEntityId — ADR-013 §3). Absent when there's no current placement, matching organizationPath. */
+  legalEntity?: EmploymentLegalEntitySummary;
 }
 
 const EMPTY_ACTIONS: EmploymentActionsViewModel = Object.freeze({
@@ -145,6 +153,9 @@ export async function loadEmploymentActionsSurface(employeeId: string): Promise<
   const organizationPath = currentPlacement
     ? toOrganizationPathSegments(await runtime.queries.resolveOrgPath(runtime.context, currentPlacement.assignment.orgUnitId))
     : [];
+  const legalEntity = currentPlacement
+    ? await runtime.legalEntities.read.getById(runtime.context, currentPlacement.assignment.legalEntityId)
+    : undefined;
 
   return {
     canManage: hasPermission(runtime.context, "organization.manage"),
@@ -154,23 +165,38 @@ export async function loadEmploymentActionsSurface(employeeId: string): Promise<
     ...toEmploymentPickerOptions(orgUnits, employees, employeeId, locations),
     history: toEmploymentHistoryRows(history, orgUnitNames, employeeNames, locationNames),
     organizationPath,
+    ...(legalEntity ? { legalEntity: { id: legalEntity.id, legalName: legalEntity.legalName, code: legalEntity.code } } : {}),
   };
 }
 
+export interface OrganizationPathWithLegalEntity {
+  organizationPath: OrganizationPathSegment[];
+  /** Same Assignment.legalEntityId loadEmploymentActionsSurface resolves — Employment and Work Information always show the same value (ADR-013 §3), never independently derived. */
+  legalEntity?: EmploymentLegalEntitySummary;
+}
+
+const EMPTY_ORGANIZATION_PATH: OrganizationPathWithLegalEntity = Object.freeze({ organizationPath: [] });
+
 /**
  * Lightweight sibling of loadEmploymentActionsSurface for screens that only
- * need the organization path (e.g. Work Information) — skips the picker
- * options and history payload loadEmploymentActionsSurface also computes.
- * Same OrganizationQueryService, same graceful degradation.
+ * need the organization path and legal entity (e.g. Work Information) —
+ * skips the picker options and history payload loadEmploymentActionsSurface
+ * also computes. Same OrganizationQueryService, same graceful degradation.
  */
-export async function loadOrganizationPathForEmployee(employeeId: string): Promise<OrganizationPathSegment[]> {
+export async function loadOrganizationPathForEmployee(employeeId: string): Promise<OrganizationPathWithLegalEntity> {
   const request = await resolveRequestContext();
   const runtime = createOrganizationAdminRuntime(request);
-  if (!hasPermission(runtime.context, "organization.view")) return [];
+  if (!hasPermission(runtime.context, "organization.view")) return EMPTY_ORGANIZATION_PATH;
 
   const currentPlacement = await runtime.queries.resolveCurrentPlacement(runtime.context, employeeId);
-  if (!currentPlacement) return [];
+  if (!currentPlacement) return EMPTY_ORGANIZATION_PATH;
 
-  const path = await runtime.queries.resolveOrgPath(runtime.context, currentPlacement.assignment.orgUnitId);
-  return toOrganizationPathSegments(path);
+  const [path, legalEntity] = await Promise.all([
+    runtime.queries.resolveOrgPath(runtime.context, currentPlacement.assignment.orgUnitId),
+    runtime.legalEntities.read.getById(runtime.context, currentPlacement.assignment.legalEntityId),
+  ]);
+  return {
+    organizationPath: toOrganizationPathSegments(path),
+    ...(legalEntity ? { legalEntity: { id: legalEntity.id, legalName: legalEntity.legalName, code: legalEntity.code } } : {}),
+  };
 }

@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  ORG_UNIT_KINDS,
   buildOrgUnitTree,
   collectDescendantIds,
   validateCreateOrgUnitDraft,
@@ -7,22 +8,32 @@ import {
   type OrgUnitRecord,
 } from "@/platform/organization/org-unit";
 
+describe("ORG_UNIT_KINDS", () => {
+  it("includes BUSINESS_UNIT — reachable end-to-end from Settings and from Hire's organization unit selector", () => {
+    expect(ORG_UNIT_KINDS).toContain("BUSINESS_UNIT");
+  });
+
+  it("never includes Legal Entity as an OrgUnit kind (ADR-012 §5 — LegalEntity is a separate, deferred aggregate, never an OrgUnit kind)", () => {
+    for (const kind of ORG_UNIT_KINDS) expect(kind).not.toMatch(/entity/i);
+  });
+});
+
 function unit(id: string, parentId?: string, name = id): OrgUnitRecord {
   return Object.freeze({
-    id, tenantId: "t1", code: id.toUpperCase(), name, kind: "DEPARTMENT", ...(parentId ? { parentId } : {}),
+    id, tenantId: "t1", legalEntityId: "le1", code: id.toUpperCase(), name, kind: "DEPARTMENT", ...(parentId ? { parentId } : {}),
     status: "ACTIVE", createdAt: "2026-01-01T00:00:00.000Z", createdBy: "actor", updatedAt: "2026-01-01T00:00:00.000Z",
   });
 }
 
 describe("validateCreateOrgUnitDraft", () => {
   it("accepts a valid draft and normalizes code (trim + uppercase) and name", () => {
-    const result = validateCreateOrgUnitDraft({ code: " fin ", name: " Finance ", kind: "DEPARTMENT" });
+    const result = validateCreateOrgUnitDraft({ legalEntityId: "le1", code: " fin ", name: " Finance ", kind: "DEPARTMENT" });
     expect(result.success).toBe(true);
     if (result.success) { expect(result.data.code).toBe("FIN"); expect(result.data.name).toBe("Finance"); }
   });
 
   it("rejects a missing/blank name and code", () => {
-    const result = validateCreateOrgUnitDraft({ code: "", name: "", kind: "DEPARTMENT" });
+    const result = validateCreateOrgUnitDraft({ legalEntityId: "le1", code: "", name: "", kind: "DEPARTMENT" });
     expect(result.success).toBe(false);
     if (!result.success) {
       expect(result.issues.some((i) => i.path.join(".") === "code" && i.code === "REQUIRED")).toBe(true);
@@ -31,14 +42,20 @@ describe("validateCreateOrgUnitDraft", () => {
   });
 
   it("rejects an unsupported kind", () => {
-    const result = validateCreateOrgUnitDraft({ code: "X1", name: "X", kind: "GUILD" });
+    const result = validateCreateOrgUnitDraft({ legalEntityId: "le1", code: "X1", name: "X", kind: "GUILD" });
     expect(result.success).toBe(false);
     if (!result.success) expect(result.issues.some((i) => i.path.join(".") === "kind" && i.code === "UNSUPPORTED")).toBe(true);
   });
 
   it("rejects a malformed code", () => {
-    expect(validateCreateOrgUnitDraft({ code: "has space", name: "X", kind: "TEAM" }).success).toBe(false);
-    expect(validateCreateOrgUnitDraft({ code: "-bad", name: "X", kind: "TEAM" }).success).toBe(false);
+    expect(validateCreateOrgUnitDraft({ legalEntityId: "le1", code: "has space", name: "X", kind: "TEAM" }).success).toBe(false);
+    expect(validateCreateOrgUnitDraft({ legalEntityId: "le1", code: "-bad", name: "X", kind: "TEAM" }).success).toBe(false);
+  });
+
+  it("rejects a missing legal entity", () => {
+    const result = validateCreateOrgUnitDraft({ legalEntityId: "", code: "X1", name: "X", kind: "TEAM" });
+    expect(result.success).toBe(false);
+    if (!result.success) expect(result.issues.some((i) => i.path.join(".") === "legalEntityId" && i.code === "REQUIRED")).toBe(true);
   });
 });
 

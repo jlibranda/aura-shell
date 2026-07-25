@@ -22,6 +22,7 @@ describe("organization admin runtime (integration)", () => {
     await prisma.assignment.deleteMany({ where: { tenantId: { in: [tenantA, tenantB] } } }).catch(() => undefined);
     await prisma.location.deleteMany({ where: { tenantId: { in: [tenantA, tenantB] } } }).catch(() => undefined);
     await prisma.orgUnit.deleteMany({ where: { tenantId: { in: [tenantA, tenantB] } } }).catch(() => undefined);
+    await prisma.legalEntity.deleteMany({ where: { tenantId: { in: [tenantA, tenantB] } } }).catch(() => undefined);
     await prisma.employee.deleteMany({ where: { tenantId: { in: [tenantA, tenantB] } } }).catch(() => undefined);
     await prisma.tenant.deleteMany({ where: { id: { in: [tenantA, tenantB] } } }).catch(() => undefined);
   });
@@ -51,6 +52,12 @@ describe("organization admin runtime (integration)", () => {
     });
   }
 
+  async function seedLegalEntity(runtime: ReturnType<typeof createOrganizationAdminRuntime>, tenantId: string): Promise<string> {
+    const result = await runtime.legalEntities.service.createLegalEntity(request(tenantId), { code: `LE-${randomUUID().slice(0, 8)}`.toUpperCase(), legalName: "Test Legal Entity", countryCode: "PH" });
+    if (result.kind !== "success") throw new Error("seed legal entity failed");
+    return result.value.legalEntity.id;
+  }
+
   it("drives org unit, location, and assignment creation through one runtime, and reflects it in the admin read surface", async () => {
     await seedTenant(tenantA);
     const personId = `emp-${randomUUID().slice(0, 8)}`;
@@ -59,9 +66,10 @@ describe("organization admin runtime (integration)", () => {
     await seedEmployee(tenantA, managerId, "Mary Manager");
 
     const runtime = createOrganizationAdminRuntime(request(tenantA));
+    const legalEntityId = await seedLegalEntity(runtime, tenantA);
 
     const unitCode = `FIN-${randomUUID().slice(0, 8)}`.toUpperCase();
-    const unitResult = await runtime.orgUnits.service.createOrgUnit(request(tenantA), { code: unitCode, name: "Finance", kind: "DEPARTMENT" });
+    const unitResult = await runtime.orgUnits.service.createOrgUnit(request(tenantA), { legalEntityId, code: unitCode, name: "Finance", kind: "DEPARTMENT" });
     expect(unitResult.kind).toBe("success");
     if (unitResult.kind !== "success") return;
 
@@ -94,9 +102,10 @@ describe("organization admin runtime (integration)", () => {
     const personId = `emp-${randomUUID().slice(0, 8)}`;
     await seedEmployee(tenantA, personId, "Transfer Target");
     const runtime = createOrganizationAdminRuntime(request(tenantA));
+    const legalEntityId = await seedLegalEntity(runtime, tenantA);
 
-    const unitA = await runtime.orgUnits.service.createOrgUnit(request(tenantA), { code: `A-${randomUUID().slice(0, 8)}`.toUpperCase(), name: "Unit A", kind: "TEAM" });
-    const unitB = await runtime.orgUnits.service.createOrgUnit(request(tenantA), { code: `B-${randomUUID().slice(0, 8)}`.toUpperCase(), name: "Unit B", kind: "TEAM" });
+    const unitA = await runtime.orgUnits.service.createOrgUnit(request(tenantA), { legalEntityId, code: `A-${randomUUID().slice(0, 8)}`.toUpperCase(), name: "Unit A", kind: "TEAM" });
+    const unitB = await runtime.orgUnits.service.createOrgUnit(request(tenantA), { legalEntityId, code: `B-${randomUUID().slice(0, 8)}`.toUpperCase(), name: "Unit B", kind: "TEAM" });
     if (unitA.kind !== "success" || unitB.kind !== "success") throw new Error("seed org units failed");
 
     const assigned = await runtime.assignments.service.assignPrimary(request(tenantA), { personId, orgUnitId: unitA.value.unit.id, effectiveFrom: "2026-01-01T00:00:00.000Z" });
@@ -122,7 +131,8 @@ describe("organization admin runtime (integration)", () => {
     await seedEmployee(tenantA, personId, "Tenant A Employee");
 
     const runtimeA = createOrganizationAdminRuntime(request(tenantA));
-    const unit = await runtimeA.orgUnits.service.createOrgUnit(request(tenantA), { code: `IS-${randomUUID().slice(0, 8)}`.toUpperCase(), name: "Isolated Unit", kind: "TEAM" });
+    const legalEntityId = await seedLegalEntity(runtimeA, tenantA);
+    const unit = await runtimeA.orgUnits.service.createOrgUnit(request(tenantA), { legalEntityId, code: `IS-${randomUUID().slice(0, 8)}`.toUpperCase(), name: "Isolated Unit", kind: "TEAM" });
     if (unit.kind !== "success") throw new Error("seed org unit failed");
     const assigned = await runtimeA.assignments.service.assignPrimary(request(tenantA), { personId, orgUnitId: unit.value.unit.id, effectiveFrom: "2026-01-01T00:00:00.000Z" });
     if (assigned.kind !== "success") throw new Error("seed assignment failed");

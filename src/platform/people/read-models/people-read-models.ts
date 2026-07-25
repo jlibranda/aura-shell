@@ -47,7 +47,8 @@ export interface EmployeeProfileReadModel {
   departmentId: string;
   teamId?: string;
   managerId?: string;
-  location: string;
+  /** The legacy free-text field — null once an employee has no Assignment.locationId AND no legacy value (e.g. every new hire; see resolveDisplayLocation, the only place this should ever be read). */
+  location: string | null;
   hireDate: string;
   /** Not persisted by the canonical schema; retained only as an optional UI boundary. */
   regularizationDate?: string;

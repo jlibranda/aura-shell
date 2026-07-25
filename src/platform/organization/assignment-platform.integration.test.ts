@@ -24,6 +24,7 @@ describe("assignment platform (integration)", () => {
   afterAll(async () => {
     await prisma.assignment.deleteMany({ where: { tenantId: { in: [tenantA, tenantB] } } }).catch(() => undefined);
     await prisma.orgUnit.deleteMany({ where: { tenantId: { in: [tenantA, tenantB] } } }).catch(() => undefined);
+    await prisma.legalEntity.deleteMany({ where: { tenantId: { in: [tenantA, tenantB] } } }).catch(() => undefined);
     await prisma.employee.deleteMany({ where: { tenantId: { in: [tenantA, tenantB] } } }).catch(() => undefined);
     await prisma.tenant.deleteMany({ where: { id: { in: [tenantA, tenantB] } } }).catch(() => undefined);
   });
@@ -43,8 +44,15 @@ describe("assignment platform (integration)", () => {
     });
   }
 
+  async function seedLegalEntity(tenantId: string): Promise<string> {
+    const suffix = randomUUID().slice(0, 8).toUpperCase();
+    const entity = await prisma.legalEntity.create({ data: { tenantId, code: `LE-${suffix}`, legalName: "Test Legal Entity", countryCode: "PH", createdBy: "tester" } });
+    return entity.id;
+  }
+
   async function seedOrgUnit(tenantId: string, id: string, code: string) {
-    return prisma.orgUnit.create({ data: { id, tenantId, code, name: code, kind: "TEAM", createdBy: "tester" } });
+    const legalEntityId = await seedLegalEntity(tenantId);
+    return prisma.orgUnit.create({ data: { id, tenantId, legalEntityId, code, name: code, kind: "TEAM", createdBy: "tester" } });
   }
 
   function request(tenantId: string) {
@@ -91,11 +99,11 @@ describe("assignment platform (integration)", () => {
     const orgUnit = await seedOrgUnit(tenantA, randomUUID(), `OU-${randomUUID().slice(0, 8)}`.toUpperCase());
 
     await expect(prisma.assignment.create({
-      data: { tenantId: tenantA, personId, orgUnitId: orgUnit.id, managerId: personId, effectiveFrom: new Date("2026-01-01"), createdBy: "tester" },
+      data: { tenantId: tenantA, personId, legalEntityId: orgUnit.legalEntityId, orgUnitId: orgUnit.id, managerId: personId, effectiveFrom: new Date("2026-01-01"), createdBy: "tester" },
     })).rejects.toThrow();
 
     await expect(prisma.assignment.create({
-      data: { tenantId: tenantA, personId, orgUnitId: orgUnit.id, effectiveFrom: new Date("2026-06-01"), effectiveUntil: new Date("2026-01-01"), createdBy: "tester" },
+      data: { tenantId: tenantA, personId, legalEntityId: orgUnit.legalEntityId, orgUnitId: orgUnit.id, effectiveFrom: new Date("2026-06-01"), effectiveUntil: new Date("2026-01-01"), createdBy: "tester" },
     })).rejects.toThrow();
   });
 
@@ -105,9 +113,9 @@ describe("assignment platform (integration)", () => {
     await seedEmployee(tenantA, personId);
     const orgUnit = await seedOrgUnit(tenantA, randomUUID(), `OU-${randomUUID().slice(0, 8)}`.toUpperCase());
 
-    await prisma.assignment.create({ data: { tenantId: tenantA, personId, orgUnitId: orgUnit.id, effectiveFrom: new Date("2026-01-01"), createdBy: "tester" } });
+    await prisma.assignment.create({ data: { tenantId: tenantA, personId, legalEntityId: orgUnit.legalEntityId, orgUnitId: orgUnit.id, effectiveFrom: new Date("2026-01-01"), createdBy: "tester" } });
     await expect(prisma.assignment.create({
-      data: { tenantId: tenantA, personId, orgUnitId: orgUnit.id, effectiveFrom: new Date("2026-06-01"), createdBy: "tester" },
+      data: { tenantId: tenantA, personId, legalEntityId: orgUnit.legalEntityId, orgUnitId: orgUnit.id, effectiveFrom: new Date("2026-06-01"), createdBy: "tester" },
     })).rejects.toThrow();
   });
 
@@ -162,7 +170,7 @@ describe("assignment platform (integration)", () => {
     const foreignOrgUnit = await seedOrgUnit(tenantB, randomUUID(), `OU-${randomUUID().slice(0, 8)}`.toUpperCase());
 
     await expect(prisma.assignment.create({
-      data: { tenantId: tenantA, personId, orgUnitId: foreignOrgUnit.id, effectiveFrom: new Date("2026-01-01"), createdBy: "tester" },
+      data: { tenantId: tenantA, personId, legalEntityId: foreignOrgUnit.legalEntityId, orgUnitId: foreignOrgUnit.id, effectiveFrom: new Date("2026-01-01"), createdBy: "tester" },
     })).rejects.toThrow();
   });
 

@@ -40,7 +40,7 @@ function parseCommand(input: unknown): CreateEmployeeCommand | undefined {
   const root = object(input); if (!root) return undefined;
   const personal = strings(object(root.personal), ["firstName", "middleName", "lastName", "preferredName", "gender", "maritalStatus", "nationality"]);
   const contact = strings(object(root.contact), ["personalEmail", "workEmail", "mobileNumber", "homeAddress"]);
-  const employment = strings(object(root.employment), ["departmentId", "teamId", "position", "managerId", "employmentType", "workLocation"]);
+  const employment = strings(object(root.employment), ["legalEntityId", "orgUnitId", "locationId", "position", "managerId", "employmentType"]);
   const emergencyContact = strings(object(root.emergencyContact), ["name", "relationship", "mobileNumber", "email", "address"]);
   const dateOfBirth = value(object(root.personal) ?? {}, "dateOfBirth", true);
   const hireDate = value(object(root.employment) ?? {}, "hireDate", true);

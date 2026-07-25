@@ -4,7 +4,7 @@ import type { AssignmentRecord } from "@/platform/organization/assignment";
 
 function assignment(overrides: Partial<AssignmentRecord> = {}): AssignmentRecord {
   return Object.freeze({
-    id: "a1", tenantId: "t1", personId: "p1", orgUnitId: "ou1", isPrimary: true,
+    id: "a1", tenantId: "t1", personId: "p1", legalEntityId: "le1", orgUnitId: "ou1", isPrimary: true,
     effectiveFrom: "2026-01-01T00:00:00.000Z", createdAt: "2026-01-01T00:00:00.000Z", createdBy: "actor", updatedAt: "2026-01-01T00:00:00.000Z",
     ...overrides,
   });

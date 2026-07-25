@@ -22,11 +22,18 @@ describe("org unit platform (integration)", () => {
 
   afterAll(async () => {
     await prisma.orgUnit.deleteMany({ where: { tenantId: { in: [tenantA, tenantB] } } }).catch(() => undefined);
+    await prisma.legalEntity.deleteMany({ where: { tenantId: { in: [tenantA, tenantB] } } }).catch(() => undefined);
     await prisma.tenant.deleteMany({ where: { id: { in: [tenantA, tenantB] } } }).catch(() => undefined);
   });
 
   async function seedTenant(tenantId: string) {
     await prisma.tenant.upsert({ where: { id: tenantId }, create: { id: tenantId }, update: {} });
+  }
+
+  async function seedLegalEntity(tenantId: string): Promise<string> {
+    const suffix = randomUUID().slice(0, 8).toUpperCase();
+    const entity = await prisma.legalEntity.create({ data: { tenantId, code: `LE-${suffix}`, legalName: "Test Legal Entity", countryCode: "PH", createdBy: "tester" } });
+    return entity.id;
   }
 
   function request(tenantId: string) {
@@ -45,12 +52,13 @@ describe("org unit platform (integration)", () => {
 
   it("commits the org unit, audit record, and outbox message atomically on create", async () => {
     await seedTenant(tenantA);
+    const legalEntityId = await seedLegalEntity(tenantA);
     const events = new InMemoryDomainEventCollector();
     const audit = new InMemoryAuditCollector();
     const service = new OrgUnitService(new PrismaOrgUnitUnitOfWork(prisma, events, audit));
 
     const code = `FIN-${randomUUID().slice(0, 8)}`.toUpperCase();
-    const result = await service.createOrgUnit(request(tenantA), { code, name: "Finance", kind: "DIVISION" });
+    const result = await service.createOrgUnit(request(tenantA), { legalEntityId, code, name: "Finance", kind: "DIVISION" });
     expect(result.kind).toBe("success");
     if (result.kind !== "success") return;
 
@@ -65,11 +73,12 @@ describe("org unit platform (integration)", () => {
 
   it("builds and reads a real parent-child hierarchy, tenant-scoped", async () => {
     await seedTenant(tenantA);
+    const legalEntityId = await seedLegalEntity(tenantA);
     const service = new OrgUnitService(new PrismaOrgUnitUnitOfWork(prisma, new InMemoryDomainEventCollector(), new InMemoryAuditCollector()));
     const suffix = randomUUID().slice(0, 8).toUpperCase();
-    const root = await service.createOrgUnit(request(tenantA), { code: `ROOT-${suffix}`, name: "Root", kind: "DIVISION" });
+    const root = await service.createOrgUnit(request(tenantA), { legalEntityId, code: `ROOT-${suffix}`, name: "Root", kind: "DIVISION" });
     if (root.kind !== "success") throw new Error("root create failed");
-    const child = await service.createOrgUnit(request(tenantA), { code: `CH-${suffix}`, name: "Child", kind: "DEPARTMENT", parentId: root.value.unit.id });
+    const child = await service.createOrgUnit(request(tenantA), { legalEntityId, code: `CH-${suffix}`, name: "Child", kind: "DEPARTMENT", parentId: root.value.unit.id });
     expect(child.kind).toBe("success");
     if (child.kind !== "success") return;
 
@@ -81,26 +90,29 @@ describe("org unit platform (integration)", () => {
 
   it("the database rejects an invalid kind and a self-parent (DB-level guards)", async () => {
     await seedTenant(tenantA);
+    const legalEntityId = await seedLegalEntity(tenantA);
     const id = randomUUID();
-    await expect(prisma.orgUnit.create({ data: { id, tenantId: tenantA, code: `BAD-${id.slice(0, 6)}`, name: "Bad", kind: "GUILD", createdBy: "tester" } })).rejects.toThrow();
+    await expect(prisma.orgUnit.create({ data: { id, tenantId: tenantA, legalEntityId, code: `BAD-${id.slice(0, 6)}`, name: "Bad", kind: "GUILD", createdBy: "tester" } })).rejects.toThrow();
 
-    const good = await prisma.orgUnit.create({ data: { tenantId: tenantA, code: `SELF-${id.slice(0, 6)}`, name: "Self", kind: "TEAM", createdBy: "tester" } });
+    const good = await prisma.orgUnit.create({ data: { tenantId: tenantA, legalEntityId, code: `SELF-${id.slice(0, 6)}`, name: "Self", kind: "TEAM", createdBy: "tester" } });
     await expect(prisma.orgUnit.update({ where: { id: good.id }, data: { parentId: good.id } })).rejects.toThrow();
   });
 
   it("the database rejects a duplicate code within a tenant", async () => {
     await seedTenant(tenantA);
+    const legalEntityId = await seedLegalEntity(tenantA);
     const code = `UNIQ-${randomUUID().slice(0, 8)}`.toUpperCase();
-    await prisma.orgUnit.create({ data: { tenantId: tenantA, code, name: "One", kind: "TEAM", createdBy: "tester" } });
-    await expect(prisma.orgUnit.create({ data: { tenantId: tenantA, code, name: "Two", kind: "TEAM", createdBy: "tester" } })).rejects.toThrow();
+    await prisma.orgUnit.create({ data: { tenantId: tenantA, legalEntityId, code, name: "One", kind: "TEAM", createdBy: "tester" } });
+    await expect(prisma.orgUnit.create({ data: { tenantId: tenantA, legalEntityId, code, name: "Two", kind: "TEAM", createdBy: "tester" } })).rejects.toThrow();
   });
 
   it("keeps org units strictly tenant-isolated in reads", async () => {
     await seedTenant(tenantA);
     await seedTenant(tenantB);
+    const legalEntityId = await seedLegalEntity(tenantA);
     const service = new OrgUnitService(new PrismaOrgUnitUnitOfWork(prisma, new InMemoryDomainEventCollector(), new InMemoryAuditCollector()));
     const code = `ISO-${randomUUID().slice(0, 8)}`.toUpperCase();
-    const created = await service.createOrgUnit(request(tenantA), { code, name: "A only", kind: "DIVISION" });
+    const created = await service.createOrgUnit(request(tenantA), { legalEntityId, code, name: "A only", kind: "DIVISION" });
     if (created.kind !== "success") throw new Error("create failed");
 
     const reader = new PrismaOrgUnitReadRepository(prisma);

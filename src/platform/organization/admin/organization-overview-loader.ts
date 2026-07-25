@@ -4,9 +4,12 @@ import { createOrganizationAdminRuntime } from "@/platform/organization/organiza
 import type { AssignmentRecord } from "@/platform/organization/assignment";
 import type { LocationRecord } from "@/platform/organization/location";
 import type { OrgUnitRecord } from "@/platform/organization/org-unit";
+import type { LegalEntityRecord } from "@/platform/organization/legal-entity";
 import type { OrganizationEmployeeDirectoryEntry } from "@/platform/organization/organization-employee-directory";
 
 export interface OrganizationOverviewCounts {
+  activeLegalEntities: number;
+  archivedLegalEntities: number;
   activeOrgUnits: number;
   archivedOrgUnits: number;
   activeLocations: number;
@@ -27,17 +30,21 @@ export type OrganizationOverviewResult =
  * Pure so it can be unit tested without a request/runtime.
  */
 export function computeOrganizationOverviewCounts(
+  legalEntities: readonly Pick<LegalEntityRecord, "status">[],
   orgUnits: readonly Pick<OrgUnitRecord, "status">[],
   locations: readonly Pick<LocationRecord, "status">[],
   employees: readonly OrganizationEmployeeDirectoryEntry[],
   currentAssignments: readonly Pick<AssignmentRecord, "personId">[],
 ): OrganizationOverviewCounts {
+  const activeLegalEntities = legalEntities.filter((entity) => entity.status === "ACTIVE").length;
   const activeOrgUnits = orgUnits.filter((unit) => unit.status === "ACTIVE").length;
   const activeLocations = locations.filter((location) => location.status === "ACTIVE").length;
   const assignedPersonIds = new Set(currentAssignments.map((assignment) => assignment.personId));
   const employeesWithAssignment = employees.filter((employee) => assignedPersonIds.has(employee.id)).length;
 
   return {
+    activeLegalEntities,
+    archivedLegalEntities: legalEntities.length - activeLegalEntities,
     activeOrgUnits,
     archivedOrgUnits: orgUnits.length - activeOrgUnits,
     activeLocations,
@@ -52,7 +59,8 @@ export async function loadOrganizationOverview(): Promise<OrganizationOverviewRe
   const runtime = createOrganizationAdminRuntime(request);
   if (!hasPermission(runtime.context, "organization.view")) return { kind: "unauthorized" };
 
-  const [orgUnits, locations, employees, currentAssignments] = await Promise.all([
+  const [legalEntities, orgUnits, locations, employees, currentAssignments] = await Promise.all([
+    runtime.legalEntities.read.listAll(runtime.context),
     runtime.orgUnits.read.listAll(runtime.context),
     runtime.locations.read.listAll(runtime.context),
     runtime.employees.listAll(runtime.context.tenantId),
@@ -62,7 +70,7 @@ export async function loadOrganizationOverview(): Promise<OrganizationOverviewRe
   return {
     kind: "ready",
     context: runtime.context,
-    counts: computeOrganizationOverviewCounts(orgUnits, locations, employees, currentAssignments),
+    counts: computeOrganizationOverviewCounts(legalEntities, orgUnits, locations, employees, currentAssignments),
     canManage: hasPermission(runtime.context, "organization.manage"),
   };
 }

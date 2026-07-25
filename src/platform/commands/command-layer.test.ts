@@ -17,7 +17,7 @@ const request = () => createTrustedRequestContext({
 const command = () => createCreateEmployeeCommand({
   personal: { firstName: "Ana", middleName: "", lastName: "Domingo", preferredName: "", dateOfBirth: "1994-02-01", gender: "female", maritalStatus: "single", nationality: "Filipino" },
   contact: { personalEmail: "", workEmail: "ana@work.example", mobileNumber: "+63 917 000 0000", homeAddress: "" },
-  employment: { departmentId: "dep-1", teamId: "", position: "Analyst", managerId: "", employmentType: "regular", hireDate: "2024-02-01", workLocation: "Manila" },
+  employment: { legalEntityId: "le-1", orgUnitId: "dep-1", locationId: "loc-1", position: "Analyst", managerId: "", employmentType: "regular", hireDate: "2024-02-01" },
   emergencyContact: { name: "", relationship: "", mobileNumber: "", email: "", address: "" },
 });
 

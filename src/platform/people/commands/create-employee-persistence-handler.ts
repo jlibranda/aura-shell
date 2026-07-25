@@ -21,7 +21,16 @@ export class CreateEmployeePersistenceHandler implements CommandHandler<CreateEm
       displayName: [command.personal.firstName, command.personal.middleName, command.personal.lastName].filter(Boolean).join(" "),
       personal: { ...command.personal, dateOfBirth: command.personal.dateOfBirth! },
       contact: { ...command.contact },
-      employment: { ...command.employment, hireDate: command.employment.hireDate! },
+      // Legacy compatibility only (ADR-012 §7) — see CreateEmployeeDurableHandler for the authoritative Assignment creation this test-only path does not perform.
+      employment: {
+        departmentId: command.employment.orgUnitId,
+        teamId: "",
+        position: command.employment.position,
+        managerId: command.employment.managerId,
+        employmentType: command.employment.employmentType,
+        hireDate: command.employment.hireDate!,
+        workLocation: null,
+      },
       emergencyContact: { ...command.emergencyContact },
     };
     const result = await this.unitOfWork.execute(

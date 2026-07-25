@@ -24,6 +24,7 @@ model Tenant {
   orgUnits                     OrgUnit[]
   assignments                  Assignment[]
   locations                    Location[]
+  legalEntities                LegalEntity[]
 
   @@map("tenants")
 }
@@ -83,6 +84,37 @@ model ConfigurationVersion {
   @@map("configuration_versions")
 }
 
+/// LegalEntity — the registered employer of record (Epic 7B.6, ADR-013).
+/// A peer Organization aggregate, never an OrgUnit `kind`: every OrgUnit
+/// belongs to exactly one Legal Entity (ownership, not attribute), and every
+/// Assignment records the Legal Entity of the OrgUnit it places a person into.
+/// `id` and `code` are stable identity — immutable and never reused. Archived,
+/// never hard-deleted, matching OrgUnit/Location. Deliberately narrow scope
+/// (ADR-013 §3): no tax registrations, statutory account numbers, bank
+/// accounts, payroll calendars, or country payroll rules — those are
+/// Payroll-domain concerns that attach later, when Payroll is built.
+model LegalEntity {
+  id          String       @id @default(uuid()) @map("legal_entity_id")
+  tenantId    String       @map("tenant_id")
+  code        String       @map("code")
+  legalName   String       @map("legal_name")
+  /// ISO 3166-1 alpha-2, e.g. "PH", "SG", "US".
+  countryCode String       @map("country_code")
+  status      String       @default("ACTIVE") @map("status")
+  createdAt   DateTime     @default(now()) @map("created_at") @db.Timestamptz(6)
+  createdBy   String       @map("created_by")
+  updatedAt   DateTime     @updatedAt @map("updated_at") @db.Timestamptz(6)
+  archivedAt  DateTime?    @map("archived_at") @db.Timestamptz(6)
+  tenant      Tenant       @relation(fields: [tenantId], references: [id], onDelete: Restrict, onUpdate: Cascade)
+  orgUnits    OrgUnit[]    @relation("LegalEntityOrgUnits")
+  assignments Assignment[] @relation("LegalEntityAssignments")
+
+  @@unique([tenantId, id])
+  @@unique([tenantId, code])
+  @@index([tenantId, status])
+  @@map("legal_entities")
+}
+
 /// OrgUnit — the single, recursive, typed organizational node (Epic 7B.1,
 /// ADR-012). One aggregate differentiated by `kind`; never a table per level.
 /// A strict single-parent tree: `parentId` is null for a root and otherwise
@@ -91,26 +123,33 @@ model ConfigurationVersion {
 /// `code` are stable identity — immutable and never reused. Not a versioned
 /// entity: it is mutable structural master data (rename, move, archive), with
 /// history captured in the immutable audit trail, not in per-row versions.
+/// Every OrgUnit belongs to exactly one Legal Entity (ADR-013 §3) — ownership,
+/// not an optional attribute; a parent-child relationship is only valid within
+/// the same Legal Entity (enforced in OrgUnitService, not at the database,
+/// since it is a cross-row invariant over the live tree).
 model OrgUnit {
-  id          String       @id @default(uuid()) @map("org_unit_id")
-  tenantId    String       @map("tenant_id")
-  code        String       @map("code")
-  name        String       @map("name")
-  kind        String       @map("kind")
-  parentId    String?      @map("parent_id")
-  status      String       @default("ACTIVE") @map("status")
-  createdAt   DateTime     @default(now()) @map("created_at") @db.Timestamptz(6)
-  createdBy   String       @map("created_by")
-  updatedAt   DateTime     @updatedAt @map("updated_at") @db.Timestamptz(6)
-  tenant      Tenant       @relation(fields: [tenantId], references: [id], onDelete: Restrict, onUpdate: Cascade)
-  parent      OrgUnit?     @relation("OrgUnitHierarchy", fields: [tenantId, parentId], references: [tenantId, id], onDelete: Restrict, onUpdate: Cascade)
-  children    OrgUnit[]    @relation("OrgUnitHierarchy")
-  assignments Assignment[] @relation("OrgUnitAssignments")
+  id            String       @id @default(uuid()) @map("org_unit_id")
+  tenantId      String       @map("tenant_id")
+  legalEntityId String       @map("legal_entity_id")
+  code          String       @map("code")
+  name          String       @map("name")
+  kind          String       @map("kind")
+  parentId      String?      @map("parent_id")
+  status        String       @default("ACTIVE") @map("status")
+  createdAt     DateTime     @default(now()) @map("created_at") @db.Timestamptz(6)
+  createdBy     String       @map("created_by")
+  updatedAt     DateTime     @updatedAt @map("updated_at") @db.Timestamptz(6)
+  tenant        Tenant       @relation(fields: [tenantId], references: [id], onDelete: Restrict, onUpdate: Cascade)
+  legalEntity   LegalEntity  @relation("LegalEntityOrgUnits", fields: [tenantId, legalEntityId], references: [tenantId, id], onDelete: Restrict, onUpdate: Cascade)
+  parent        OrgUnit?     @relation("OrgUnitHierarchy", fields: [tenantId, parentId], references: [tenantId, id], onDelete: Restrict, onUpdate: Cascade)
+  children      OrgUnit[]    @relation("OrgUnitHierarchy")
+  assignments   Assignment[] @relation("OrgUnitAssignments")
 
   @@unique([tenantId, id])
   @@unique([tenantId, code])
   @@index([tenantId, parentId])
   @@index([tenantId, status])
+  @@index([tenantId, legalEntityId])
   @@map("org_units")
 }
 
@@ -124,32 +163,40 @@ model OrgUnit {
 /// database. "At most one PRIMARY in force per person at any instant" is
 /// enforced by a GIST exclusion constraint installed in the migration.
 model Assignment {
-  id             String    @id @default(uuid()) @map("assignment_id")
-  tenantId       String    @map("tenant_id")
-  personId       String    @map("person_id")
-  orgUnitId      String    @map("org_unit_id")
-  managerId      String?   @map("manager_id")
+  id             String      @id @default(uuid()) @map("assignment_id")
+  tenantId       String      @map("tenant_id")
+  personId       String      @map("person_id")
+  /// The employer of record this placement belongs to (ADR-013 §3). Always
+  /// equal to orgUnit.legalEntityId at the effective date — Assignment
+  /// records the OrgUnit's Legal Entity, it does not carry an independent,
+  /// separately-editable entity. Ordinary transfer/manager/location changes
+  /// preserve this value; only Hire sets it in this slice.
+  legalEntityId  String      @map("legal_entity_id")
+  orgUnitId      String      @map("org_unit_id")
+  managerId      String?     @map("manager_id")
   /// The assigned work Location, when the placement has one (nullable —
   /// most existing assignments predate this column, and Location assignment
   /// is phased in per employee, not backfilled in bulk). Location is
   /// orthogonal to the OrgUnit tree (ADR-012 §5): this is a plain reference,
   /// never a hierarchy relationship.
-  locationId     String?   @map("location_id")
-  isPrimary      Boolean   @default(true) @map("is_primary")
-  effectiveFrom  DateTime  @map("effective_from") @db.Timestamptz(6)
-  effectiveUntil DateTime? @map("effective_until") @db.Timestamptz(6)
-  createdAt      DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
-  createdBy      String    @map("created_by")
-  updatedAt      DateTime  @updatedAt @map("updated_at") @db.Timestamptz(6)
-  tenant         Tenant    @relation(fields: [tenantId], references: [id], onDelete: Restrict, onUpdate: Cascade)
-  person         Employee  @relation("AssignmentPerson", fields: [tenantId, personId], references: [tenantId, employeeId], onDelete: Restrict, onUpdate: Cascade)
-  manager        Employee? @relation("AssignmentManager", fields: [tenantId, managerId], references: [tenantId, employeeId], onDelete: Restrict, onUpdate: Cascade)
-  orgUnit        OrgUnit   @relation("OrgUnitAssignments", fields: [tenantId, orgUnitId], references: [tenantId, id], onDelete: Restrict, onUpdate: Cascade)
-  location       Location? @relation("AssignmentLocation", fields: [tenantId, locationId], references: [tenantId, id], onDelete: Restrict, onUpdate: Cascade)
+  locationId     String?     @map("location_id")
+  isPrimary      Boolean     @default(true) @map("is_primary")
+  effectiveFrom  DateTime    @map("effective_from") @db.Timestamptz(6)
+  effectiveUntil DateTime?   @map("effective_until") @db.Timestamptz(6)
+  createdAt      DateTime    @default(now()) @map("created_at") @db.Timestamptz(6)
+  createdBy      String      @map("created_by")
+  updatedAt      DateTime    @updatedAt @map("updated_at") @db.Timestamptz(6)
+  tenant         Tenant      @relation(fields: [tenantId], references: [id], onDelete: Restrict, onUpdate: Cascade)
+  person         Employee    @relation("AssignmentPerson", fields: [tenantId, personId], references: [tenantId, employeeId], onDelete: Restrict, onUpdate: Cascade)
+  manager        Employee?   @relation("AssignmentManager", fields: [tenantId, managerId], references: [tenantId, employeeId], onDelete: Restrict, onUpdate: Cascade)
+  legalEntity    LegalEntity @relation("LegalEntityAssignments", fields: [tenantId, legalEntityId], references: [tenantId, id], onDelete: Restrict, onUpdate: Cascade)
+  orgUnit        OrgUnit     @relation("OrgUnitAssignments", fields: [tenantId, orgUnitId], references: [tenantId, id], onDelete: Restrict, onUpdate: Cascade)
+  location       Location?   @relation("AssignmentLocation", fields: [tenantId, locationId], references: [tenantId, id], onDelete: Restrict, onUpdate: Cascade)
 
   @@index([tenantId, personId, effectiveFrom])
   @@index([tenantId, orgUnitId])
   @@index([tenantId, locationId])
+  @@index([tenantId, legalEntityId])
   @@map("assignments")
 }
 
@@ -323,7 +370,10 @@ model Employee {
   employmentType        String       @map("employment_type")
   employmentStatus      String?      @map("employment_status")
   hireDate              DateTime     @map("hire_date") @db.Date
-  workLocation          String       @map("work_location")
+  /// Nullable: new hires no longer write here (Assignment.locationId is
+  /// authoritative from day one) — this stays populated only for employees
+  /// hired before Location assignment existed.
+  workLocation          String?      @map("work_location")
   emergencyContactName  String?      @map("emergency_contact_name")
   emergencyRelationship String?      @map("emergency_relationship")
   emergencyMobileNumber String?      @map("emergency_mobile_number")

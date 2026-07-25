@@ -6,7 +6,7 @@ import type { LocationRecord } from "@/platform/organization/location";
 
 function assignment(overrides: Partial<AssignmentRecord> = {}): AssignmentRecord {
   return Object.freeze({
-    id: "a1", tenantId: "t1", personId: "p1", orgUnitId: "ou1", isPrimary: true,
+    id: "a1", tenantId: "t1", personId: "p1", legalEntityId: "le1", orgUnitId: "ou1", isPrimary: true,
     effectiveFrom: "2026-01-01T00:00:00.000Z", createdAt: "2026-01-01T00:00:00.000Z", createdBy: "actor", updatedAt: "2026-01-01T00:00:00.000Z",
     ...overrides,
   });
@@ -14,7 +14,7 @@ function assignment(overrides: Partial<AssignmentRecord> = {}): AssignmentRecord
 
 function orgUnit(overrides: Partial<OrgUnitRecord> = {}): OrgUnitRecord {
   return Object.freeze({
-    id: "ou1", tenantId: "t1", code: "OU1", name: "Finance", kind: "DEPARTMENT", status: "ACTIVE",
+    id: "ou1", tenantId: "t1", legalEntityId: "le1", code: "OU1", name: "Finance", kind: "DEPARTMENT", status: "ACTIVE",
     createdAt: "2026-01-01T00:00:00.000Z", createdBy: "actor", updatedAt: "2026-01-01T00:00:00.000Z",
     ...overrides,
   });

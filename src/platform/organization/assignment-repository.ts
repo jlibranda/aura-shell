@@ -1,12 +1,15 @@
 import type { TenantContext } from "@/platform/context";
 import type { OrgUnitWriteRepository } from "@/platform/organization/org-unit-repository";
 import type { LocationWriteRepository } from "@/platform/organization/location-repository";
+import type { LegalEntityWriteRepository } from "@/platform/organization/legal-entity-repository";
 import type { PersonExistenceRepository } from "@/platform/organization/person-existence-repository";
 import type { AssignmentRecord } from "@/platform/organization/assignment";
 
 export interface AssignPrimaryInput {
   tenantId: string;
   personId: string;
+  /** Always resolved (validated-provided or derived from orgUnit) before reaching the repository — never optional at this layer (ADR-013 §3). */
+  legalEntityId: string;
   orgUnitId: string;
   managerId?: string;
   locationId?: string;
@@ -46,6 +49,7 @@ export type AssignmentTransactionRepositories = Readonly<{
   assignments: AssignmentWriteRepository;
   orgUnits: OrgUnitWriteRepository;
   locations: LocationWriteRepository;
+  legalEntities: Pick<LegalEntityWriteRepository, "findById">;
   people: PersonExistenceRepository;
 }>;
 

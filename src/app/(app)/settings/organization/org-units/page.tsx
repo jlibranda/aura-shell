@@ -14,7 +14,7 @@ export default async function OrgUnitsAdminPage() {
   return (
     <div className="mx-auto max-w-3xl">
       <PageHeader title="Organization Units" description="The recursive tree of divisions, business units, departments, branches, and teams." backHref="/settings/organization" />
-      <OrgUnitAdminView tree={result.tree} flat={result.flat} canManage={result.canManage} />
+      <OrgUnitAdminView tree={result.tree} flat={result.flat} legalEntities={result.legalEntities} canManage={result.canManage} />
     </div>
   );
 }

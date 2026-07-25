@@ -17,6 +17,8 @@ export type OrgUnitStatus = (typeof ORG_UNIT_STATUSES)[number];
 export interface OrgUnitRecord {
   id: string;
   tenantId: string;
+  /** The Legal Entity this unit belongs to (ADR-013 §3) — ownership, not an optional attribute. Immutable in this slice; a unit is never moved across Legal Entities. */
+  legalEntityId: string;
   code: string;
   name: string;
   kind: OrgUnitKind;
@@ -30,6 +32,7 @@ export interface OrgUnitRecord {
 const CODE_PATTERN = /^[A-Z0-9][A-Z0-9._-]{0,49}$/;
 
 export interface CreateOrgUnitDraft {
+  legalEntityId: string;
   code: string;
   name: string;
   kind: string;
@@ -39,18 +42,20 @@ export interface CreateOrgUnitDraft {
 /**
  * Server-authoritative validation for a new org unit's own fields. The code is
  * normalized (trimmed + upper-cased) so "FIN" and "fin" can never become two
- * distinct units. Structural invariants (parent existence, cycles) are enforced
- * by the write service against the live tree, not here.
+ * distinct units. Structural invariants (parent existence, cycles, and the
+ * parent belonging to the same Legal Entity — ADR-013 §3) are enforced by the
+ * write service against live data, not here.
  */
 export function validateCreateOrgUnitDraft(input: CreateOrgUnitDraft): ValidationResult<CreateOrgUnitDraft & { kind: OrgUnitKind }> {
   const issues = [];
+  if (!input.legalEntityId?.trim()) issues.push(issue("legalEntityId", "REQUIRED", "A legal entity is required."));
   const normalizedCode = input.code?.trim().toUpperCase() ?? "";
   if (!normalizedCode) issues.push(issue("code", "REQUIRED", "A short, stable code is required."));
   else if (!CODE_PATTERN.test(normalizedCode)) issues.push(issue("code", "INVALID_FORMAT", "Code must be 1-50 characters: letters, numbers, dot, dash, or underscore, starting with a letter or number."));
   if (!input.name?.trim()) issues.push(issue("name", "REQUIRED", "A name is required."));
   if (!input.kind) issues.push(issue("kind", "REQUIRED", "An organization unit kind is required."));
   else if (!(ORG_UNIT_KINDS as readonly string[]).includes(input.kind)) issues.push(issue("kind", "UNSUPPORTED", `"${input.kind}" is not a supported org unit kind.`));
-  return issues.length ? invalid(issues) : valid({ ...input, code: normalizedCode, name: input.name.trim(), kind: input.kind as OrgUnitKind });
+  return issues.length ? invalid(issues) : valid({ ...input, legalEntityId: input.legalEntityId.trim(), code: normalizedCode, name: input.name.trim(), kind: input.kind as OrgUnitKind });
 }
 
 export function validateOrgUnitName(name: string): ValidationResult<string> {

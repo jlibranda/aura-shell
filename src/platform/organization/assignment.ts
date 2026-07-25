@@ -16,6 +16,8 @@ export interface AssignmentRecord {
   tenantId: string;
   /** The employee this placement is for. */
   personId: string;
+  /** Always equal to orgUnit.legalEntityId at creation (ADR-013 §3) — Assignment records the OrgUnit's Legal Entity, it is never an independently-editable second source of entity truth. */
+  legalEntityId: string;
   orgUnitId: string;
   /** The primary manager (an employee), when the person has one. */
   managerId?: string;
@@ -41,6 +43,15 @@ function validInstant(value: string | undefined): boolean {
 export interface AssignPrimaryInput {
   personId: string;
   orgUnitId: string;
+  /**
+   * Optional caller-asserted Legal Entity, checked against the chosen
+   * OrgUnit's actual owning Legal Entity (ADR-013 §3) — provided by callers
+   * that show a Legal Entity picker (Hire) so a stale/mismatched client
+   * selection is rejected rather than silently accepted; omitted by callers
+   * with no such picker (e.g. Settings Assignment Diagnostics), which simply
+   * inherit whichever Legal Entity the chosen OrgUnit already belongs to.
+   */
+  legalEntityId?: string;
   managerId?: string;
   locationId?: string;
   effectiveFrom: string;

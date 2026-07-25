@@ -10,7 +10,7 @@ import { createTrustedRequestContext } from "@/platform/runtime-context";
 const command = (workEmail = "ana@work.example") => createCreateEmployeeCommand({
   personal: { firstName: "Ana", middleName: "", lastName: "Domingo", preferredName: "", dateOfBirth: "1994-02-01", gender: "female", maritalStatus: "single", nationality: "Filipino" },
   contact: { personalEmail: "", workEmail, mobileNumber: "+63 917 000 0000", homeAddress: "" },
-  employment: { departmentId: "dep-1", teamId: "", position: "Analyst", managerId: "", employmentType: "regular", hireDate: "2024-02-01", workLocation: "Manila" },
+  employment: { legalEntityId: "le-1", orgUnitId: "dep-1", locationId: "loc-1", position: "Analyst", managerId: "", employmentType: "regular", hireDate: "2024-02-01" },
   emergencyContact: { name: "", relationship: "", mobileNumber: "", email: "", address: "" },
 });
 
@@ -66,7 +66,13 @@ describe("in-memory employee aggregate write adapter", () => {
     const runtime = createApplicationRuntime(request("tenant-a"));
     const prepared = await runtime.commands.executeCreateEmployee(command());
     if (prepared.kind !== "success") throw new Error("Expected a prepared command.");
-    await repository.create({ tenantId: "tenant-a" }, { displayName: "Ana Domingo", personal: { ...prepared.value.command.personal, dateOfBirth: prepared.value.command.personal.dateOfBirth! }, contact: prepared.value.command.contact, employment: { ...prepared.value.command.employment, hireDate: prepared.value.command.employment.hireDate! }, emergencyContact: prepared.value.command.emergencyContact });
+    await repository.create({ tenantId: "tenant-a" }, {
+      displayName: "Ana Domingo",
+      personal: { ...prepared.value.command.personal, dateOfBirth: prepared.value.command.personal.dateOfBirth! },
+      contact: prepared.value.command.contact,
+      employment: { departmentId: prepared.value.command.employment.orgUnitId, teamId: "", position: prepared.value.command.employment.position, managerId: prepared.value.command.employment.managerId, employmentType: prepared.value.command.employment.employmentType, hireDate: prepared.value.command.employment.hireDate!, workLocation: null },
+      emergencyContact: prepared.value.command.emergencyContact,
+    });
     expect(await repository.list({ tenantId: "tenant-b" })).toEqual([]);
     expect(await repository.list({ tenantId: "tenant-a" })).toHaveLength(1);
   });

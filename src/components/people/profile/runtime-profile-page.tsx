@@ -5,7 +5,7 @@ import { RuntimeProfileWorkInformation } from "@/components/people/profile/runti
 import { RuntimeProfileEmployment } from "@/components/people/profile/runtime-profile-employment";
 import { RuntimeProfileDeferredTab } from "@/components/people/profile/runtime-profile-deferred-tab";
 import type { RuntimeProfilePageResult } from "@/platform/people/profile-runtime-loader";
-import type { EmploymentActionsViewModel, OrganizationPathSegment } from "@/platform/people/profile-employment-actions-loader";
+import type { EmploymentActionsViewModel, EmploymentLegalEntitySummary, OrganizationPathSegment } from "@/platform/people/profile-employment-actions-loader";
 
 export type RuntimeProfileActiveTab =
   | "overview"
@@ -25,6 +25,7 @@ export function RuntimeProfilePage({
   activeTab,
   employmentActions,
   organizationPath,
+  legalEntity,
 }: {
   result: RuntimeProfilePageResult;
   activeTab: RuntimeProfileActiveTab;
@@ -32,6 +33,8 @@ export function RuntimeProfilePage({
   employmentActions?: EmploymentActionsViewModel;
   /** Only meaningful (and only fetched) when activeTab is "work-information". */
   organizationPath?: OrganizationPathSegment[];
+  /** Only meaningful (and only fetched) when activeTab is "work-information" — same Assignment.legalEntityId the Employment tab shows. */
+  legalEntity?: EmploymentLegalEntitySummary;
 }) {
   if (result.kind !== "ready") return <ProfilePageState kind={result.kind} />;
   const backHref = activeTab === "overview" ? "/people" : `/people/${result.overview.employeeId}`;
@@ -42,7 +45,7 @@ export function RuntimeProfilePage({
         <RuntimeProfileEmployment employment={result.employment} employeeId={result.overview.employeeId} employeeName={result.overview.displayName} employmentActions={employmentActions} />
       ) : null}
       {activeTab === "work-information" ? (
-        <RuntimeProfileWorkInformation workInformation={result.workInformation} organizationPath={organizationPath ?? []} />
+        <RuntimeProfileWorkInformation workInformation={result.workInformation} organizationPath={organizationPath ?? []} legalEntity={legalEntity} />
       ) : null}
       {activeTab === "contact-information" ? <RuntimeProfileContactInformation contactInformation={result.contactInformation} /> : null}
       {isDeferredTab(activeTab) ? <RuntimeProfileDeferredTab title={deferredTabTitle(activeTab)} /> : null}

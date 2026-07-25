@@ -27,6 +27,7 @@ export function RuntimeProfileEmployment({
           <Field label="Employee number" value={employment.employeeNumber} />
           <Field label="Position" value={employment.position} />
           <Field label="Employment status" value={employment.employmentStatus} />
+          <Field label="Legal entity" value={employmentActions.legalEntity ? `${employmentActions.legalEntity.legalName} (${employmentActions.legalEntity.code})` : undefined} />
           <Field label="Hire date" value={employment.hireDate} />
           <Field label="Regularization date" value={employment.regularizationDate} />
           <Field label="Manager" value={employment.manager} />

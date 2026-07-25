@@ -1,14 +1,16 @@
 import { RuntimeProfileField as Field } from "@/components/people/profile/runtime-profile-overview";
 import { OrganizationPath } from "@/components/shared/organization-path";
 import type { ProfileWorkInformationViewModel } from "@/platform/people/profile-runtime-loader";
-import type { OrganizationPathSegment } from "@/platform/people/profile-employment-actions-loader";
+import type { EmploymentLegalEntitySummary, OrganizationPathSegment } from "@/platform/people/profile-employment-actions-loader";
 
 export function RuntimeProfileWorkInformation({
   workInformation,
   organizationPath,
+  legalEntity,
 }: {
   workInformation: ProfileWorkInformationViewModel;
   organizationPath: OrganizationPathSegment[];
+  legalEntity?: EmploymentLegalEntitySummary;
 }) {
   return (
     <section aria-labelledby="work-information-heading" className="rounded-xl border border-border bg-surface p-6">
@@ -17,6 +19,7 @@ export function RuntimeProfileWorkInformation({
         <Field label="Employee number" value={workInformation.employeeNumber} />
         <Field label="Position" value={workInformation.position} />
         <Field label="Employment status" value={workInformation.employmentStatus} />
+        <Field label="Legal entity" value={legalEntity ? `${legalEntity.legalName} (${legalEntity.code})` : undefined} />
         <Field label="Manager" value={workInformation.manager} />
         <Field label="Location" value={workInformation.location} />
         <Field label="Hire date" value={workInformation.hireDate} />

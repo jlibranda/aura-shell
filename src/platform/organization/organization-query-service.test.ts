@@ -15,7 +15,7 @@ function context(tenantId = "tenant-a"): TenantContext {
 
 function orgUnit(overrides: Partial<OrgUnitRecord> = {}): OrgUnitRecord {
   return Object.freeze({
-    id: "ou1", tenantId: "tenant-a", code: "OU1", name: "Unit", kind: "TEAM", status: "ACTIVE",
+    id: "ou1", tenantId: "tenant-a", legalEntityId: "le1", code: "OU1", name: "Unit", kind: "TEAM", status: "ACTIVE",
     createdAt: "2026-01-01T00:00:00.000Z", createdBy: "actor", updatedAt: "2026-01-01T00:00:00.000Z",
     ...overrides,
   });
@@ -23,7 +23,7 @@ function orgUnit(overrides: Partial<OrgUnitRecord> = {}): OrgUnitRecord {
 
 function assignment(overrides: Partial<AssignmentRecord> = {}): AssignmentRecord {
   return Object.freeze({
-    id: "a1", tenantId: "tenant-a", personId: "p1", orgUnitId: "ou1", isPrimary: true,
+    id: "a1", tenantId: "tenant-a", personId: "p1", legalEntityId: "le1", orgUnitId: "ou1", isPrimary: true,
     effectiveFrom: "2026-01-01T00:00:00.000Z", createdAt: "2026-01-01T00:00:00.000Z", createdBy: "actor", updatedAt: "2026-01-01T00:00:00.000Z",
     ...overrides,
   });

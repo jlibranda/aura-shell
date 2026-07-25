@@ -1,8 +1,10 @@
 import type { TenantContext } from "@/platform/context";
 import type { OrgUnitKind, OrgUnitRecord } from "@/platform/organization/org-unit";
+import type { LegalEntityWriteRepository } from "@/platform/organization/legal-entity-repository";
 
 export interface CreateOrgUnitInput {
   tenantId: string;
+  legalEntityId: string;
   code: string;
   name: string;
   kind: OrgUnitKind;
@@ -40,8 +42,8 @@ export interface OrgUnitWriteRepository {
   archive(tenantId: string, id: string): Promise<OrgUnitRecord>;
 }
 
-/** Transaction-scoped repositories exposed to the org-unit write service via UnitOfWork.execute(). */
-export type OrgUnitTransactionRepositories = Readonly<{ orgUnits: OrgUnitWriteRepository }>;
+/** Transaction-scoped repositories exposed to the org-unit write service via UnitOfWork.execute(). Legal Entity existence/status is checked in the same transaction (read-only — OrgUnitService never mutates LegalEntity). */
+export type OrgUnitTransactionRepositories = Readonly<{ orgUnits: OrgUnitWriteRepository; legalEntities: Pick<LegalEntityWriteRepository, "findById"> }>;
 
 /**
  * Server-only read port. Read-only, tenant-scoped, used outside any write

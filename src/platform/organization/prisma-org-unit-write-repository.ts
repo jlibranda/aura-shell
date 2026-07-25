@@ -10,12 +10,13 @@ import type { OrgUnitKind, OrgUnitRecord, OrgUnitStatus } from "@/platform/organ
 export type PrismaOrgUnitWriteClient = Pick<Prisma.TransactionClient, "orgUnit">;
 
 function toRecord(value: {
-  id: string; tenantId: string; code: string; name: string; kind: string; parentId: string | null;
+  id: string; tenantId: string; legalEntityId: string; code: string; name: string; kind: string; parentId: string | null;
   status: string; createdAt: Date; createdBy: string; updatedAt: Date;
 }): OrgUnitRecord {
   return Object.freeze({
     id: value.id,
     tenantId: value.tenantId,
+    legalEntityId: value.legalEntityId,
     code: value.code,
     name: value.name,
     kind: value.kind as OrgUnitKind,
@@ -52,7 +53,7 @@ export class PrismaOrgUnitWriteRepository implements OrgUnitWriteRepository {
 
   async create(input: CreateOrgUnitInput): Promise<OrgUnitRecord> {
     const unit = await this.prisma.orgUnit.create({
-      data: { tenantId: input.tenantId, code: input.code, name: input.name, kind: input.kind, parentId: input.parentId ?? null, createdBy: input.createdBy },
+      data: { tenantId: input.tenantId, legalEntityId: input.legalEntityId, code: input.code, name: input.name, kind: input.kind, parentId: input.parentId ?? null, createdBy: input.createdBy },
     });
     return toRecord(unit);
   }

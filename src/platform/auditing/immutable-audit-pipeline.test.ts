@@ -23,7 +23,11 @@ const draft = (workEmail = "ana@work.example"): EmployeeAggregateDraft => ({
   employment: { departmentId: "dep-1", teamId: "", position: "Analyst", managerId: "", employmentType: "regular", hireDate: "2024-02-01", workLocation: "Manila" },
   emergencyContact: { name: "", relationship: "", mobileNumber: "", email: "", address: "" },
 });
-const command = () => createCreateEmployeeCommand({ ...draft(), personal: draft().personal, employment: draft().employment });
+const command = () => createCreateEmployeeCommand({
+  ...draft(),
+  personal: draft().personal,
+  employment: { legalEntityId: "le-1", orgUnitId: "dep-1", locationId: "loc-1", position: "Analyst", managerId: "", employmentType: "regular", hireDate: "2024-02-01" },
+});
 const request = () => createTrustedRequestContext({
   principal: { subjectId: "subject-a", userId: "user-a", tenantId: "tenant-a", authenticationMethod: "test", authenticatedAt: "2026-01-01T00:00:00.000Z" },
   roles: ["hr_admin"], permissions: ["people.employee.hire"], actorProvenance: "server_verified", correlationId: baseContext.correlationId,

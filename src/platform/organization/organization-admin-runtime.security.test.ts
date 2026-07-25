@@ -26,7 +26,7 @@ describe("organization admin runtime — permission matrix", () => {
   it("an org admin (organization.view + organization.manage) can read and is not denied by the write services", async () => {
     const runtime = createOrganizationAdminRuntime(request({ roles: ["hr_admin"], permissions: ["organization.view", "organization.manage"] }));
     await expect(runtime.orgUnits.read.listAll(runtime.context)).resolves.toEqual([]);
-    const result = await runtime.orgUnits.service.createOrgUnit(request({ roles: ["hr_admin"], permissions: ["organization.view", "organization.manage"] }), { code: "X", name: "", kind: "TEAM" });
+    const result = await runtime.orgUnits.service.createOrgUnit(request({ roles: ["hr_admin"], permissions: ["organization.view", "organization.manage"] }), { legalEntityId: "le1", code: "X", name: "", kind: "TEAM" });
     // Reaches real validation (name required) rather than being denied at the authorization gate — proves it was not rejected for lack of permission.
     expect(result.kind).toBe("validation_failure");
   });
@@ -38,7 +38,7 @@ describe("organization admin runtime — permission matrix", () => {
     await expect(runtime.locations.read.listAll(runtime.context)).resolves.toEqual([]);
     await expect(runtime.queries.resolveCurrentAssignments(runtime.context)).resolves.toEqual([]);
 
-    const createOrgUnit = await runtime.orgUnits.service.createOrgUnit(viewerRequest, { code: "X", name: "X", kind: "TEAM" });
+    const createOrgUnit = await runtime.orgUnits.service.createOrgUnit(viewerRequest, { legalEntityId: "le1", code: "X", name: "X", kind: "TEAM" });
     expect(createOrgUnit.kind).toBe("authorization_failure");
     const createLocation = await runtime.locations.service.createLocation(viewerRequest, { code: "X", name: "X", address: { line1: "a", city: "b" }, countryCode: "PH", timezone: "Asia/Manila" });
     expect(createLocation.kind).toBe("authorization_failure");
