@@ -1,6 +1,7 @@
 import { RuntimeProfileField as Field } from "@/components/people/profile/runtime-profile-overview";
 import { EmploymentActions } from "@/components/people/profile/employment-actions";
 import { RuntimeEmploymentHistory } from "@/components/people/profile/runtime-employment-history";
+import { OrganizationPath } from "@/components/shared/organization-path";
 import type { ProfileEmploymentViewModel } from "@/platform/people/profile-runtime-loader";
 import type { EmploymentActionsViewModel } from "@/platform/people/profile-employment-actions-loader";
 
@@ -28,10 +29,14 @@ export function RuntimeProfileEmployment({
           <Field label="Employment status" value={employment.employmentStatus} />
           <Field label="Hire date" value={employment.hireDate} />
           <Field label="Regularization date" value={employment.regularizationDate} />
-          <Field label="Department" value={employment.department} />
-          <Field label="Team" value={employment.team} />
           <Field label="Manager" value={employment.manager} />
           <Field label="Location" value={employment.location} />
+          <div className="sm:col-span-2">
+            <dt className="text-xs font-medium uppercase tracking-wide text-muted-foreground">Organization</dt>
+            <dd className="mt-1">
+              <OrganizationPath path={employmentActions.organizationPath} />
+            </dd>
+          </div>
         </dl>
       </section>
 

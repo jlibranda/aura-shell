@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { toEmploymentHistoryRows, toEmploymentPickerOptions } from "@/platform/people/profile-employment-actions-loader";
+import { toEmploymentHistoryRows, toEmploymentPickerOptions, toOrganizationPathSegments } from "@/platform/people/profile-employment-actions-loader";
 import type { AssignmentRecord } from "@/platform/organization/assignment";
 import type { OrgUnitRecord } from "@/platform/organization/org-unit";
 
@@ -76,5 +76,24 @@ describe("toEmploymentPickerOptions", () => {
   it("labels org unit options with name and code", () => {
     const { orgUnitOptions } = toEmploymentPickerOptions([orgUnit({ id: "ou1", name: "Finance", code: "FIN" })], [], "p1");
     expect(orgUnitOptions).toEqual([{ id: "ou1", label: "Finance (FIN)" }]);
+  });
+});
+
+describe("toOrganizationPathSegments", () => {
+  it("carries the path through as id/name pairs, in the given order, regardless of kind", () => {
+    const segments = toOrganizationPathSegments([
+      orgUnit({ id: "root", name: "APAC", kind: "DIVISION" }),
+      orgUnit({ id: "mid", name: "Philippines", kind: "BRANCH" }),
+      orgUnit({ id: "leaf", name: "Payroll", kind: "TEAM" }),
+    ]);
+    expect(segments).toEqual([{ id: "root", name: "APAC" }, { id: "mid", name: "Philippines" }, { id: "leaf", name: "Payroll" }]);
+  });
+
+  it("handles a single-node (flat) organization", () => {
+    expect(toOrganizationPathSegments([orgUnit({ id: "hr", name: "Human Resources", kind: "DIVISION" })])).toEqual([{ id: "hr", name: "Human Resources" }]);
+  });
+
+  it("handles no placement at all", () => {
+    expect(toOrganizationPathSegments([])).toEqual([]);
   });
 });
