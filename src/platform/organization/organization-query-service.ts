@@ -63,6 +63,11 @@ export class OrganizationQueryService {
     return this.assignments.listCurrentByManager(context, managerId);
   }
 
+  /** Every currently open primary assignment in the tenant — the Assignment administration list. */
+  resolveCurrentAssignments(context: TenantContext): Promise<AssignmentRecord[]> {
+    return this.assignments.listCurrentPrimary(context);
+  }
+
   /** A person's current assignment together with the OrgUnit it names, or undefined if the person has none. */
   async resolveCurrentPlacement(context: TenantContext, personId: string): Promise<CurrentPlacement | undefined> {
     const assignment = await this.assignments.getCurrentForPerson(context, personId);

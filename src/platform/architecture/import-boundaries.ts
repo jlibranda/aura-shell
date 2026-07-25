@@ -65,6 +65,16 @@ const isOrganizationQueryService = (file: SourceFile) => file.path === "src/plat
 // through OrganizationQueryService and a minimal employee display lookup —
 // never the Organization write side.
 const isOrganizationPlacementImplementation = (file: SourceFile) => file.path === "src/platform/people/read-models/prisma-organization-placement-service.ts";
+// Epic 7B.5: the Settings > Organization admin UI's trusted server
+// composition — mirrors createDurableConfigurationRuntime. A client
+// component reaching it directly would bypass organization.view/.manage.
+const isOrganizationAdminRuntime = (file: SourceFile) => file.path === "src/platform/organization/organization-admin-runtime.ts";
+// Epic 7B.5: page loaders and server actions for the Settings > Organization
+// admin UI. These must obtain every read/write capability through
+// createOrganizationAdminRuntime() — never Prisma or a write-side module
+// directly — so there is exactly one place that composes the runtime.
+const isSettingsOrganizationAdminUiCode = (file: SourceFile) =>
+  file.path.startsWith("src/platform/organization/admin/") || file.path.startsWith("src/app/(app)/settings/organization/");
 
 const WRITE_RUNTIME_IMPORTS = [
   /^@prisma\/client/,
@@ -144,6 +154,9 @@ const ORGANIZATION_SERVER_ONLY_IMPORTS = [
   /platform\/organization\/organization-query-service/,
   /platform\/people\/read-models\/prisma-organization-placement-service/,
   /platform\/people\/read-models\/prisma-employee-display-lookup/,
+  /platform\/organization\/organization-admin-runtime/,
+  /platform\/organization\/prisma-organization-employee-directory/,
+  /platform\/organization\/admin\//,
 ];
 
 // Anything that lets a caller obtain or construct a TrustedRequestContext —
@@ -285,6 +298,49 @@ export const RULES: Rule[] = [
     name: "organization-placement-service-must-not-import-write-side",
     appliesTo: isOrganizationPlacementImplementation,
     forbidden: ORGANIZATION_WRITE_SIDE_IMPORTS,
+  },
+  {
+    // ADR-012 §4: Organization never depends on People — only the reverse.
+    // The same precedent as PersonExistenceRepository (queries the employees
+    // table directly rather than importing People module code), now made
+    // mechanical for every file under src/platform/organization/.
+    name: "organization-must-not-import-people",
+    appliesTo: isOrganizationCode,
+    forbidden: [/platform\/people\//],
+  },
+  {
+    // Epic 7B.5: every Settings > Organization admin page, loader, and
+    // server action must obtain read/write capability through
+    // createOrganizationAdminRuntime() — never Prisma, a Prisma read
+    // repository, or a UnitOfWork/write-repository module directly.
+    // organization-admin-runtime.ts itself is exempt (it is the one file
+    // allowed to compose these). Importing a *-service.ts module for its
+    // exported result *types* (e.g. OrgUnitCreated) is not forbidden — the
+    // actions call the service only via runtime.orgUnits.service etc., never
+    // by constructing OrgUnitService/LocationService/AssignmentService
+    // themselves, which is what this rule actually guards against.
+    name: "settings-organization-admin-ui-must-not-bypass-runtime",
+    appliesTo: (file) => isSettingsOrganizationAdminUiCode(file) && !isOrganizationAdminRuntime(file),
+    forbidden: [
+      /^@prisma\/client/,
+      /platform\/persistence\/prisma-client/,
+      /platform\/organization\/prisma-org-unit-write-repository/,
+      /platform\/organization\/org-unit-write-transaction/,
+      /platform\/organization\/prisma-org-unit-unit-of-work/,
+      /platform\/organization\/in-memory-org-unit-unit-of-work/,
+      /platform\/organization\/prisma-assignment-write-repository/,
+      /platform\/organization\/assignment-write-transaction/,
+      /platform\/organization\/prisma-assignment-unit-of-work/,
+      /platform\/organization\/in-memory-assignment-unit-of-work/,
+      /platform\/organization\/prisma-location-write-repository/,
+      /platform\/organization\/location-write-transaction/,
+      /platform\/organization\/prisma-location-unit-of-work/,
+      /platform\/organization\/in-memory-location-unit-of-work/,
+      /platform\/organization\/prisma-org-unit-read-repository/,
+      /platform\/organization\/prisma-assignment-read-repository/,
+      /platform\/organization\/prisma-location-read-repository/,
+      /platform\/organization\/prisma-organization-employee-directory/,
+    ],
   },
 ];
 
