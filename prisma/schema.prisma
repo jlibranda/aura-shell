@@ -28,6 +28,7 @@ model Tenant {
   attendanceEvents             AttendanceEvent[]
   workSchedules                WorkSchedule[]
   workScheduleVersions         WorkScheduleVersion[]
+  scheduleAssignments          ScheduleAssignment[]
 
   @@map("tenants")
 }
@@ -211,23 +212,23 @@ model Assignment {
 /// trail, not in per-row versions. Address is a value object flattened onto
 /// this table (no independent lifecycle, per ADR-012 §5/§8).
 model Location {
-  id           String    @id @default(uuid()) @map("location_id")
-  tenantId     String    @map("tenant_id")
-  code         String    @map("code")
-  name         String    @map("name")
-  addressLine1 String    @map("address_line1")
-  addressLine2 String?   @map("address_line2")
-  city         String    @map("city")
-  region       String?   @map("region")
-  postalCode   String?   @map("postal_code")
-  countryCode  String    @map("country_code")
-  timezone     String    @map("timezone")
-  status       String    @default("ACTIVE") @map("status")
-  createdAt    DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
-  createdBy    String    @map("created_by")
-  updatedAt    DateTime  @updatedAt @map("updated_at") @db.Timestamptz(6)
-  archivedAt   DateTime? @map("archived_at") @db.Timestamptz(6)
-  tenant       Tenant    @relation(fields: [tenantId], references: [id], onDelete: Restrict, onUpdate: Cascade)
+  id           String       @id @default(uuid()) @map("location_id")
+  tenantId     String       @map("tenant_id")
+  code         String       @map("code")
+  name         String       @map("name")
+  addressLine1 String       @map("address_line1")
+  addressLine2 String?      @map("address_line2")
+  city         String       @map("city")
+  region       String?      @map("region")
+  postalCode   String?      @map("postal_code")
+  countryCode  String       @map("country_code")
+  timezone     String       @map("timezone")
+  status       String       @default("ACTIVE") @map("status")
+  createdAt    DateTime     @default(now()) @map("created_at") @db.Timestamptz(6)
+  createdBy    String       @map("created_by")
+  updatedAt    DateTime     @updatedAt @map("updated_at") @db.Timestamptz(6)
+  archivedAt   DateTime?    @map("archived_at") @db.Timestamptz(6)
+  tenant       Tenant       @relation(fields: [tenantId], references: [id], onDelete: Restrict, onUpdate: Cascade)
   assignments  Assignment[] @relation("AssignmentLocation")
 
   @@unique([tenantId, id])
@@ -345,49 +346,50 @@ model SubmissionIdempotencyRecord {
 /// aggregate. Government identifiers, payroll, compensation, tax, and banking
 /// data are deliberately not part of this model.
 model Employee {
-  tenantId              String       @map("tenant_id")
-  employeeId            String       @map("employee_id")
-  employeeNumber        String       @map("employee_number")
-  displayName           String       @map("display_name")
-  firstName             String       @map("first_name")
-  middleName            String?      @map("middle_name")
-  lastName              String       @map("last_name")
-  preferredName         String?      @map("preferred_name")
-  dateOfBirth           DateTime     @map("date_of_birth") @db.Date
+  tenantId              String               @map("tenant_id")
+  employeeId            String               @map("employee_id")
+  employeeNumber        String               @map("employee_number")
+  displayName           String               @map("display_name")
+  firstName             String               @map("first_name")
+  middleName            String?              @map("middle_name")
+  lastName              String               @map("last_name")
+  preferredName         String?              @map("preferred_name")
+  dateOfBirth           DateTime             @map("date_of_birth") @db.Date
   gender                String
-  maritalStatus         String       @map("marital_status")
+  maritalStatus         String               @map("marital_status")
   nationality           String
-  workEmail             String       @map("work_email")
-  personalEmail         String?      @map("personal_email")
-  mobileNumber          String       @map("mobile_number")
-  homeAddress           String       @map("home_address")
+  workEmail             String               @map("work_email")
+  personalEmail         String?              @map("personal_email")
+  mobileNumber          String               @map("mobile_number")
+  homeAddress           String               @map("home_address")
   /// LEGACY placement fields (ADR-012 §7). Superseded by the Assignment
   /// aggregate, which is the authoritative, effective-dated source of a
   /// person's org unit and manager. These columns are retained (not removed)
   /// for backward compatibility and are no longer the source of truth for
   /// placement; new placement reads/writes go through Assignment.
-  departmentId          String       @map("department_id")
-  teamId                String?      @map("team_id")
+  departmentId          String               @map("department_id")
+  teamId                String?              @map("team_id")
   position              String
-  managerId             String?      @map("manager_id")
-  employmentType        String       @map("employment_type")
-  employmentStatus      String?      @map("employment_status")
-  hireDate              DateTime     @map("hire_date") @db.Date
+  managerId             String?              @map("manager_id")
+  employmentType        String               @map("employment_type")
+  employmentStatus      String?              @map("employment_status")
+  hireDate              DateTime             @map("hire_date") @db.Date
   /// Nullable: new hires no longer write here (Assignment.locationId is
   /// authoritative from day one) — this stays populated only for employees
   /// hired before Location assignment existed.
-  workLocation          String?      @map("work_location")
-  emergencyContactName  String?      @map("emergency_contact_name")
-  emergencyRelationship String?      @map("emergency_relationship")
-  emergencyMobileNumber String?      @map("emergency_mobile_number")
-  emergencyEmail        String?      @map("emergency_email")
-  emergencyAddress      String?      @map("emergency_address")
-  createdAt             DateTime     @default(now()) @map("created_at") @db.Timestamptz(6)
-  updatedAt             DateTime     @updatedAt @map("updated_at") @db.Timestamptz(6)
-  tenant                Tenant       @relation(fields: [tenantId], references: [id], onDelete: Restrict, onUpdate: Cascade)
-  assignmentsAsPerson   Assignment[] @relation("AssignmentPerson")
-  assignmentsAsManager  Assignment[] @relation("AssignmentManager")
-  attendanceEvents      AttendanceEvent[] @relation("AttendanceEventPerson")
+  workLocation          String?              @map("work_location")
+  emergencyContactName  String?              @map("emergency_contact_name")
+  emergencyRelationship String?              @map("emergency_relationship")
+  emergencyMobileNumber String?              @map("emergency_mobile_number")
+  emergencyEmail        String?              @map("emergency_email")
+  emergencyAddress      String?              @map("emergency_address")
+  createdAt             DateTime             @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt             DateTime             @updatedAt @map("updated_at") @db.Timestamptz(6)
+  tenant                Tenant               @relation(fields: [tenantId], references: [id], onDelete: Restrict, onUpdate: Cascade)
+  assignmentsAsPerson   Assignment[]         @relation("AssignmentPerson")
+  assignmentsAsManager  Assignment[]         @relation("AssignmentManager")
+  attendanceEvents      AttendanceEvent[]    @relation("AttendanceEventPerson")
+  scheduleAssignments   ScheduleAssignment[] @relation("ScheduleAssignmentPerson")
 
   @@id([tenantId, employeeId])
   @@unique([tenantId, employeeNumber])
@@ -405,31 +407,31 @@ model Employee {
 /// Corrections belong to a future AttendanceAdjustment against the computed
 /// AttendanceDay — never a mutation of this row.
 model AttendanceEvent {
-  id              String    @id @default(uuid()) @map("attendance_event_id")
-  tenantId        String    @map("tenant_id")
-  personId        String    @map("person_id")
+  id             String   @id @default(uuid()) @map("attendance_event_id")
+  tenantId       String   @map("tenant_id")
+  personId       String   @map("person_id")
   /// The device/channel-reported instant the punch occurred, UTC.
-  occurredAtUtc   DateTime  @map("occurred_at_utc") @db.Timestamptz(6)
+  occurredAtUtc  DateTime @map("occurred_at_utc") @db.Timestamptz(6)
   /// When AURA received this event — distinct from occurredAtUtc
   /// (channel-reported) and createdAt (persistence time). Never compared
   /// against occurredAtUtc to reject an event: clock skew and delayed/
   /// offline sync are forensic/anomaly concerns, not grounds to refuse a
   /// genuinely received fact (ADR-014 §15).
-  receivedAtUtc   DateTime  @map("received_at_utc") @db.Timestamptz(6)
+  receivedAtUtc  DateTime @map("received_at_utc") @db.Timestamptz(6)
   /// Stable channel category (ADR-014 §4.3, §8) — never vendor-specific;
   /// vendor/device identity belongs to sourceRef so a new vendor never
   /// requires a schema migration.
-  source          String    @map("source")
+  source         String   @map("source")
   /// Device id / import batch id / API caller — free-text, channel-specific.
-  sourceRef       String?   @map("source_ref")
+  sourceRef      String?  @map("source_ref")
   /// What the source channel itself reported, if known — evidentiary only,
   /// never authoritative. AttendanceDay remains solely responsible for
   /// interpreting event chronology (ADR-014 §4.4, §9).
-  eventType       String?   @map("event_type")
-  idempotencyKey  String    @map("idempotency_key")
-  createdAt       DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
-  tenant          Tenant    @relation(fields: [tenantId], references: [id], onDelete: Restrict, onUpdate: Cascade)
-  person          Employee  @relation("AttendanceEventPerson", fields: [tenantId, personId], references: [tenantId, employeeId], onDelete: Restrict, onUpdate: Cascade)
+  eventType      String?  @map("event_type")
+  idempotencyKey String   @map("idempotency_key")
+  createdAt      DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  tenant         Tenant   @relation(fields: [tenantId], references: [id], onDelete: Restrict, onUpdate: Cascade)
+  person         Employee @relation("AttendanceEventPerson", fields: [tenantId, personId], references: [tenantId, employeeId], onDelete: Restrict, onUpdate: Cascade)
 
   @@unique([tenantId, id])
   @@unique([tenantId, idempotencyKey])
@@ -442,16 +444,17 @@ model AttendanceEvent {
 /// affects what the schedule computes to lives on WorkScheduleVersion.
 /// `code` is permanent business identity, never changed, never reused.
 model WorkSchedule {
-  id          String                @id @default(uuid()) @map("work_schedule_id")
-  tenantId    String                @map("tenant_id")
-  code        String                @map("code")
-  name        String                @map("name")
-  description String?               @map("description")
-  createdAt   DateTime              @default(now()) @map("created_at") @db.Timestamptz(6)
-  createdBy   String                @map("created_by")
-  updatedAt   DateTime              @updatedAt @map("updated_at") @db.Timestamptz(6)
-  tenant      Tenant                @relation(fields: [tenantId], references: [id], onDelete: Restrict, onUpdate: Cascade)
-  versions    WorkScheduleVersion[]
+  id                  String                @id @default(uuid()) @map("work_schedule_id")
+  tenantId            String                @map("tenant_id")
+  code                String                @map("code")
+  name                String                @map("name")
+  description         String?               @map("description")
+  createdAt           DateTime              @default(now()) @map("created_at") @db.Timestamptz(6)
+  createdBy           String                @map("created_by")
+  updatedAt           DateTime              @updatedAt @map("updated_at") @db.Timestamptz(6)
+  tenant              Tenant                @relation(fields: [tenantId], references: [id], onDelete: Restrict, onUpdate: Cascade)
+  versions            WorkScheduleVersion[]
+  scheduleAssignments ScheduleAssignment[]  @relation("ScheduleAssignmentWorkSchedule")
 
   @@unique([tenantId, id])
   @@unique([tenantId, code])
@@ -466,29 +469,73 @@ model WorkSchedule {
 /// migration), not application code alone. `canonicalHash` is for
 /// duplicate-content detection only — never business identity.
 model WorkScheduleVersion {
-  id                      String       @id @default(uuid()) @map("work_schedule_version_id")
-  tenantId                String       @map("tenant_id")
-  workScheduleId          String       @map("work_schedule_id")
-  versionNumber           Int          @map("version_number")
-  status                  String       @map("status")
-  scheduleType            String       @map("schedule_type")
-  timezoneResolutionMode  String       @map("timezone_resolution_mode")
+  id                     String               @id @default(uuid()) @map("work_schedule_version_id")
+  tenantId               String               @map("tenant_id")
+  workScheduleId         String               @map("work_schedule_id")
+  versionNumber          Int                  @map("version_number")
+  status                 String               @map("status")
+  scheduleType           String               @map("schedule_type")
+  timezoneResolutionMode String               @map("timezone_resolution_mode")
   /// Required iff timezoneResolutionMode = FIXED; absent iff LOCATION.
-  timezone                String?      @map("timezone")
-  weeklyPattern           Json         @map("weekly_pattern")
-  canonicalHash           String       @map("canonical_hash")
-  changeReason            String?      @map("change_reason")
-  createdAt               DateTime     @default(now()) @map("created_at") @db.Timestamptz(6)
-  createdBy               String       @map("created_by")
-  activatedAt             DateTime?    @map("activated_at") @db.Timestamptz(6)
-  retiredAt               DateTime?    @map("retired_at") @db.Timestamptz(6)
-  tenant                  Tenant       @relation(fields: [tenantId], references: [id], onDelete: Restrict, onUpdate: Cascade)
-  workSchedule            WorkSchedule @relation(fields: [tenantId, workScheduleId], references: [tenantId, id], onDelete: Restrict, onUpdate: Cascade)
+  timezone               String?              @map("timezone")
+  weeklyPattern          Json                 @map("weekly_pattern")
+  canonicalHash          String               @map("canonical_hash")
+  changeReason           String?              @map("change_reason")
+  createdAt              DateTime             @default(now()) @map("created_at") @db.Timestamptz(6)
+  createdBy              String               @map("created_by")
+  activatedAt            DateTime?            @map("activated_at") @db.Timestamptz(6)
+  retiredAt              DateTime?            @map("retired_at") @db.Timestamptz(6)
+  tenant                 Tenant               @relation(fields: [tenantId], references: [id], onDelete: Restrict, onUpdate: Cascade)
+  workSchedule           WorkSchedule         @relation(fields: [tenantId, workScheduleId], references: [tenantId, id], onDelete: Restrict, onUpdate: Cascade)
+  scheduleAssignments    ScheduleAssignment[] @relation("ScheduleAssignmentVersion")
 
   @@unique([tenantId, id])
   @@unique([workScheduleId, versionNumber])
+  /// Slice 4 (Timekeeping ScheduleAssignment): enables the composite
+  /// (tenantId, workScheduleId, workScheduleVersionId) foreign key from
+  /// ScheduleAssignment, so the database itself enforces "the referenced
+  /// version belongs to the referenced WorkSchedule." Index-only addition —
+  /// no column, data, or behavior change to this Slice 3 table.
+  @@unique([tenantId, workScheduleId, id])
   @@index([tenantId, workScheduleId, status])
   @@map("work_schedule_versions")
+}
+
+/// ScheduleAssignment — the effective-dated binding of one immutable
+/// WorkScheduleVersion to one person (ADR-014 §4.2; Timekeeping Slice 4).
+/// Append-oriented: the only ordinary post-creation mutation is closing an
+/// open window via effectiveUntil; a not-yet-started assignment is retired
+/// instead via the explicit cancellation fields, never by mutating
+/// effectiveUntil. Pins a specific, immutable WorkScheduleVersion — it never
+/// dynamically follows whichever version of workScheduleId is currently
+/// ACTIVE, and it is never invalidated or migrated when that version is
+/// later RETIRED. Never snapshots location/timezone/legal entity — those
+/// remain Organization's, resolved live at read/compute time (ADR-014 §5.4).
+model ScheduleAssignment {
+  id                    String              @id @default(uuid()) @map("schedule_assignment_id")
+  tenantId              String              @map("tenant_id")
+  personId              String              @map("person_id")
+  workScheduleId        String              @map("work_schedule_id")
+  workScheduleVersionId String              @map("work_schedule_version_id")
+  effectiveFrom         DateTime            @map("effective_from") @db.Timestamptz(6)
+  effectiveUntil        DateTime?           @map("effective_until") @db.Timestamptz(6)
+  changeReason          String?             @map("change_reason")
+  /// Set only by cancelFutureAssignment — never as a side effect of
+  /// end/transfer, which use effectiveUntil instead (Slice 4 Decision 7).
+  cancelledAt           DateTime?           @map("cancelled_at") @db.Timestamptz(6)
+  cancelledBy           String?             @map("cancelled_by")
+  cancellationReason    String?             @map("cancellation_reason")
+  createdAt             DateTime            @default(now()) @map("created_at") @db.Timestamptz(6)
+  createdBy             String              @map("created_by")
+  tenant                Tenant              @relation(fields: [tenantId], references: [id], onDelete: Restrict, onUpdate: Cascade)
+  person                Employee            @relation("ScheduleAssignmentPerson", fields: [tenantId, personId], references: [tenantId, employeeId], onDelete: Restrict, onUpdate: Cascade)
+  workSchedule          WorkSchedule        @relation("ScheduleAssignmentWorkSchedule", fields: [tenantId, workScheduleId], references: [tenantId, id], onDelete: Restrict, onUpdate: Cascade)
+  workScheduleVersion   WorkScheduleVersion @relation("ScheduleAssignmentVersion", fields: [tenantId, workScheduleId, workScheduleVersionId], references: [tenantId, workScheduleId, id], onDelete: Restrict, onUpdate: Cascade)
+
+  @@unique([tenantId, id])
+  @@index([tenantId, personId, effectiveFrom])
+  @@index([tenantId, workScheduleVersionId])
+  @@map("schedule_assignments")
 }
 
 /// Append-only command outcome evidence. The migration installs a PostgreSQL
