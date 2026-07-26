@@ -95,8 +95,35 @@ describe("hasPermission — timekeeping.view (Timekeeping Slice 1)", () => {
     }
   });
 
-  it("gives manager and employee no timekeeping access by default", () => {
+  it("gives manager and employee no timekeeping.view by default (they gain only timekeeping.clock in Slice 2 — see below)", () => {
     expect(hasPermission(contextFor(["manager"]), "timekeeping.view")).toBe(false);
     expect(hasPermission(contextFor(["employee"]), "timekeeping.view")).toBe(false);
+  });
+});
+
+describe("hasPermission — timekeeping.clock / timekeeping.manage (Timekeeping Slice 2, Decision 2)", () => {
+  it("grants timekeeping.clock to every role representing a real staff member: hr_admin, hr_operations, manager, and employee", () => {
+    for (const role of ["hr_admin", "hr_operations", "manager", "employee"] as const) {
+      expect(hasPermission(contextFor([role]), "timekeeping.clock")).toBe(true);
+    }
+  });
+
+  it("denies timekeeping.clock to payroll and auditor — self-clock for real staff in those functions comes from also holding the employee role, not from widening the functional role itself", () => {
+    expect(hasPermission(contextFor(["payroll"]), "timekeeping.clock")).toBe(false);
+    expect(hasPermission(contextFor(["auditor"]), "timekeeping.clock")).toBe(false);
+  });
+
+  it("grants timekeeping.manage to hr_admin only — mirroring organization.manage's identically narrow precedent", () => {
+    expect(hasPermission(contextFor(["hr_admin"]), "timekeeping.manage")).toBe(true);
+    for (const role of ["hr_operations", "payroll", "auditor", "manager", "employee"] as const) {
+      expect(hasPermission(contextFor([role]), "timekeeping.manage")).toBe(false);
+    }
+  });
+
+  it("keeps timekeeping.clock and timekeeping.manage orthogonal — manager/employee can clock in but never record on behalf of another person", () => {
+    expect(hasPermission(contextFor(["manager"]), "timekeeping.clock")).toBe(true);
+    expect(hasPermission(contextFor(["manager"]), "timekeeping.manage")).toBe(false);
+    expect(hasPermission(contextFor(["employee"]), "timekeeping.clock")).toBe(true);
+    expect(hasPermission(contextFor(["employee"]), "timekeeping.manage")).toBe(false);
   });
 });
