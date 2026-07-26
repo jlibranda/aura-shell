@@ -26,6 +26,8 @@ model Tenant {
   locations                    Location[]
   legalEntities                LegalEntity[]
   attendanceEvents             AttendanceEvent[]
+  workSchedules                WorkSchedule[]
+  workScheduleVersions         WorkScheduleVersion[]
 
   @@map("tenants")
 }
@@ -433,6 +435,60 @@ model AttendanceEvent {
   @@unique([tenantId, idempotencyKey])
   @@index([tenantId, personId, occurredAtUtc])
   @@map("attendance_events")
+}
+
+/// WorkSchedule — a reusable, tenant-scoped schedule template (ADR-014
+/// §4.1, Timekeeping Slice 3). Stable identity/label only; every field that
+/// affects what the schedule computes to lives on WorkScheduleVersion.
+/// `code` is permanent business identity, never changed, never reused.
+model WorkSchedule {
+  id          String                @id @default(uuid()) @map("work_schedule_id")
+  tenantId    String                @map("tenant_id")
+  code        String                @map("code")
+  name        String                @map("name")
+  description String?               @map("description")
+  createdAt   DateTime              @default(now()) @map("created_at") @db.Timestamptz(6)
+  createdBy   String                @map("created_by")
+  updatedAt   DateTime              @updatedAt @map("updated_at") @db.Timestamptz(6)
+  tenant      Tenant                @relation(fields: [tenantId], references: [id], onDelete: Restrict, onUpdate: Cascade)
+  versions    WorkScheduleVersion[]
+
+  @@unique([tenantId, id])
+  @@unique([tenantId, code])
+  @@map("work_schedules")
+}
+
+/// One versioned content snapshot of a WorkSchedule (ADR-014 §4.1; Slice 3
+/// Decisions 1, 8, 9). DRAFT content may be replaced in full before
+/// activation; ACTIVE/RETIRED content is never mutated — a change
+/// always creates a new DRAFT version instead. At most one ACTIVE version
+/// per work_schedule_id is enforced by a partial unique index (see
+/// migration), not application code alone. `canonicalHash` is for
+/// duplicate-content detection only — never business identity.
+model WorkScheduleVersion {
+  id                      String       @id @default(uuid()) @map("work_schedule_version_id")
+  tenantId                String       @map("tenant_id")
+  workScheduleId          String       @map("work_schedule_id")
+  versionNumber           Int          @map("version_number")
+  status                  String       @map("status")
+  scheduleType            String       @map("schedule_type")
+  timezoneResolutionMode  String       @map("timezone_resolution_mode")
+  /// Required iff timezoneResolutionMode = FIXED; absent iff LOCATION.
+  timezone                String?      @map("timezone")
+  weeklyPattern           Json         @map("weekly_pattern")
+  canonicalHash           String       @map("canonical_hash")
+  changeReason            String?      @map("change_reason")
+  createdAt               DateTime     @default(now()) @map("created_at") @db.Timestamptz(6)
+  createdBy               String       @map("created_by")
+  activatedAt             DateTime?    @map("activated_at") @db.Timestamptz(6)
+  retiredAt               DateTime?    @map("retired_at") @db.Timestamptz(6)
+  tenant                  Tenant       @relation(fields: [tenantId], references: [id], onDelete: Restrict, onUpdate: Cascade)
+  workSchedule            WorkSchedule @relation(fields: [tenantId, workScheduleId], references: [tenantId, id], onDelete: Restrict, onUpdate: Cascade)
+
+  @@unique([tenantId, id])
+  @@unique([workScheduleId, versionNumber])
+  @@index([tenantId, workScheduleId, status])
+  @@map("work_schedule_versions")
 }
 
 /// Append-only command outcome evidence. The migration installs a PostgreSQL
