@@ -85,3 +85,18 @@ describe("hasPermission — settings.* role matrix (Epic 7 Slice 7A)", () => {
     expect(hasPermission(context, "settings.publish")).toBe(false);
   });
 });
+
+describe("hasPermission — timekeeping.view (Timekeeping Slice 1)", () => {
+  // timekeeping.view is granted to exactly the same roles as organization.view — no clock/manage/approve/adjust permission exists yet.
+  it("grants timekeeping.view to hr_admin, hr_operations, payroll, and auditor — the same roles as organization.view", () => {
+    for (const role of ["hr_admin", "hr_operations", "payroll", "auditor"] as const) {
+      expect(hasPermission(contextFor([role]), "timekeeping.view")).toBe(hasPermission(contextFor([role]), "organization.view"));
+      expect(hasPermission(contextFor([role]), "timekeeping.view")).toBe(true);
+    }
+  });
+
+  it("gives manager and employee no timekeeping access by default", () => {
+    expect(hasPermission(contextFor(["manager"]), "timekeeping.view")).toBe(false);
+    expect(hasPermission(contextFor(["employee"]), "timekeeping.view")).toBe(false);
+  });
+});

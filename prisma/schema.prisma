@@ -25,6 +25,7 @@ model Tenant {
   assignments                  Assignment[]
   locations                    Location[]
   legalEntities                LegalEntity[]
+  attendanceEvents             AttendanceEvent[]
 
   @@map("tenants")
 }
@@ -384,6 +385,7 @@ model Employee {
   tenant                Tenant       @relation(fields: [tenantId], references: [id], onDelete: Restrict, onUpdate: Cascade)
   assignmentsAsPerson   Assignment[] @relation("AssignmentPerson")
   assignmentsAsManager  Assignment[] @relation("AssignmentManager")
+  attendanceEvents      AttendanceEvent[] @relation("AttendanceEventPerson")
 
   @@id([tenantId, employeeId])
   @@unique([tenantId, employeeNumber])
@@ -391,6 +393,46 @@ model Employee {
   @@index([tenantId, lastName, firstName])
   @@index([tenantId, departmentId])
   @@map("employees")
+}
+
+/// AttendanceEvent — the immutable, atomic fact that a person's clock-in/out
+/// channel registered a punch at a specific instant (ADR-014 §4.3,
+/// Timekeeping Slice 1). Create-only: the migration installs a PostgreSQL
+/// trigger that rejects UPDATE and DELETE operations on this table, the same
+/// pattern already used for audit_records and configuration_versions.
+/// Corrections belong to a future AttendanceAdjustment against the computed
+/// AttendanceDay — never a mutation of this row.
+model AttendanceEvent {
+  id              String    @id @default(uuid()) @map("attendance_event_id")
+  tenantId        String    @map("tenant_id")
+  personId        String    @map("person_id")
+  /// The device/channel-reported instant the punch occurred, UTC.
+  occurredAtUtc   DateTime  @map("occurred_at_utc") @db.Timestamptz(6)
+  /// When AURA received this event — distinct from occurredAtUtc
+  /// (channel-reported) and createdAt (persistence time). Never compared
+  /// against occurredAtUtc to reject an event: clock skew and delayed/
+  /// offline sync are forensic/anomaly concerns, not grounds to refuse a
+  /// genuinely received fact (ADR-014 §15).
+  receivedAtUtc   DateTime  @map("received_at_utc") @db.Timestamptz(6)
+  /// Stable channel category (ADR-014 §4.3, §8) — never vendor-specific;
+  /// vendor/device identity belongs to sourceRef so a new vendor never
+  /// requires a schema migration.
+  source          String    @map("source")
+  /// Device id / import batch id / API caller — free-text, channel-specific.
+  sourceRef       String?   @map("source_ref")
+  /// What the source channel itself reported, if known — evidentiary only,
+  /// never authoritative. AttendanceDay remains solely responsible for
+  /// interpreting event chronology (ADR-014 §4.4, §9).
+  eventType       String?   @map("event_type")
+  idempotencyKey  String    @map("idempotency_key")
+  createdAt       DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
+  tenant          Tenant    @relation(fields: [tenantId], references: [id], onDelete: Restrict, onUpdate: Cascade)
+  person          Employee  @relation("AttendanceEventPerson", fields: [tenantId, personId], references: [tenantId, employeeId], onDelete: Restrict, onUpdate: Cascade)
+
+  @@unique([tenantId, id])
+  @@unique([tenantId, idempotencyKey])
+  @@index([tenantId, personId, occurredAtUtc])
+  @@map("attendance_events")
 }
 
 /// Append-only command outcome evidence. The migration installs a PostgreSQL
