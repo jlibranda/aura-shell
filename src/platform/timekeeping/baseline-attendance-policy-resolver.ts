@@ -4,25 +4,24 @@ import type { AttendancePolicyReadRepository } from "@/platform/timekeeping/atte
 import type { AttendancePolicyResolver } from "@/platform/timekeeping/attendance-policy-resolver";
 import type { AttendancePolicyResolutionInput, AttendancePolicyResolutionResult, ResolvedAttendancePolicy } from "@/platform/timekeeping/attendance-policy";
 
-function toResolved(record: {
-  attendancePolicyId: string; attendancePolicyVersionId: string; scope: ResolvedAttendancePolicy["scope"]; scopeId: string;
-  effectiveFrom: string; effectiveUntil?: string; rounding: ResolvedAttendancePolicy["rounding"]; gracePeriod: ResolvedAttendancePolicy["gracePeriod"];
-  breakRules: ResolvedAttendancePolicy["breakRules"]; overtime: ResolvedAttendancePolicy["overtime"]; overtimeThresholdsAreStatutoryFloor: boolean;
-  tolerance: ResolvedAttendancePolicy["tolerance"]; calculationAlgorithmVersion: number; fingerprint: string;
-}): ResolvedAttendancePolicy {
+/** Strips provenance-only fields (changeReason/createdAt/createdBy) from a persisted record, leaving exactly the approved ResolvedAttendancePolicy shape. */
+function toResolved(record: ResolvedAttendancePolicy): ResolvedAttendancePolicy {
   return Object.freeze({
-    attendancePolicyId: record.attendancePolicyId,
-    attendancePolicyVersionId: record.attendancePolicyVersionId,
+    policyId: record.policyId,
+    policyVersionId: record.policyVersionId,
     scope: record.scope,
     scopeId: record.scopeId,
+    tenantId: record.tenantId,
     effectiveFrom: record.effectiveFrom,
     ...(record.effectiveUntil ? { effectiveUntil: record.effectiveUntil } : {}),
-    rounding: record.rounding,
-    gracePeriod: record.gracePeriod,
-    breakRules: record.breakRules,
-    overtime: record.overtime,
-    overtimeThresholdsAreStatutoryFloor: record.overtimeThresholdsAreStatutoryFloor,
-    tolerance: record.tolerance,
+    roundingIntervalMinutes: record.roundingIntervalMinutes,
+    roundingDirection: record.roundingDirection,
+    gracePeriodMinutes: record.gracePeriodMinutes,
+    latenessToleranceMinutes: record.latenessToleranceMinutes,
+    ...(record.unpaidBreakMinutes !== undefined ? { unpaidBreakMinutes: record.unpaidBreakMinutes } : {}),
+    standardWorkWeekMinutes: record.standardWorkWeekMinutes,
+    isStandardWorkWeekStatutoryFloor: record.isStandardWorkWeekStatutoryFloor,
+    ...(record.dailyOvertimeThresholdMinutes !== undefined ? { dailyOvertimeThresholdMinutes: record.dailyOvertimeThresholdMinutes } : {}),
     calculationAlgorithmVersion: record.calculationAlgorithmVersion,
     fingerprint: record.fingerprint,
   });

@@ -15,40 +15,38 @@
 
 -- CreateTable
 CREATE TABLE "attendance_policies" (
-    "attendance_policy_id" TEXT NOT NULL,
-    "attendance_policy_version_id" TEXT NOT NULL,
+    "policy_id" TEXT NOT NULL,
+    "policy_version_id" TEXT NOT NULL,
     "tenant_id" TEXT NOT NULL,
     "scope" TEXT NOT NULL,
     "scope_id" TEXT NOT NULL,
     "effective_from" TIMESTAMPTZ(6) NOT NULL,
     "effective_until" TIMESTAMPTZ(6),
-    "rounding_increment_minutes" INTEGER NOT NULL,
+    "rounding_interval_minutes" INTEGER NOT NULL,
     "rounding_direction" TEXT NOT NULL,
-    "late_arrival_grace_minutes" INTEGER NOT NULL,
-    "early_departure_grace_minutes" INTEGER NOT NULL,
-    "unpaid_break_minutes" INTEGER NOT NULL,
-    "paid_break_minutes" INTEGER NOT NULL,
-    "daily_overtime_threshold_minutes" INTEGER NOT NULL,
-    "weekly_overtime_threshold_minutes" INTEGER NOT NULL,
-    "overtime_thresholds_are_statutory_floor" BOOLEAN NOT NULL,
-    "missed_punch_tolerance_minutes" INTEGER NOT NULL,
+    "grace_period_minutes" INTEGER NOT NULL,
+    "lateness_tolerance_minutes" INTEGER NOT NULL,
+    "unpaid_break_minutes" INTEGER,
+    "standard_work_week_minutes" INTEGER NOT NULL,
+    "is_standard_work_week_statutory_floor" BOOLEAN NOT NULL,
+    "daily_overtime_threshold_minutes" INTEGER,
     "calculation_algorithm_version" INTEGER NOT NULL,
     "fingerprint" TEXT NOT NULL,
     "change_reason" TEXT,
     "created_at" TIMESTAMPTZ(6) NOT NULL DEFAULT CURRENT_TIMESTAMP,
     "created_by" TEXT NOT NULL,
 
-    CONSTRAINT "attendance_policies_pkey" PRIMARY KEY ("attendance_policy_version_id")
+    CONSTRAINT "attendance_policies_pkey" PRIMARY KEY ("policy_version_id")
 );
 
 -- CreateIndex
 CREATE INDEX "attendance_policies_tenant_id_scope_scope_id_effective_from_idx" ON "attendance_policies"("tenant_id", "scope", "scope_id", "effective_from");
 
 -- CreateIndex
-CREATE INDEX "attendance_policies_tenant_id_attendance_policy_id_idx" ON "attendance_policies"("tenant_id", "attendance_policy_id");
+CREATE INDEX "attendance_policies_tenant_id_policy_id_idx" ON "attendance_policies"("tenant_id", "policy_id");
 
 -- CreateIndex
-CREATE UNIQUE INDEX "attendance_policies_tenant_id_attendance_policy_version_id_key" ON "attendance_policies"("tenant_id", "attendance_policy_version_id");
+CREATE UNIQUE INDEX "attendance_policies_tenant_id_policy_version_id_key" ON "attendance_policies"("tenant_id", "policy_version_id");
 
 -- AddForeignKey
 ALTER TABLE "attendance_policies" ADD CONSTRAINT "attendance_policies_tenant_id_fkey" FOREIGN KEY ("tenant_id") REFERENCES "tenants"("tenant_id") ON DELETE RESTRICT ON UPDATE CASCADE;
@@ -63,19 +61,24 @@ ALTER TABLE "attendance_policies" ADD CONSTRAINT "attendance_policies_scope_chec
 -- CheckConstraint: for a TENANT-scope row, scope_id must equal tenant_id — there is exactly one Tenant scope per tenant, so the two identifiers coincide by construction, never by convention alone.
 ALTER TABLE "attendance_policies" ADD CONSTRAINT "attendance_policies_tenant_scope_id_check" CHECK ("scope" <> 'TENANT' OR "scope_id" = "tenant_id");
 
--- CheckConstraint: rounding_direction must be one of the three recognized directions.
-ALTER TABLE "attendance_policies" ADD CONSTRAINT "attendance_policies_rounding_direction_check" CHECK ("rounding_direction" IN ('NEAREST', 'UP', 'DOWN'));
+-- CheckConstraint: rounding_direction must be one of the three approved (lowercase) directions.
+ALTER TABLE "attendance_policies" ADD CONSTRAINT "attendance_policies_rounding_direction_check" CHECK ("rounding_direction" IN ('nearest', 'up', 'down'));
 
--- CheckConstraint: every duration/threshold value is a non-negative number of minutes, and the rounding increment evenly divides 60 — the same rule computeAttendancePolicyFingerprint's caller already validates in the application layer, enforced again at the database as the final authority.
+-- CheckConstraint: rounding_interval_minutes must be strictly positive — the
+-- approved contract requires roundingIntervalMinutes > 0 and does not
+-- authorize any divisibility restriction on top of it.
+ALTER TABLE "attendance_policies" ADD CONSTRAINT "attendance_policies_rounding_interval_positive_check" CHECK ("rounding_interval_minutes" > 0);
+
+-- CheckConstraint: every other duration/threshold value is a non-negative
+-- number of minutes when present; unpaid_break_minutes and
+-- daily_overtime_threshold_minutes are nullable per the approved contract's
+-- optionality, so a NULL is always allowed alongside a non-negative value.
 ALTER TABLE "attendance_policies" ADD CONSTRAINT "attendance_policies_non_negative_minutes_check" CHECK (
-    "rounding_increment_minutes" >= 0 AND (("rounding_increment_minutes" = 0) OR (60 % "rounding_increment_minutes" = 0))
-    AND "late_arrival_grace_minutes" >= 0
-    AND "early_departure_grace_minutes" >= 0
-    AND "unpaid_break_minutes" >= 0
-    AND "paid_break_minutes" >= 0
-    AND "daily_overtime_threshold_minutes" >= 0
-    AND "weekly_overtime_threshold_minutes" >= 0
-    AND "missed_punch_tolerance_minutes" >= 0
+    "grace_period_minutes" >= 0
+    AND "lateness_tolerance_minutes" >= 0
+    AND ("unpaid_break_minutes" IS NULL OR "unpaid_break_minutes" >= 0)
+    AND "standard_work_week_minutes" >= 0
+    AND ("daily_overtime_threshold_minutes" IS NULL OR "daily_overtime_threshold_minutes" >= 0)
 );
 
 -- ExclusionConstraint: for the same (tenant, scope, scope_id), policy

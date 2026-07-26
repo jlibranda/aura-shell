@@ -3,15 +3,50 @@ import { join, relative } from "node:path";
 import { describe, expect, it } from "vitest";
 
 /**
- * Structural guards for Slice 5 Phase A: AttendancePolicy stays the stable
- * contract Slice 6 depends on — no AttendanceDay/attendance-calculation
+ * Structural guards for Slice 5 Phase A: AttendancePolicy stays the stable,
+ * flat contract Slice 6 depends on — no AttendanceDay/attendance-calculation
  * reference, no People/Organization/Payroll import, no monetary field, no
  * workdayBoundaryMinutes anywhere (a fixed Algorithm Invariant per ADR-014
  * Appendix G, never a policy field), no lifecycle operation beyond
- * create/replace/end, and a resolver interface that is not coupled to its
- * one implementation.
+ * create/replace/end, a resolver interface not coupled to its one
+ * implementation, and — critically — no nested "rule object" substitution
+ * for the approved flat ResolvedAttendancePolicy contract.
  */
 const REPO_ROOT = join(__dirname, "..", "..", "..");
+
+const APPROVED_RESOLVED_ATTENDANCE_POLICY_FIELDS = [
+  "policyId",
+  "policyVersionId",
+  "scope",
+  "scopeId",
+  "tenantId",
+  "effectiveFrom",
+  "effectiveUntil",
+  "roundingIntervalMinutes",
+  "roundingDirection",
+  "gracePeriodMinutes",
+  "latenessToleranceMinutes",
+  "unpaidBreakMinutes",
+  "standardWorkWeekMinutes",
+  "isStandardWorkWeekStatutoryFloor",
+  "dailyOvertimeThresholdMinutes",
+  "calculationAlgorithmVersion",
+  "fingerprint",
+] as const;
+
+/** Prohibited nested/renamed replacement structures for the approved flat contract (Slice 5 contract-conformance audit). */
+const PROHIBITED_NESTED_SUBSTITUTIONS = [
+  "rounding",
+  "gracePeriod",
+  "breakRules",
+  "overtime",
+  "tolerance",
+  "overtimeThresholdsAreStatutoryFloor",
+  "policyRules",
+  "attendanceRules",
+  "attendancePolicyId",
+  "attendancePolicyVersionId",
+] as const;
 
 function sourceFiles(): { path: string; content: string }[] {
   const walk = (dir: string): string[] =>
@@ -27,21 +62,54 @@ function sourceFiles(): { path: string; content: string }[] {
   }));
 }
 
-describe("AttendancePolicy stays the stable Slice 6 contract — no calculation/payroll reference", () => {
+describe("ResolvedAttendancePolicy is the exact approved flat contract — no nested/renamed substitution", () => {
   const files = sourceFiles();
-  const attendancePolicyFiles = files.filter((f) => f.path.startsWith("src/platform/timekeeping/") && /attendance-policy/.test(f.path));
+  const domainFile = files.find((f) => f.path === "src/platform/timekeeping/attendance-policy.ts");
 
   it("declares ResolvedAttendancePolicy in exactly one file", () => {
     const declarers = files.filter((f) => /interface\s+ResolvedAttendancePolicy\b/.test(f.content));
     expect(declarers.map((f) => f.path)).toEqual(["src/platform/timekeeping/attendance-policy.ts"]);
   });
 
-  it("declares AttendancePolicyResolver in exactly one file", () => {
-    const declarers = files.filter((f) => /interface\s+AttendancePolicyResolver\b/.test(f.content));
-    expect(declarers.map((f) => f.path)).toEqual(["src/platform/timekeeping/attendance-policy-resolver.ts"]);
+  it("declares exactly the approved flat field set on ResolvedAttendancePolicy — no more, no fewer", () => {
+    expect(domainFile).toBeDefined();
+    const match = domainFile!.content.match(/export interface ResolvedAttendancePolicy \{[\s\S]*?\n\}/);
+    expect(match).not.toBeNull();
+    const block = match![0];
+    const fieldNames = [...block.matchAll(/^\s{2}([a-zA-Z][a-zA-Z0-9]*)\??:/gm)].map((m) => m[1]);
+    expect(fieldNames.sort()).toEqual([...APPROVED_RESOLVED_ATTENDANCE_POLICY_FIELDS].sort());
   });
 
-  it("never declares or references workdayBoundaryMinutes as a field anywhere in the AttendancePolicy file set — it is a fixed Algorithm Invariant, never a policy field (prose explaining the deliberate exclusion is fine)", () => {
+  it("never substitutes a nested rule object for the approved flat contract anywhere in the AttendancePolicy file set", () => {
+    const attendancePolicyFiles = files.filter((f) => f.path.startsWith("src/platform/timekeeping/") && /attendance-policy/.test(f.path));
+    for (const file of attendancePolicyFiles) {
+      for (const forbidden of PROHIBITED_NESTED_SUBSTITUTIONS) {
+        expect(file.content).not.toMatch(new RegExp(`\\b${forbidden}\\s*:`));
+        expect(file.content).not.toMatch(new RegExp(`\\.${forbidden}\\b`));
+      }
+    }
+  });
+
+  it("uses lowercase RoundingDirection values ('nearest' | 'up' | 'down'), never the uppercase form", () => {
+    expect(domainFile).toBeDefined();
+    expect(domainFile!.content).toMatch(/ROUNDING_DIRECTIONS\s*=\s*\["nearest",\s*"up",\s*"down"\]/);
+    expect(domainFile!.content).not.toMatch(/"NEAREST"|"UP"|"DOWN"/);
+  });
+
+  it("never imposes a divisibility-by-60 (or any other) restriction on roundingIntervalMinutes beyond > 0 — that rule was never authorized (prose explaining the deliberate absence is fine; only executable code is checked)", () => {
+    const attendancePolicyFiles = files.filter((f) => f.path.startsWith("src/platform/timekeeping/") && /attendance-policy/.test(f.path));
+    for (const file of attendancePolicyFiles) {
+      const codeOnly = file.content.replace(/\/\*\*[\s\S]*?\*\//g, "").replace(/\/\/.*$/gm, "");
+      expect(codeOnly).not.toMatch(/60\s*%/);
+    }
+  });
+});
+
+describe("AttendancePolicy stays the stable Slice 6 contract — no calculation/payroll reference", () => {
+  const files = sourceFiles();
+  const attendancePolicyFiles = files.filter((f) => f.path.startsWith("src/platform/timekeeping/") && /attendance-policy/.test(f.path));
+
+  it("never references workdayBoundaryMinutes as a field anywhere in the AttendancePolicy file set — it is a fixed Algorithm Invariant, never a policy field", () => {
     for (const file of attendancePolicyFiles) {
       expect(file.content).not.toMatch(/[.\s]workdayBoundaryMinutes\s*[?:]/i);
     }
@@ -164,5 +232,19 @@ describe("attendance_policies migration installs the required database-level inv
     const sql = readFileSync(join(migrationsRoot, migrationDirs[0].name, "migration.sql"), "utf8");
     expect(sql).toMatch(/EXCLUDE USING gist/);
     expect(sql).not.toMatch(/UNIQUE INDEX[^;]*\("fingerprint"\)/i);
+  });
+
+  it("enforces rounding_interval_minutes > 0 without an unauthorized divides-60 constraint", () => {
+    expect(migrationDirs).toHaveLength(1);
+    const sql = readFileSync(join(migrationsRoot, migrationDirs[0].name, "migration.sql"), "utf8");
+    expect(sql).toMatch(/"rounding_interval_minutes"\s*>\s*0/);
+    expect(sql).not.toMatch(/60\s*%/);
+  });
+
+  it("constrains rounding_direction to the lowercase approved values only", () => {
+    expect(migrationDirs).toHaveLength(1);
+    const sql = readFileSync(join(migrationsRoot, migrationDirs[0].name, "migration.sql"), "utf8");
+    expect(sql).toMatch(/'nearest',\s*'up',\s*'down'/);
+    expect(sql).not.toMatch(/'NEAREST'|'UP'|'DOWN'/);
   });
 });

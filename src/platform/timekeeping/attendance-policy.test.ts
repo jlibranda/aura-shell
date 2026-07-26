@@ -12,30 +12,34 @@ import {
 function draft(overrides: Partial<AttendancePolicyContentDraft> = {}): AttendancePolicyContentDraft {
   return {
     effectiveFrom: "2026-01-01T00:00:00.000Z",
-    rounding: { incrementMinutes: 15, direction: "NEAREST" },
-    gracePeriod: { lateArrivalGraceMinutes: 5, earlyDepartureGraceMinutes: 5 },
-    breakRules: { unpaidBreakMinutes: 60, paidBreakMinutes: 15 },
-    overtime: { dailyThresholdMinutes: 480, weeklyThresholdMinutes: 2400 },
-    overtimeThresholdsAreStatutoryFloor: false,
-    tolerance: { missedPunchToleranceMinutes: 10 },
+    roundingIntervalMinutes: 15,
+    roundingDirection: "nearest",
+    gracePeriodMinutes: 5,
+    latenessToleranceMinutes: 10,
+    unpaidBreakMinutes: 60,
+    standardWorkWeekMinutes: 2400,
+    isStandardWorkWeekStatutoryFloor: false,
+    dailyOvertimeThresholdMinutes: 480,
     ...overrides,
   };
 }
 
 function record(overrides: Partial<AttendancePolicyRecord> = {}): AttendancePolicyRecord {
   return Object.freeze({
-    attendancePolicyId: "lineage-1",
-    attendancePolicyVersionId: "version-1",
+    policyId: "lineage-1",
+    policyVersionId: "version-1",
     tenantId: "tenant-a",
     scope: "TENANT" as const,
     scopeId: "tenant-a",
     effectiveFrom: "2026-01-01T00:00:00.000Z",
-    rounding: { incrementMinutes: 15, direction: "NEAREST" as const },
-    gracePeriod: { lateArrivalGraceMinutes: 5, earlyDepartureGraceMinutes: 5 },
-    breakRules: { unpaidBreakMinutes: 60, paidBreakMinutes: 15 },
-    overtime: { dailyThresholdMinutes: 480, weeklyThresholdMinutes: 2400 },
-    overtimeThresholdsAreStatutoryFloor: false,
-    tolerance: { missedPunchToleranceMinutes: 10 },
+    roundingIntervalMinutes: 15,
+    roundingDirection: "nearest" as const,
+    gracePeriodMinutes: 5,
+    latenessToleranceMinutes: 10,
+    unpaidBreakMinutes: 60,
+    standardWorkWeekMinutes: 2400,
+    isStandardWorkWeekStatutoryFloor: false,
+    dailyOvertimeThresholdMinutes: 480,
     calculationAlgorithmVersion: 1,
     fingerprint: "hash",
     createdAt: "2026-01-01T00:00:00.000Z",
@@ -50,10 +54,25 @@ describe("validateAttendancePolicyContentDraft", () => {
     expect(result.success).toBe(true);
   });
 
+  it("accepts a draft omitting the optional unpaidBreakMinutes/dailyOvertimeThresholdMinutes fields", () => {
+    const result = validateAttendancePolicyContentDraft(draft({ unpaidBreakMinutes: undefined, dailyOvertimeThresholdMinutes: undefined }));
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect(result.data.unpaidBreakMinutes).toBeUndefined();
+      expect(result.data.dailyOvertimeThresholdMinutes).toBeUndefined();
+    }
+  });
+
   it("accepts an optional changeReason", () => {
     const result = validateAttendancePolicyContentDraft(draft({ changeReason: "Initial baseline" }));
     expect(result.success).toBe(true);
     if (result.success) expect(result.data.changeReason).toBe("Initial baseline");
+  });
+
+  it("normalizes roundingDirection casing to lowercase", () => {
+    const result = validateAttendancePolicyContentDraft(draft({ roundingDirection: "NEAREST" }));
+    expect(result.success).toBe(true);
+    if (result.success) expect(result.data.roundingDirection).toBe("nearest");
   });
 
   it("rejects an invalid effectiveFrom", () => {
@@ -62,47 +81,53 @@ describe("validateAttendancePolicyContentDraft", () => {
   });
 
   it("rejects an unrecognized rounding direction", () => {
-    const result = validateAttendancePolicyContentDraft(draft({ rounding: { incrementMinutes: 15, direction: "SIDEWAYS" } }));
+    const result = validateAttendancePolicyContentDraft(draft({ roundingDirection: "sideways" }));
     expect(result.success).toBe(false);
   });
 
-  it("rejects a negative rounding increment", () => {
-    const result = validateAttendancePolicyContentDraft(draft({ rounding: { incrementMinutes: -5, direction: "NEAREST" } }));
+  it("rejects a zero roundingIntervalMinutes — the approved contract requires roundingIntervalMinutes > 0", () => {
+    const result = validateAttendancePolicyContentDraft(draft({ roundingIntervalMinutes: 0 }));
     expect(result.success).toBe(false);
   });
 
-  it("rejects a rounding increment that does not evenly divide 60", () => {
-    const result = validateAttendancePolicyContentDraft(draft({ rounding: { incrementMinutes: 7, direction: "NEAREST" } }));
+  it("rejects a negative roundingIntervalMinutes", () => {
+    const result = validateAttendancePolicyContentDraft(draft({ roundingIntervalMinutes: -5 }));
     expect(result.success).toBe(false);
   });
 
-  it("accepts a zero rounding increment (no rounding)", () => {
-    const result = validateAttendancePolicyContentDraft(draft({ rounding: { incrementMinutes: 0, direction: "NEAREST" } }));
+  it("accepts a roundingIntervalMinutes that does NOT evenly divide 60 — no divisibility rule is authorized", () => {
+    const result = validateAttendancePolicyContentDraft(draft({ roundingIntervalMinutes: 7 }));
     expect(result.success).toBe(true);
+    if (result.success) expect(result.data.roundingIntervalMinutes).toBe(7);
   });
 
-  it("rejects a negative grace period", () => {
-    const result = validateAttendancePolicyContentDraft(draft({ gracePeriod: { lateArrivalGraceMinutes: -1, earlyDepartureGraceMinutes: 0 } }));
+  it("rejects a negative gracePeriodMinutes", () => {
+    const result = validateAttendancePolicyContentDraft(draft({ gracePeriodMinutes: -1 }));
     expect(result.success).toBe(false);
   });
 
-  it("rejects a non-integer break minutes value", () => {
-    const result = validateAttendancePolicyContentDraft(draft({ breakRules: { unpaidBreakMinutes: 1.5, paidBreakMinutes: 0 } }));
+  it("rejects a negative latenessToleranceMinutes", () => {
+    const result = validateAttendancePolicyContentDraft(draft({ latenessToleranceMinutes: -1 }));
     expect(result.success).toBe(false);
   });
 
-  it("rejects a negative overtime threshold", () => {
-    const result = validateAttendancePolicyContentDraft(draft({ overtime: { dailyThresholdMinutes: -1, weeklyThresholdMinutes: 2400 } }));
+  it("rejects a non-integer unpaidBreakMinutes when provided", () => {
+    const result = validateAttendancePolicyContentDraft(draft({ unpaidBreakMinutes: 1.5 }));
     expect(result.success).toBe(false);
   });
 
-  it("requires overtimeThresholdsAreStatutoryFloor to be an explicit boolean", () => {
-    const result = validateAttendancePolicyContentDraft({ ...draft(), overtimeThresholdsAreStatutoryFloor: undefined as unknown as boolean });
+  it("rejects a negative standardWorkWeekMinutes", () => {
+    const result = validateAttendancePolicyContentDraft(draft({ standardWorkWeekMinutes: -1 }));
     expect(result.success).toBe(false);
   });
 
-  it("rejects a negative tolerance value", () => {
-    const result = validateAttendancePolicyContentDraft(draft({ tolerance: { missedPunchToleranceMinutes: -1 } }));
+  it("requires isStandardWorkWeekStatutoryFloor to be an explicit boolean", () => {
+    const result = validateAttendancePolicyContentDraft({ ...draft(), isStandardWorkWeekStatutoryFloor: undefined as unknown as boolean });
+    expect(result.success).toBe(false);
+  });
+
+  it("rejects a negative dailyOvertimeThresholdMinutes when provided", () => {
+    const result = validateAttendancePolicyContentDraft(draft({ dailyOvertimeThresholdMinutes: -1 }));
     expect(result.success).toBe(false);
   });
 
@@ -135,15 +160,21 @@ describe("computeAttendancePolicyFingerprint", () => {
     expect(a).toBe(b);
   });
 
-  it("changes when a resolved value changes", () => {
+  it("changes when roundingIntervalMinutes changes", () => {
     const a = computeAttendancePolicyFingerprint(record());
-    const b = computeAttendancePolicyFingerprint(record({ rounding: { incrementMinutes: 30, direction: "NEAREST" } }));
+    const b = computeAttendancePolicyFingerprint(record({ roundingIntervalMinutes: 30 }));
     expect(a).not.toBe(b);
   });
 
-  it("changes when overtimeThresholdsAreStatutoryFloor changes", () => {
+  it("changes when roundingDirection changes", () => {
     const a = computeAttendancePolicyFingerprint(record());
-    const b = computeAttendancePolicyFingerprint(record({ overtimeThresholdsAreStatutoryFloor: true }));
+    const b = computeAttendancePolicyFingerprint(record({ roundingDirection: "up" }));
+    expect(a).not.toBe(b);
+  });
+
+  it("changes when isStandardWorkWeekStatutoryFloor changes", () => {
+    const a = computeAttendancePolicyFingerprint(record());
+    const b = computeAttendancePolicyFingerprint(record({ isStandardWorkWeekStatutoryFloor: true }));
     expect(a).not.toBe(b);
   });
 
@@ -153,9 +184,21 @@ describe("computeAttendancePolicyFingerprint", () => {
     expect(a).not.toBe(b);
   });
 
-  it("is independent of identity, effective period, and provenance fields", () => {
-    const a = computeAttendancePolicyFingerprint(record({ attendancePolicyVersionId: "version-1", effectiveFrom: "2026-01-01T00:00:00.000Z" }));
-    const b = computeAttendancePolicyFingerprint(record({ attendancePolicyVersionId: "version-2", effectiveFrom: "2027-01-01T00:00:00.000Z" }));
+  it("changes when an absent optional value becomes present (undefined normalizes to null, not to the same fingerprint as a present zero)", () => {
+    const withField = computeAttendancePolicyFingerprint(record({ unpaidBreakMinutes: 0 }));
+    const withoutField = computeAttendancePolicyFingerprint(record({ unpaidBreakMinutes: undefined }));
+    expect(withField).not.toBe(withoutField);
+  });
+
+  it("is identical for two omissions of the same optional field regardless of other object shape", () => {
+    const a = computeAttendancePolicyFingerprint(record({ unpaidBreakMinutes: undefined, dailyOvertimeThresholdMinutes: undefined }));
+    const b = computeAttendancePolicyFingerprint(record({ unpaidBreakMinutes: undefined, dailyOvertimeThresholdMinutes: undefined }));
+    expect(a).toBe(b);
+  });
+
+  it("is independent of identity, scope, effective period, and provenance fields", () => {
+    const a = computeAttendancePolicyFingerprint(record({ policyVersionId: "version-1", scopeId: "tenant-a", effectiveFrom: "2026-01-01T00:00:00.000Z" }));
+    const b = computeAttendancePolicyFingerprint(record({ policyVersionId: "version-2", scopeId: "tenant-b", effectiveFrom: "2027-01-01T00:00:00.000Z" }));
     expect(a).toBe(b);
   });
 });

@@ -13,14 +13,14 @@ function attendancePolicyEvent(
   return createDomainEvent({
     eventName,
     aggregateType: "attendance_policy",
-    aggregateId: policy.attendancePolicyVersionId,
+    aggregateId: policy.policyVersionId,
     tenantId: context.tenantId,
     correlationId: context.correlationId,
     requestId: context.correlationId,
     version: 1,
     payload: {
-      attendancePolicyId: policy.attendancePolicyId,
-      attendancePolicyVersionId: policy.attendancePolicyVersionId,
+      policyId: policy.policyId,
+      policyVersionId: policy.policyVersionId,
       scope: policy.scope,
       scopeId: policy.scopeId,
       effectiveFrom: policy.effectiveFrom,

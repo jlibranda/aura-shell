@@ -51,20 +51,24 @@ export class AttendancePolicyService {
         scope: "TENANT",
         scopeId: tenantId,
         effectiveFrom: validation.data.effectiveFrom,
-        rounding: validation.data.rounding,
-        gracePeriod: validation.data.gracePeriod,
-        breakRules: validation.data.breakRules,
-        overtime: validation.data.overtime,
-        overtimeThresholdsAreStatutoryFloor: validation.data.overtimeThresholdsAreStatutoryFloor,
-        tolerance: validation.data.tolerance,
+        roundingIntervalMinutes: validation.data.roundingIntervalMinutes,
+        roundingDirection: validation.data.roundingDirection,
+        gracePeriodMinutes: validation.data.gracePeriodMinutes,
+        latenessToleranceMinutes: validation.data.latenessToleranceMinutes,
+        unpaidBreakMinutes: validation.data.unpaidBreakMinutes,
+        standardWorkWeekMinutes: validation.data.standardWorkWeekMinutes,
+        isStandardWorkWeekStatutoryFloor: validation.data.isStandardWorkWeekStatutoryFloor,
+        dailyOvertimeThresholdMinutes: validation.data.dailyOvertimeThresholdMinutes,
         calculationAlgorithmVersion: CURRENT_CALCULATION_ALGORITHM_VERSION,
         fingerprint: computeAttendancePolicyFingerprint({
-          rounding: validation.data.rounding,
-          gracePeriod: validation.data.gracePeriod,
-          breakRules: validation.data.breakRules,
-          overtime: validation.data.overtime,
-          overtimeThresholdsAreStatutoryFloor: validation.data.overtimeThresholdsAreStatutoryFloor,
-          tolerance: validation.data.tolerance,
+          roundingIntervalMinutes: validation.data.roundingIntervalMinutes,
+          roundingDirection: validation.data.roundingDirection,
+          gracePeriodMinutes: validation.data.gracePeriodMinutes,
+          latenessToleranceMinutes: validation.data.latenessToleranceMinutes,
+          unpaidBreakMinutes: validation.data.unpaidBreakMinutes,
+          standardWorkWeekMinutes: validation.data.standardWorkWeekMinutes,
+          isStandardWorkWeekStatutoryFloor: validation.data.isStandardWorkWeekStatutoryFloor,
+          dailyOvertimeThresholdMinutes: validation.data.dailyOvertimeThresholdMinutes,
           calculationAlgorithmVersion: CURRENT_CALCULATION_ALGORITHM_VERSION,
         }),
         changeReason: validation.data.changeReason,
@@ -79,8 +83,8 @@ export class AttendancePolicyService {
   /**
    * Ends the current tenant policy and opens a new one, atomically, at the
    * same instant — old and new windows are adjacent under [) semantics,
-   * carrying the same attendancePolicyId (lineage) forward so the two-ID
-   * identity model's history stays connected.
+   * carrying the same policyId (lineage) forward so the two-ID identity
+   * model's history stays connected.
    */
   async replaceTenantPolicy(request: TrustedRequestContext, input: AttendancePolicyContentDraft): Promise<CommandResult<AttendancePolicyReplaced>> {
     const denied = this.requireManage(request);
@@ -96,31 +100,35 @@ export class AttendancePolicyService {
         return "invalid_replace_date" as const;
       }
 
-      const others = (await repositories.attendancePolicies.listForScope(tenantId, "TENANT", tenantId)).filter((p) => p.attendancePolicyVersionId !== current.attendancePolicyVersionId);
+      const others = (await repositories.attendancePolicies.listForScope(tenantId, "TENANT", tenantId)).filter((p) => p.policyVersionId !== current.policyVersionId);
       const candidate = { effectiveFrom: validation.data.effectiveFrom, effectiveUntil: undefined };
       if (others.some((p) => windowsOverlap(p, candidate))) return "overlap" as const;
 
-      const previous = await repositories.attendancePolicies.end({ tenantId, attendancePolicyVersionId: current.attendancePolicyVersionId, effectiveUntil: validation.data.effectiveFrom });
+      const previous = await repositories.attendancePolicies.end({ tenantId, policyVersionId: current.policyVersionId, effectiveUntil: validation.data.effectiveFrom });
       const policy = await repositories.attendancePolicies.create({
         tenantId,
         scope: "TENANT",
         scopeId: tenantId,
-        attendancePolicyId: current.attendancePolicyId,
+        policyId: current.policyId,
         effectiveFrom: validation.data.effectiveFrom,
-        rounding: validation.data.rounding,
-        gracePeriod: validation.data.gracePeriod,
-        breakRules: validation.data.breakRules,
-        overtime: validation.data.overtime,
-        overtimeThresholdsAreStatutoryFloor: validation.data.overtimeThresholdsAreStatutoryFloor,
-        tolerance: validation.data.tolerance,
+        roundingIntervalMinutes: validation.data.roundingIntervalMinutes,
+        roundingDirection: validation.data.roundingDirection,
+        gracePeriodMinutes: validation.data.gracePeriodMinutes,
+        latenessToleranceMinutes: validation.data.latenessToleranceMinutes,
+        unpaidBreakMinutes: validation.data.unpaidBreakMinutes,
+        standardWorkWeekMinutes: validation.data.standardWorkWeekMinutes,
+        isStandardWorkWeekStatutoryFloor: validation.data.isStandardWorkWeekStatutoryFloor,
+        dailyOvertimeThresholdMinutes: validation.data.dailyOvertimeThresholdMinutes,
         calculationAlgorithmVersion: CURRENT_CALCULATION_ALGORITHM_VERSION,
         fingerprint: computeAttendancePolicyFingerprint({
-          rounding: validation.data.rounding,
-          gracePeriod: validation.data.gracePeriod,
-          breakRules: validation.data.breakRules,
-          overtime: validation.data.overtime,
-          overtimeThresholdsAreStatutoryFloor: validation.data.overtimeThresholdsAreStatutoryFloor,
-          tolerance: validation.data.tolerance,
+          roundingIntervalMinutes: validation.data.roundingIntervalMinutes,
+          roundingDirection: validation.data.roundingDirection,
+          gracePeriodMinutes: validation.data.gracePeriodMinutes,
+          latenessToleranceMinutes: validation.data.latenessToleranceMinutes,
+          unpaidBreakMinutes: validation.data.unpaidBreakMinutes,
+          standardWorkWeekMinutes: validation.data.standardWorkWeekMinutes,
+          isStandardWorkWeekStatutoryFloor: validation.data.isStandardWorkWeekStatutoryFloor,
+          dailyOvertimeThresholdMinutes: validation.data.dailyOvertimeThresholdMinutes,
           calculationAlgorithmVersion: CURRENT_CALCULATION_ALGORITHM_VERSION,
         }),
         changeReason: validation.data.changeReason,
@@ -147,7 +155,7 @@ export class AttendancePolicyService {
       const current = await repositories.attendancePolicies.findCurrentForScope(tenantId, "TENANT", tenantId);
       if (!current) return "no_current_policy" as const;
       if (new Date(validation.data.effectiveUntil).getTime() <= new Date(current.effectiveFrom).getTime()) return "invalid_end_date" as const;
-      return repositories.attendancePolicies.end({ tenantId, attendancePolicyVersionId: current.attendancePolicyVersionId, effectiveUntil: validation.data.effectiveUntil });
+      return repositories.attendancePolicies.end({ tenantId, policyVersionId: current.policyVersionId, effectiveUntil: validation.data.effectiveUntil });
     });
 
     if (result === "no_current_policy") return commandValidationFailure([issue("effectiveUntil", "no_current_policy", "This tenant has no current attendance policy baseline to end.")]);

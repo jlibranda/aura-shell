@@ -18,12 +18,14 @@ const CREATE_INPUT: CreateAttendancePolicyInput = {
   scope: "TENANT",
   scopeId: "tenant-a",
   effectiveFrom: "2026-01-01T00:00:00.000Z",
-  rounding: { incrementMinutes: 15, direction: "NEAREST" },
-  gracePeriod: { lateArrivalGraceMinutes: 5, earlyDepartureGraceMinutes: 5 },
-  breakRules: { unpaidBreakMinutes: 60, paidBreakMinutes: 15 },
-  overtime: { dailyThresholdMinutes: 480, weeklyThresholdMinutes: 2400 },
-  overtimeThresholdsAreStatutoryFloor: false,
-  tolerance: { missedPunchToleranceMinutes: 10 },
+  roundingIntervalMinutes: 15,
+  roundingDirection: "nearest",
+  gracePeriodMinutes: 5,
+  latenessToleranceMinutes: 10,
+  unpaidBreakMinutes: 60,
+  standardWorkWeekMinutes: 2400,
+  isStandardWorkWeekStatutoryFloor: false,
+  dailyOvertimeThresholdMinutes: 480,
   calculationAlgorithmVersion: 1,
   fingerprint: "hash-1",
   createdBy: "user-1",
@@ -61,7 +63,7 @@ describe("InMemoryAttendancePolicyUnitOfWork — rollback", () => {
 
     await expect(
       unitOfWork.execute(AUDITED_CONTEXT, async (tx: { repositories: AttendancePolicyTransactionRepositories }) => {
-        await tx.repositories.attendancePolicies.end({ tenantId: "tenant-a", attendancePolicyVersionId: first.attendancePolicyVersionId, effectiveUntil: "2026-06-01" });
+        await tx.repositories.attendancePolicies.end({ tenantId: "tenant-a", policyVersionId: first.policyVersionId, effectiveUntil: "2026-06-01" });
         throw new Error("downstream failure after end");
       }),
     ).rejects.toThrow("downstream failure after end");
