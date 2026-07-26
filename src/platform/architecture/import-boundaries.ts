@@ -48,6 +48,9 @@ const isConfigurationManifest = (file: SourceFile) => file.path === "src/platfor
 // The Organization domain (ADR-012) is a peer domain — never coupled to Configuration.
 const isConfigurationCode = (file: SourceFile) => file.path.startsWith("src/platform/configuration/");
 const isOrganizationCode = (file: SourceFile) => file.path.startsWith("src/platform/organization/");
+// ADR-014 §3: Timekeeping is a peer bounded context, downstream of
+// Organization and People — it reads them, they must never know it exists.
+const isPeopleCode = (file: SourceFile) => file.path.startsWith("src/platform/people/");
 const ORGANIZATION_READ_REPOSITORY_FILES = new Set([
   "src/platform/organization/prisma-org-unit-read-repository.ts",
   "src/platform/organization/prisma-assignment-read-repository.ts",
@@ -341,6 +344,19 @@ export const RULES: Rule[] = [
     name: "organization-must-not-import-people",
     appliesTo: isOrganizationCode,
     forbidden: [/platform\/people\//],
+  },
+  {
+    // ADR-014 §3: Timekeeping is downstream of Organization and People — it
+    // reads them via their query services; neither may depend on it, now or
+    // once ingestion/schedules/policy/approvals/adjustments/Payroll land.
+    name: "organization-must-not-import-timekeeping",
+    appliesTo: isOrganizationCode,
+    forbidden: [/platform\/timekeeping\//],
+  },
+  {
+    name: "people-must-not-import-timekeeping",
+    appliesTo: isPeopleCode,
+    forbidden: [/platform\/timekeeping\//],
   },
   {
     // Epic 7B.5: every Settings > Organization admin page, loader, and

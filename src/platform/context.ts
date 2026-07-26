@@ -9,7 +9,8 @@ export type Permission =
   | "settings.publish"
   | "settings.audit.view"
   | "organization.view"
-  | "organization.manage";
+  | "organization.manage"
+  | "timekeeping.view";
 
 /** The canonical runtime list of every platform permission, for validation and enumeration. */
 export const ALL_PERMISSIONS: readonly Permission[] = Object.freeze([
@@ -23,6 +24,7 @@ export const ALL_PERMISSIONS: readonly Permission[] = Object.freeze([
   "settings.audit.view",
   "organization.view",
   "organization.manage",
+  "timekeeping.view",
 ]);
 
 /** Type guard: is an arbitrary string a recognized platform permission? */
@@ -59,11 +61,18 @@ export interface TenantContext {
  * settings access by default. People permissions are unchanged from the
  * pre-existing coarse hr_admin/hr_operations(/payroll for government IDs) rule.
  */
+// timekeeping.view is granted to exactly the same roles as organization.view
+// (ADR-014 §13/Slice 1 investigation): hr_admin, hr_operations, payroll, and
+// auditor already see placement/administrative data; manager and employee
+// get no Timekeeping access by default, matching how they get no
+// organization.view today. clock/manage/approve/adjust permissions are
+// deliberately not introduced yet — they arrive with the slices that need
+// them (ADR-014 §13; roadmap Slice 2+).
 const ROLE_PERMISSIONS: Readonly<Record<PlatformRole, readonly Permission[]>> = Object.freeze({
-  hr_admin: ["people.read", "people.write", "people.government_ids.read", "people.employee.hire", "settings.view", "settings.manage", "settings.publish", "settings.audit.view", "organization.view", "organization.manage"],
-  hr_operations: ["people.read", "people.write", "people.government_ids.read", "people.employee.hire", "settings.view", "settings.manage", "organization.view"],
-  payroll: ["people.government_ids.read", "settings.view", "organization.view"],
-  auditor: ["settings.view", "settings.audit.view", "organization.view"],
+  hr_admin: ["people.read", "people.write", "people.government_ids.read", "people.employee.hire", "settings.view", "settings.manage", "settings.publish", "settings.audit.view", "organization.view", "organization.manage", "timekeeping.view"],
+  hr_operations: ["people.read", "people.write", "people.government_ids.read", "people.employee.hire", "settings.view", "settings.manage", "organization.view", "timekeeping.view"],
+  payroll: ["people.government_ids.read", "settings.view", "organization.view", "timekeeping.view"],
+  auditor: ["settings.view", "settings.audit.view", "organization.view", "timekeeping.view"],
   manager: [],
   employee: [],
 });

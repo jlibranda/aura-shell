@@ -278,6 +278,18 @@ describe("import boundary fitness rules (fixtures prove each rule actually catch
     const file: SourceFile = { path: "src/platform/organization/organization-query-service.ts", content: `import type { AssignmentReadRepository } from "@/platform/organization/assignment-repository";\nimport type { OrgUnitReadRepository } from "@/platform/organization/org-unit-repository";\nimport type { LocationReadRepository } from "@/platform/organization/location-repository";\n` };
     expect(scanImportBoundaries([file])).toHaveLength(0);
   });
+
+  it("flags Organization code importing Timekeeping (ADR-014 §3 one-way dependency chain)", () => {
+    const file: SourceFile = { path: "src/platform/organization/bad-organization-service.ts", content: `import type { AttendanceEventRecord } from "@/platform/timekeeping/attendance-event";\n` };
+    const violations = scanImportBoundaries([file]);
+    expect(violations).toContainEqual({ path: file.path, rule: "organization-must-not-import-timekeeping", matchedImport: "@/platform/timekeeping/attendance-event" });
+  });
+
+  it("flags People code importing Timekeeping (ADR-014 §3 one-way dependency chain)", () => {
+    const file: SourceFile = { path: "src/platform/people/bad-people-service.ts", content: `import type { AttendanceEventRecord } from "@/platform/timekeeping/attendance-event";\n` };
+    const violations = scanImportBoundaries([file]);
+    expect(violations).toContainEqual({ path: file.path, rule: "people-must-not-import-timekeeping", matchedImport: "@/platform/timekeeping/attendance-event" });
+  });
 });
 
 describe("import boundary fitness rules — real codebase scan", () => {
