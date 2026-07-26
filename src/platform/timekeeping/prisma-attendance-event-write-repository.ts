@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { Prisma } from "@prisma/client";
 import type {
   AttendanceEventCreateOutcome,
@@ -7,12 +8,14 @@ import type {
 } from "@/platform/timekeeping/attendance-event-repository";
 import { isSameAttendanceFact, type AttendanceEventRecord, type AttendanceEventSource, type AttendanceEventType } from "@/platform/timekeeping/attendance-event";
 
-export type PrismaAttendanceEventWriteClient = Pick<Prisma.TransactionClient, "attendanceEvent">;
+export type PrismaAttendanceEventWriteClient = Pick<Prisma.TransactionClient, "attendanceEvent" | "$queryRaw">;
 
-function toRecord(value: {
+type AttendanceEventRow = {
   id: string; tenantId: string; personId: string; occurredAtUtc: Date; receivedAtUtc: Date;
   source: string; sourceRef: string | null; eventType: string | null; idempotencyKey: string; createdAt: Date;
-}): AttendanceEventRecord {
+};
+
+function toRecord(value: AttendanceEventRow): AttendanceEventRecord {
   return Object.freeze({
     id: value.id,
     tenantId: value.tenantId,
@@ -27,10 +30,6 @@ function toRecord(value: {
   });
 }
 
-function isUniqueConstraintViolation(error: unknown): boolean {
-  return error instanceof Prisma.PrismaClientKnownRequestError && error.code === "P2002";
-}
-
 /**
  * Write-side adapter, used only inside an AttendanceEvent write transaction.
  * Tenant scoping is on every query's where clause. There is no update and no
@@ -41,45 +40,52 @@ function isUniqueConstraintViolation(error: unknown): boolean {
  *
  * create() is the atomic "create or detect idempotent replay/conflict" path:
  * the UNIQUE (tenant_id, idempotency_key) database constraint is the source
- * of truth for concurrency safety, not an optimistic pre-check alone — two
+ * of truth for concurrency safety, not an optimistic pre-check alone.
+ *
+ * This uses a single `INSERT ... ON CONFLICT DO NOTHING RETURNING` statement
+ * rather than "try create(), catch the P2002 error, then look up the
+ * existing row" — a failed INSERT inside a Postgres transaction aborts the
+ * *entire* transaction (error 25P02 on every subsequent statement, including
+ * the lookup meant to run in the same catch block), which made the original
+ * try/catch version fail whenever create() ran inside the real
+ * PrismaAttendanceEventUnitOfWork's interactive `$transaction` — its only
+ * production call path. `ON CONFLICT DO NOTHING` never raises an error, so
+ * the transaction stays healthy and the fallback lookup below is safe: two
  * concurrent submissions with the same key will have exactly one INSERT
- * succeed; the loser falls into the catch branch and compares against
- * whatever the winner just committed, so the outcome is deterministic
- * regardless of ordering.
+ * return a row; the loser gets zero rows back and looks up whatever the
+ * winner just committed, so the outcome is deterministic regardless of
+ * ordering.
  */
 export class PrismaAttendanceEventWriteRepository implements AttendanceEventWriteRepository {
   constructor(private readonly prisma: PrismaAttendanceEventWriteClient) {}
 
   async create(input: CreateAttendanceEventInput): Promise<AttendanceEventCreateOutcome> {
-    try {
-      const created = await this.prisma.attendanceEvent.create({
-        data: {
-          tenantId: input.tenantId,
-          personId: input.personId,
-          occurredAtUtc: new Date(input.occurredAtUtc),
-          receivedAtUtc: new Date(input.receivedAtUtc),
-          source: input.source,
-          sourceRef: input.sourceRef ?? null,
-          eventType: input.eventType ?? null,
-          idempotencyKey: input.idempotencyKey,
-        },
-      });
-      return { kind: "created" as const, event: toRecord(created) };
-    } catch (error) {
-      if (!isUniqueConstraintViolation(error)) throw error;
-
-      const existing = await this.prisma.attendanceEvent.findUnique({
-        where: { tenantId_idempotencyKey: { tenantId: input.tenantId, idempotencyKey: input.idempotencyKey } },
-      });
-      if (!existing) throw error;
-
-      const existingRecord = toRecord(existing);
-      const same = isSameAttendanceFact(
-        { personId: existingRecord.personId, occurredAtUtc: existingRecord.occurredAtUtc, receivedAtUtc: existingRecord.receivedAtUtc, source: existingRecord.source, sourceRef: existingRecord.sourceRef, eventType: existingRecord.eventType, idempotencyKey: existingRecord.idempotencyKey },
-        { personId: input.personId, occurredAtUtc: input.occurredAtUtc, receivedAtUtc: input.receivedAtUtc, source: input.source, sourceRef: input.sourceRef, eventType: input.eventType, idempotencyKey: input.idempotencyKey },
-      );
-      return same ? { kind: "replayed" as const, event: existingRecord } : { kind: "conflict" as const, existing: existingRecord };
+    const id = randomUUID();
+    const inserted = await this.prisma.$queryRaw<AttendanceEventRow[]>`
+      INSERT INTO attendance_events (attendance_event_id, tenant_id, person_id, occurred_at_utc, received_at_utc, source, source_ref, event_type, idempotency_key)
+      VALUES (${id}, ${input.tenantId}, ${input.personId}, ${new Date(input.occurredAtUtc)}, ${new Date(input.receivedAtUtc)}, ${input.source}, ${input.sourceRef ?? null}, ${input.eventType ?? null}, ${input.idempotencyKey})
+      ON CONFLICT (tenant_id, idempotency_key) DO NOTHING
+      RETURNING
+        attendance_event_id AS "id", tenant_id AS "tenantId", person_id AS "personId",
+        occurred_at_utc AS "occurredAtUtc", received_at_utc AS "receivedAtUtc",
+        source, source_ref AS "sourceRef", event_type AS "eventType",
+        idempotency_key AS "idempotencyKey", created_at AS "createdAt"
+    `;
+    if (inserted.length === 1) {
+      return { kind: "created" as const, event: toRecord(inserted[0]) };
     }
+
+    const existing = await this.prisma.attendanceEvent.findUnique({
+      where: { tenantId_idempotencyKey: { tenantId: input.tenantId, idempotencyKey: input.idempotencyKey } },
+    });
+    if (!existing) throw new Error("AttendanceEvent insert conflicted on (tenant_id, idempotency_key) but no existing row was found.");
+
+    const existingRecord = toRecord(existing);
+    const same = isSameAttendanceFact(
+      { personId: existingRecord.personId, occurredAtUtc: existingRecord.occurredAtUtc, receivedAtUtc: existingRecord.receivedAtUtc, source: existingRecord.source, sourceRef: existingRecord.sourceRef, eventType: existingRecord.eventType, idempotencyKey: existingRecord.idempotencyKey },
+      { personId: input.personId, occurredAtUtc: input.occurredAtUtc, receivedAtUtc: input.receivedAtUtc, source: input.source, sourceRef: input.sourceRef, eventType: input.eventType, idempotencyKey: input.idempotencyKey },
+    );
+    return same ? { kind: "replayed" as const, event: existingRecord } : { kind: "conflict" as const, existing: existingRecord };
   }
 
   async findById(tenantId: string, id: string): Promise<AttendanceEventRecord | undefined> {
