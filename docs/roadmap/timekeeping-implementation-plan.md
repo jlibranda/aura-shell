@@ -223,7 +223,7 @@ shape) and can be built in parallel with them.
 - The **`AttendancePolicyResolver` interface** — the sole seam
   `AttendanceCalculationService` (Slice 6) is allowed to depend on:
   `resolve(context, input) -> AttendancePolicyResolutionResult`, where
-  `input` carries `tenantId`, `personId`, `attendanceDate`, and the
+  `input` carries `tenantId`, `personId`, `attendanceAnchorInstant`, and the
   **caller-resolved** `legalEntityId`/`orgUnitId`/`locationId` — Slice 6
   resolves Organization placement historically once (for its own
   `AttendanceDay` snapshot) and passes those identifiers in explicitly;

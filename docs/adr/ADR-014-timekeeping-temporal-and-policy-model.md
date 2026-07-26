@@ -450,7 +450,7 @@ modification here.
 effective-dated record whose window contains X — never by reading "the
 current" record and assuming it always applied. `AttendanceCalculationService`
 resolves `ScheduleAssignment` and `AttendancePolicy` **as of the
-`attendanceDate` being computed**, not as of "now."
+`attendanceAnchorInstant` being computed**, not as of "now."
 
 ### 5.4 Snapshot vs. live reference — the rule, stated once
 
