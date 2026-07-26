@@ -2,33 +2,35 @@ import type { PrismaClient } from "@prisma/client";
 import { hasPermission, type TenantContext } from "@/platform/context";
 import { AuthorizationError } from "@/platform/errors";
 import type { AttendancePolicyReadRepository } from "@/platform/timekeeping/attendance-policy-repository";
-import type { AttendancePolicyRecord, PolicyScope } from "@/platform/timekeeping/attendance-policy";
+import type { AttendancePolicyRecord, PolicyScope, RoundingDirection } from "@/platform/timekeeping/attendance-policy";
 
 function toRecord(value: {
-  attendancePolicyId: string; attendancePolicyVersionId: string; tenantId: string; scope: string; scopeId: string;
+  policyId: string; policyVersionId: string; tenantId: string; scope: string; scopeId: string;
   effectiveFrom: Date; effectiveUntil: Date | null;
-  roundingIncrementMinutes: number; roundingDirection: string;
-  lateArrivalGraceMinutes: number; earlyDepartureGraceMinutes: number;
-  unpaidBreakMinutes: number; paidBreakMinutes: number;
-  dailyOvertimeThresholdMinutes: number; weeklyOvertimeThresholdMinutes: number; overtimeThresholdsAreStatutoryFloor: boolean;
-  missedPunchToleranceMinutes: number;
+  roundingIntervalMinutes: number; roundingDirection: string;
+  gracePeriodMinutes: number; latenessToleranceMinutes: number;
+  unpaidBreakMinutes: number | null;
+  standardWorkWeekMinutes: number; isStandardWorkWeekStatutoryFloor: boolean;
+  dailyOvertimeThresholdMinutes: number | null;
   calculationAlgorithmVersion: number; fingerprint: string;
   changeReason: string | null; createdAt: Date; createdBy: string;
 }): AttendancePolicyRecord {
   return Object.freeze({
-    attendancePolicyId: value.attendancePolicyId,
-    attendancePolicyVersionId: value.attendancePolicyVersionId,
+    policyId: value.policyId,
+    policyVersionId: value.policyVersionId,
     tenantId: value.tenantId,
     scope: value.scope as PolicyScope,
     scopeId: value.scopeId,
     effectiveFrom: value.effectiveFrom.toISOString(),
     ...(value.effectiveUntil ? { effectiveUntil: value.effectiveUntil.toISOString() } : {}),
-    rounding: { incrementMinutes: value.roundingIncrementMinutes, direction: value.roundingDirection as AttendancePolicyRecord["rounding"]["direction"] },
-    gracePeriod: { lateArrivalGraceMinutes: value.lateArrivalGraceMinutes, earlyDepartureGraceMinutes: value.earlyDepartureGraceMinutes },
-    breakRules: { unpaidBreakMinutes: value.unpaidBreakMinutes, paidBreakMinutes: value.paidBreakMinutes },
-    overtime: { dailyThresholdMinutes: value.dailyOvertimeThresholdMinutes, weeklyThresholdMinutes: value.weeklyOvertimeThresholdMinutes },
-    overtimeThresholdsAreStatutoryFloor: value.overtimeThresholdsAreStatutoryFloor,
-    tolerance: { missedPunchToleranceMinutes: value.missedPunchToleranceMinutes },
+    roundingIntervalMinutes: value.roundingIntervalMinutes,
+    roundingDirection: value.roundingDirection as RoundingDirection,
+    gracePeriodMinutes: value.gracePeriodMinutes,
+    latenessToleranceMinutes: value.latenessToleranceMinutes,
+    ...(value.unpaidBreakMinutes !== null ? { unpaidBreakMinutes: value.unpaidBreakMinutes } : {}),
+    standardWorkWeekMinutes: value.standardWorkWeekMinutes,
+    isStandardWorkWeekStatutoryFloor: value.isStandardWorkWeekStatutoryFloor,
+    ...(value.dailyOvertimeThresholdMinutes !== null ? { dailyOvertimeThresholdMinutes: value.dailyOvertimeThresholdMinutes } : {}),
     calculationAlgorithmVersion: value.calculationAlgorithmVersion,
     fingerprint: value.fingerprint,
     ...(value.changeReason ? { changeReason: value.changeReason } : {}),
@@ -45,9 +47,9 @@ function requireTimekeepingView(context: TenantContext): void {
 export class PrismaAttendancePolicyReadRepository implements AttendancePolicyReadRepository {
   constructor(private readonly prisma: Pick<PrismaClient, "attendancePolicy">) {}
 
-  async findById(context: TenantContext, attendancePolicyVersionId: string): Promise<AttendancePolicyRecord | undefined> {
+  async findById(context: TenantContext, policyVersionId: string): Promise<AttendancePolicyRecord | undefined> {
     requireTimekeepingView(context);
-    const policy = await this.prisma.attendancePolicy.findFirst({ where: { tenantId: context.tenantId, attendancePolicyVersionId } });
+    const policy = await this.prisma.attendancePolicy.findFirst({ where: { tenantId: context.tenantId, policyVersionId } });
     return policy ? toRecord(policy) : undefined;
   }
 

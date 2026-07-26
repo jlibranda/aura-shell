@@ -11,11 +11,15 @@ import { invalid, issue, valid, type ValidationIssue, type ValidationResult } fr
  * Slice 7, against this same contract, without changing its shape.
  *
  * Identity is a two-ID model on one effective-dated table: a stable
- * "lineage" id (`attendancePolicyId`, copied forward on every replacement)
- * and a per-row "version" id (`attendancePolicyVersionId`, the actual
- * primary key) — the same discipline ScheduleAssignment/Assignment use for
- * effective dating, extended with the lineage id the approved
- * policyId/policyVersionId contract requires.
+ * "lineage" id (`policyId`, copied forward on every replacement) and a
+ * per-row "version" id (`policyVersionId`, the actual primary key) — the
+ * same discipline ScheduleAssignment/Assignment use for effective dating,
+ * extended with the lineage id the approved contract requires.
+ *
+ * `ResolvedAttendancePolicy` is a flat contract by design — no nested rule
+ * objects. `AttendanceCalculationService` (Slice 6) depends on this exact
+ * shape permanently; a flat contract keeps that dependency legible and
+ * avoids an internal grouping decision leaking into the public seam.
  *
  * `workdayBoundaryMinutes` is deliberately never a field here — the
  * unscheduled-attribution boundary is a fixed ADR-014 Algorithm Invariant
@@ -31,33 +35,8 @@ export const CURRENT_CALCULATION_ALGORITHM_VERSION = 1;
 export const POLICY_SCOPES = ["TENANT", "LEGAL_ENTITY", "LOCATION", "ORG_UNIT", "EMPLOYEE"] as const;
 export type PolicyScope = (typeof POLICY_SCOPES)[number];
 
-export const ROUNDING_DIRECTIONS = ["NEAREST", "UP", "DOWN"] as const;
+export const ROUNDING_DIRECTIONS = ["nearest", "up", "down"] as const;
 export type RoundingDirection = (typeof ROUNDING_DIRECTIONS)[number];
-
-export interface RoundingRule {
-  incrementMinutes: number;
-  direction: RoundingDirection;
-}
-
-export interface GracePeriodRule {
-  lateArrivalGraceMinutes: number;
-  earlyDepartureGraceMinutes: number;
-}
-
-export interface BreakRule {
-  unpaidBreakMinutes: number;
-  paidBreakMinutes: number;
-}
-
-/** Work-week length and overtime thresholds are one statutory axis (ADR-014 §6.1) — grouped here rather than split, since they describe the same legal fact. */
-export interface OvertimeRule {
-  dailyThresholdMinutes: number;
-  weeklyThresholdMinutes: number;
-}
-
-export interface ToleranceRule {
-  missedPunchToleranceMinutes: number;
-}
 
 function validInstant(value: string | undefined): boolean {
   return Boolean(value && isoInstant.test(value) && !Number.isNaN(Date.parse(value)));
@@ -72,33 +51,44 @@ function normalizeReason(value: string | undefined | null): string | undefined {
 /**
  * Every field AttendanceCalculationService (Slice 6) will ever need to
  * interpret one day's AttendanceEvents against — a stable policy version
- * identity, an effective period, the resolved policy values, and a
+ * identity, an effective period, the resolved flat policy values, and a
  * deterministic fingerprint so two computations against "the same" policy
  * are provably identical (ADR-014 §4.7's historical-immutability invariant).
- * This is a pure value object: it carries no createdAt/createdBy/changeReason
- * provenance — those live only on AttendancePolicyRecord.
+ * This is the exact, approved public contract — no nested rule objects, no
+ * additional fields, no renamed fields.
  */
 export interface ResolvedAttendancePolicy {
-  attendancePolicyId: string;
-  attendancePolicyVersionId: string;
+  policyId: string;
+  policyVersionId: string;
+
   scope: PolicyScope;
   scopeId: string;
+
+  tenantId: string;
+
   effectiveFrom: string;
   effectiveUntil?: string;
-  rounding: RoundingRule;
-  gracePeriod: GracePeriodRule;
-  breakRules: BreakRule;
-  overtime: OvertimeRule;
-  /** Statutory-floor metadata (ADR-014 §6.1): whether this record's overtime/work-week values are themselves a Legal-Entity-derived statutory floor, vs. pure operational convenience. Always false for a Tenant-scope record in this slice — there is nothing above Tenant to derive a floor from. */
-  overtimeThresholdsAreStatutoryFloor: boolean;
-  tolerance: ToleranceRule;
+
+  roundingIntervalMinutes: number;
+  roundingDirection: RoundingDirection;
+
+  gracePeriodMinutes: number;
+  latenessToleranceMinutes: number;
+
+  unpaidBreakMinutes?: number;
+
+  standardWorkWeekMinutes: number;
+  isStandardWorkWeekStatutoryFloor: boolean;
+
+  dailyOvertimeThresholdMinutes?: number;
+
   calculationAlgorithmVersion: number;
+
   fingerprint: string;
 }
 
 /** The persisted row — ResolvedAttendancePolicy plus provenance/audit fields never exposed to the resolver contract. */
 export interface AttendancePolicyRecord extends ResolvedAttendancePolicy {
-  tenantId: string;
   changeReason?: string;
   createdAt: string;
   createdBy: string;
@@ -108,7 +98,9 @@ export interface AttendancePolicyRecord extends ResolvedAttendancePolicy {
 export interface AttendancePolicyResolutionInput {
   tenantId: string;
   personId: string;
+
   attendanceAnchorInstant: string;
+
   legalEntityId?: string;
   orgUnitId?: string;
   locationId?: string;
@@ -125,23 +117,27 @@ export type AttendancePolicyResolutionResult =
 
 export interface AttendancePolicyContentDraft {
   effectiveFrom: string;
-  rounding: { incrementMinutes: number; direction: string };
-  gracePeriod: { lateArrivalGraceMinutes: number; earlyDepartureGraceMinutes: number };
-  breakRules: { unpaidBreakMinutes: number; paidBreakMinutes: number };
-  overtime: { dailyThresholdMinutes: number; weeklyThresholdMinutes: number };
-  overtimeThresholdsAreStatutoryFloor: boolean;
-  tolerance: { missedPunchToleranceMinutes: number };
+  roundingIntervalMinutes: number;
+  roundingDirection: string;
+  gracePeriodMinutes: number;
+  latenessToleranceMinutes: number;
+  unpaidBreakMinutes?: number;
+  standardWorkWeekMinutes: number;
+  isStandardWorkWeekStatutoryFloor: boolean;
+  dailyOvertimeThresholdMinutes?: number;
   changeReason?: string;
 }
 
 export interface ValidatedAttendancePolicyContent {
   effectiveFrom: string;
-  rounding: RoundingRule;
-  gracePeriod: GracePeriodRule;
-  breakRules: BreakRule;
-  overtime: OvertimeRule;
-  overtimeThresholdsAreStatutoryFloor: boolean;
-  tolerance: ToleranceRule;
+  roundingIntervalMinutes: number;
+  roundingDirection: RoundingDirection;
+  gracePeriodMinutes: number;
+  latenessToleranceMinutes: number;
+  unpaidBreakMinutes?: number;
+  standardWorkWeekMinutes: number;
+  isStandardWorkWeekStatutoryFloor: boolean;
+  dailyOvertimeThresholdMinutes?: number;
   changeReason?: string;
 }
 
@@ -149,28 +145,40 @@ function isNonNegativeInteger(value: unknown): value is number {
   return typeof value === "number" && Number.isInteger(value) && value >= 0;
 }
 
+function isPositiveInteger(value: unknown): value is number {
+  return typeof value === "number" && Number.isInteger(value) && value > 0;
+}
+
+/**
+ * `roundingIntervalMinutes` must be a strictly positive whole number of
+ * minutes — the approved contract requires `roundingIntervalMinutes > 0`
+ * and does not authorize any divisibility-by-60 (or any other) restriction
+ * on top of it.
+ */
 export function validateAttendancePolicyContentDraft(input: AttendancePolicyContentDraft): ValidationResult<ValidatedAttendancePolicyContent> {
   const issues: ValidationIssue[] = [];
 
   if (!validInstant(input.effectiveFrom)) issues.push(issue("effectiveFrom", "INVALID_DATE", "A valid effective-from date is required."));
 
-  const direction = input.rounding?.direction?.trim().toUpperCase() ?? "";
-  if (!direction) issues.push(issue("rounding.direction", "REQUIRED", "A rounding direction is required."));
-  else if (!(ROUNDING_DIRECTIONS as readonly string[]).includes(direction)) issues.push(issue("rounding.direction", "INVALID_FORMAT", `"${input.rounding?.direction}" is not a recognized rounding direction.`));
-  if (!isNonNegativeInteger(input.rounding?.incrementMinutes)) issues.push(issue("rounding.incrementMinutes", "INVALID_VALUE", "Rounding increment must be a non-negative whole number of minutes."));
-  else if (input.rounding.incrementMinutes > 0 && 60 % input.rounding.incrementMinutes !== 0) issues.push(issue("rounding.incrementMinutes", "INVALID_VALUE", "Rounding increment must evenly divide 60 minutes."));
+  const roundingDirection = input.roundingDirection?.trim().toLowerCase() ?? "";
+  if (!roundingDirection) issues.push(issue("roundingDirection", "REQUIRED", "A rounding direction is required."));
+  else if (!(ROUNDING_DIRECTIONS as readonly string[]).includes(roundingDirection)) issues.push(issue("roundingDirection", "INVALID_FORMAT", `"${input.roundingDirection}" is not a recognized rounding direction.`));
 
-  if (!isNonNegativeInteger(input.gracePeriod?.lateArrivalGraceMinutes)) issues.push(issue("gracePeriod.lateArrivalGraceMinutes", "INVALID_VALUE", "Late-arrival grace must be a non-negative whole number of minutes."));
-  if (!isNonNegativeInteger(input.gracePeriod?.earlyDepartureGraceMinutes)) issues.push(issue("gracePeriod.earlyDepartureGraceMinutes", "INVALID_VALUE", "Early-departure grace must be a non-negative whole number of minutes."));
+  if (!isPositiveInteger(input.roundingIntervalMinutes)) issues.push(issue("roundingIntervalMinutes", "INVALID_VALUE", "Rounding interval must be a positive whole number of minutes."));
 
-  if (!isNonNegativeInteger(input.breakRules?.unpaidBreakMinutes)) issues.push(issue("breakRules.unpaidBreakMinutes", "INVALID_VALUE", "Unpaid break minutes must be a non-negative whole number."));
-  if (!isNonNegativeInteger(input.breakRules?.paidBreakMinutes)) issues.push(issue("breakRules.paidBreakMinutes", "INVALID_VALUE", "Paid break minutes must be a non-negative whole number."));
+  if (!isNonNegativeInteger(input.gracePeriodMinutes)) issues.push(issue("gracePeriodMinutes", "INVALID_VALUE", "Grace period must be a non-negative whole number of minutes."));
+  if (!isNonNegativeInteger(input.latenessToleranceMinutes)) issues.push(issue("latenessToleranceMinutes", "INVALID_VALUE", "Lateness tolerance must be a non-negative whole number of minutes."));
 
-  if (!isNonNegativeInteger(input.overtime?.dailyThresholdMinutes)) issues.push(issue("overtime.dailyThresholdMinutes", "INVALID_VALUE", "Daily overtime threshold must be a non-negative whole number of minutes."));
-  if (!isNonNegativeInteger(input.overtime?.weeklyThresholdMinutes)) issues.push(issue("overtime.weeklyThresholdMinutes", "INVALID_VALUE", "Weekly overtime threshold must be a non-negative whole number of minutes."));
-  if (typeof input.overtimeThresholdsAreStatutoryFloor !== "boolean") issues.push(issue("overtimeThresholdsAreStatutoryFloor", "REQUIRED", "overtimeThresholdsAreStatutoryFloor must be explicitly true or false."));
+  if (input.unpaidBreakMinutes !== undefined && !isNonNegativeInteger(input.unpaidBreakMinutes)) {
+    issues.push(issue("unpaidBreakMinutes", "INVALID_VALUE", "Unpaid break minutes must be a non-negative whole number when provided."));
+  }
 
-  if (!isNonNegativeInteger(input.tolerance?.missedPunchToleranceMinutes)) issues.push(issue("tolerance.missedPunchToleranceMinutes", "INVALID_VALUE", "Missed-punch tolerance must be a non-negative whole number of minutes."));
+  if (!isNonNegativeInteger(input.standardWorkWeekMinutes)) issues.push(issue("standardWorkWeekMinutes", "INVALID_VALUE", "Standard work week must be a non-negative whole number of minutes."));
+  if (typeof input.isStandardWorkWeekStatutoryFloor !== "boolean") issues.push(issue("isStandardWorkWeekStatutoryFloor", "REQUIRED", "isStandardWorkWeekStatutoryFloor must be explicitly true or false."));
+
+  if (input.dailyOvertimeThresholdMinutes !== undefined && !isNonNegativeInteger(input.dailyOvertimeThresholdMinutes)) {
+    issues.push(issue("dailyOvertimeThresholdMinutes", "INVALID_VALUE", "Daily overtime threshold must be a non-negative whole number when provided."));
+  }
 
   const changeReason = normalizeReason(input.changeReason);
   if (changeReason && changeReason.length > REASON_MAX_LENGTH) issues.push(issue("changeReason", "TOO_LONG", `Change reason must be at most ${REASON_MAX_LENGTH} characters.`));
@@ -178,12 +186,14 @@ export function validateAttendancePolicyContentDraft(input: AttendancePolicyCont
   if (issues.length > 0) return invalid(issues);
   return valid({
     effectiveFrom: input.effectiveFrom,
-    rounding: { incrementMinutes: input.rounding.incrementMinutes, direction: direction as RoundingDirection },
-    gracePeriod: { lateArrivalGraceMinutes: input.gracePeriod.lateArrivalGraceMinutes, earlyDepartureGraceMinutes: input.gracePeriod.earlyDepartureGraceMinutes },
-    breakRules: { unpaidBreakMinutes: input.breakRules.unpaidBreakMinutes, paidBreakMinutes: input.breakRules.paidBreakMinutes },
-    overtime: { dailyThresholdMinutes: input.overtime.dailyThresholdMinutes, weeklyThresholdMinutes: input.overtime.weeklyThresholdMinutes },
-    overtimeThresholdsAreStatutoryFloor: input.overtimeThresholdsAreStatutoryFloor,
-    tolerance: { missedPunchToleranceMinutes: input.tolerance.missedPunchToleranceMinutes },
+    roundingIntervalMinutes: input.roundingIntervalMinutes,
+    roundingDirection: roundingDirection as RoundingDirection,
+    gracePeriodMinutes: input.gracePeriodMinutes,
+    latenessToleranceMinutes: input.latenessToleranceMinutes,
+    ...(input.unpaidBreakMinutes !== undefined ? { unpaidBreakMinutes: input.unpaidBreakMinutes } : {}),
+    standardWorkWeekMinutes: input.standardWorkWeekMinutes,
+    isStandardWorkWeekStatutoryFloor: input.isStandardWorkWeekStatutoryFloor,
+    ...(input.dailyOvertimeThresholdMinutes !== undefined ? { dailyOvertimeThresholdMinutes: input.dailyOvertimeThresholdMinutes } : {}),
     ...(changeReason ? { changeReason } : {}),
   });
 }
@@ -199,21 +209,37 @@ export function validateEndAttendancePolicyInput(input: EndAttendancePolicyInput
   return valid({ effectiveUntil: input.effectiveUntil });
 }
 
+const FINGERPRINT_FIELDS = [
+  "roundingIntervalMinutes",
+  "roundingDirection",
+  "gracePeriodMinutes",
+  "latenessToleranceMinutes",
+  "unpaidBreakMinutes",
+  "standardWorkWeekMinutes",
+  "isStandardWorkWeekStatutoryFloor",
+  "dailyOvertimeThresholdMinutes",
+  "calculationAlgorithmVersion",
+] as const;
+
 /**
  * Deterministic content hash (ADR-014 §4.7's fingerprint requirement) —
- * fixed key order, excludes identity/version/effective-period/provenance
- * fields, so two policy rows with identical resolved values always hash
- * identically regardless of when or how they were created. Mirrors
+ * fixed key order, excludes identity/version/scope/effective-period/
+ * provenance fields, so two policy rows with identical resolved values
+ * always hash identically regardless of when or how they were created.
+ * Undefined optional values normalize to `null` before hashing so an
+ * absent field never silently changes the fingerprint's shape. Mirrors
  * computeWorkScheduleCanonicalHash's precedent (Slice 3 Decision 10).
  */
-export function computeAttendancePolicyFingerprint(content: Pick<ResolvedAttendancePolicy, "rounding" | "gracePeriod" | "breakRules" | "overtime" | "overtimeThresholdsAreStatutoryFloor" | "tolerance" | "calculationAlgorithmVersion">): string {
+export function computeAttendancePolicyFingerprint(content: Pick<ResolvedAttendancePolicy, (typeof FINGERPRINT_FIELDS)[number]>): string {
   const canonical = {
-    rounding: { incrementMinutes: content.rounding.incrementMinutes, direction: content.rounding.direction },
-    gracePeriod: { lateArrivalGraceMinutes: content.gracePeriod.lateArrivalGraceMinutes, earlyDepartureGraceMinutes: content.gracePeriod.earlyDepartureGraceMinutes },
-    breakRules: { unpaidBreakMinutes: content.breakRules.unpaidBreakMinutes, paidBreakMinutes: content.breakRules.paidBreakMinutes },
-    overtime: { dailyThresholdMinutes: content.overtime.dailyThresholdMinutes, weeklyThresholdMinutes: content.overtime.weeklyThresholdMinutes },
-    overtimeThresholdsAreStatutoryFloor: content.overtimeThresholdsAreStatutoryFloor,
-    tolerance: { missedPunchToleranceMinutes: content.tolerance.missedPunchToleranceMinutes },
+    roundingIntervalMinutes: content.roundingIntervalMinutes,
+    roundingDirection: content.roundingDirection,
+    gracePeriodMinutes: content.gracePeriodMinutes,
+    latenessToleranceMinutes: content.latenessToleranceMinutes,
+    unpaidBreakMinutes: content.unpaidBreakMinutes ?? null,
+    standardWorkWeekMinutes: content.standardWorkWeekMinutes,
+    isStandardWorkWeekStatutoryFloor: content.isStandardWorkWeekStatutoryFloor,
+    dailyOvertimeThresholdMinutes: content.dailyOvertimeThresholdMinutes ?? null,
     calculationAlgorithmVersion: content.calculationAlgorithmVersion,
   };
   return createHash("sha256").update(JSON.stringify(canonical)).digest("hex");

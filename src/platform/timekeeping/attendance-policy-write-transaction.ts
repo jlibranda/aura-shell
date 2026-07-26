@@ -28,9 +28,9 @@ export class AttendancePolicyWriteTransaction implements AttendancePolicyWriteRe
     private readonly eventClock: DomainEventClock = systemClock,
   ) {}
 
-  findById(tenantId: string, attendancePolicyVersionId: string): Promise<AttendancePolicyRecord | undefined> {
+  findById(tenantId: string, policyVersionId: string): Promise<AttendancePolicyRecord | undefined> {
     this.assertTenant(tenantId);
-    return this.repository.findById(tenantId, attendancePolicyVersionId);
+    return this.repository.findById(tenantId, policyVersionId);
   }
 
   listForScope(tenantId: string, scope: PolicyScope, scopeId: string): Promise<AttendancePolicyRecord[]> {

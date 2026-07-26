@@ -552,37 +552,36 @@ model ScheduleAssignment {
 /// a change always closes the current row (effectiveUntil) and creates a
 /// new one (ADR-014 §4.7's historical-immutability invariant).
 model AttendancePolicy {
-  attendancePolicyId                  String    @default(uuid()) @map("attendance_policy_id")
-  attendancePolicyVersionId           String    @id @default(uuid()) @map("attendance_policy_version_id")
-  tenantId                            String    @map("tenant_id")
+  policyId                         String    @default(uuid()) @map("policy_id")
+  policyVersionId                  String    @id @default(uuid()) @map("policy_version_id")
+  tenantId                         String    @map("tenant_id")
   /// TENANT | LEGAL_ENTITY | LOCATION | ORG_UNIT | EMPLOYEE (ADR-014 §4.7). This slice's write path only ever writes TENANT.
-  scope                               String    @map("scope")
-  scopeId                             String    @map("scope_id")
-  effectiveFrom                       DateTime  @map("effective_from") @db.Timestamptz(6)
-  effectiveUntil                      DateTime? @map("effective_until") @db.Timestamptz(6)
-  roundingIncrementMinutes            Int       @map("rounding_increment_minutes")
-  roundingDirection                   String    @map("rounding_direction")
-  lateArrivalGraceMinutes             Int       @map("late_arrival_grace_minutes")
-  earlyDepartureGraceMinutes          Int       @map("early_departure_grace_minutes")
-  unpaidBreakMinutes                  Int       @map("unpaid_break_minutes")
-  paidBreakMinutes                    Int       @map("paid_break_minutes")
-  dailyOvertimeThresholdMinutes       Int       @map("daily_overtime_threshold_minutes")
-  weeklyOvertimeThresholdMinutes      Int       @map("weekly_overtime_threshold_minutes")
-  /// Statutory-floor metadata (ADR-014 §6.1) — whether this row's overtime/work-week values are themselves a Legal-Entity-derived floor, vs. pure operational convenience.
-  overtimeThresholdsAreStatutoryFloor Boolean   @map("overtime_thresholds_are_statutory_floor")
-  missedPunchToleranceMinutes         Int       @map("missed_punch_tolerance_minutes")
+  scope                            String    @map("scope")
+  scopeId                          String    @map("scope_id")
+  effectiveFrom                    DateTime  @map("effective_from") @db.Timestamptz(6)
+  effectiveUntil                   DateTime? @map("effective_until") @db.Timestamptz(6)
+  roundingIntervalMinutes          Int       @map("rounding_interval_minutes")
+  /// "nearest" | "up" | "down".
+  roundingDirection                String    @map("rounding_direction")
+  gracePeriodMinutes               Int       @map("grace_period_minutes")
+  latenessToleranceMinutes         Int       @map("lateness_tolerance_minutes")
+  unpaidBreakMinutes               Int?      @map("unpaid_break_minutes")
+  standardWorkWeekMinutes          Int       @map("standard_work_week_minutes")
+  /// Statutory-floor metadata (ADR-014 §6.1) — whether this row's standard-work-week/overtime values are themselves a Legal-Entity-derived floor, vs. pure operational convenience.
+  isStandardWorkWeekStatutoryFloor Boolean   @map("is_standard_work_week_statutory_floor")
+  dailyOvertimeThresholdMinutes    Int?      @map("daily_overtime_threshold_minutes")
   /// Appendix G algorithm-invariant version this row was interpreted under. Fixed at 1 for this slice.
-  calculationAlgorithmVersion         Int       @map("calculation_algorithm_version")
+  calculationAlgorithmVersion      Int       @map("calculation_algorithm_version")
   /// Deterministic content hash for duplicate-content detection only — never business identity, never uniquely constrained.
-  fingerprint                         String    @map("fingerprint")
-  changeReason                        String?   @map("change_reason")
-  createdAt                           DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
-  createdBy                           String    @map("created_by")
-  tenant                              Tenant    @relation(fields: [tenantId], references: [id], onDelete: Restrict, onUpdate: Cascade)
+  fingerprint                      String    @map("fingerprint")
+  changeReason                     String?   @map("change_reason")
+  createdAt                        DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
+  createdBy                        String    @map("created_by")
+  tenant                           Tenant    @relation(fields: [tenantId], references: [id], onDelete: Restrict, onUpdate: Cascade)
 
-  @@unique([tenantId, attendancePolicyVersionId])
+  @@unique([tenantId, policyVersionId])
   @@index([tenantId, scope, scopeId, effectiveFrom])
-  @@index([tenantId, attendancePolicyId])
+  @@index([tenantId, policyId])
   @@map("attendance_policies")
 }
 

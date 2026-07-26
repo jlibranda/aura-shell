@@ -24,12 +24,14 @@ const MANAGE: Permission[] = ["timekeeping.view", "timekeeping.manage"];
 function content(overrides: Partial<AttendancePolicyContentDraft> = {}): AttendancePolicyContentDraft {
   return {
     effectiveFrom: "2026-01-01T00:00:00.000Z",
-    rounding: { incrementMinutes: 15, direction: "NEAREST" },
-    gracePeriod: { lateArrivalGraceMinutes: 5, earlyDepartureGraceMinutes: 5 },
-    breakRules: { unpaidBreakMinutes: 60, paidBreakMinutes: 15 },
-    overtime: { dailyThresholdMinutes: 480, weeklyThresholdMinutes: 2400 },
-    overtimeThresholdsAreStatutoryFloor: false,
-    tolerance: { missedPunchToleranceMinutes: 10 },
+    roundingIntervalMinutes: 15,
+    roundingDirection: "nearest",
+    gracePeriodMinutes: 5,
+    latenessToleranceMinutes: 10,
+    unpaidBreakMinutes: 60,
+    standardWorkWeekMinutes: 2400,
+    isStandardWorkWeekStatutoryFloor: false,
+    dailyOvertimeThresholdMinutes: 480,
     ...overrides,
   };
 }
@@ -61,20 +63,40 @@ describe("AttendancePolicyService — authorization", () => {
 });
 
 describe("AttendancePolicyService — createTenantPolicy", () => {
-  it("creates the tenant's first baseline and audits + emits an outbox-eligible event", async () => {
+  it("creates the tenant's first baseline with the exact approved flat contract, and audits + emits an outbox-eligible event", async () => {
     const { service, audit, events } = harness();
     const result = await service.createTenantPolicy(requestFor(["hr_admin"], MANAGE), content());
     expect(result.kind).toBe("success");
     if (result.kind === "success") {
       expect(result.value.policy.scope).toBe("TENANT");
       expect(result.value.policy.scopeId).toBe("tenant-a");
+      expect(result.value.policy.tenantId).toBe("tenant-a");
       expect(result.value.policy.effectiveUntil).toBeUndefined();
-      expect(result.value.policy.attendancePolicyId).toBeTruthy();
-      expect(result.value.policy.attendancePolicyVersionId).toBeTruthy();
-      expect(result.value.policy.attendancePolicyId).not.toBe(result.value.policy.attendancePolicyVersionId);
+      expect(result.value.policy.policyId).toBeTruthy();
+      expect(result.value.policy.policyVersionId).toBeTruthy();
+      expect(result.value.policy.policyId).not.toBe(result.value.policy.policyVersionId);
+      expect(result.value.policy.roundingIntervalMinutes).toBe(15);
+      expect(result.value.policy.roundingDirection).toBe("nearest");
+      expect(result.value.policy.gracePeriodMinutes).toBe(5);
+      expect(result.value.policy.latenessToleranceMinutes).toBe(10);
+      expect(result.value.policy.unpaidBreakMinutes).toBe(60);
+      expect(result.value.policy.standardWorkWeekMinutes).toBe(2400);
+      expect(result.value.policy.isStandardWorkWeekStatutoryFloor).toBe(false);
+      expect(result.value.policy.dailyOvertimeThresholdMinutes).toBe(480);
+      expect(result.value.policy.calculationAlgorithmVersion).toBe(1);
     }
     expect(events.list().map((e) => e.eventName)).toEqual(["timekeeping.attendance_policy.created"]);
     expect(audit.list()).toHaveLength(1);
+  });
+
+  it("creates a baseline omitting the optional unpaidBreakMinutes and dailyOvertimeThresholdMinutes", async () => {
+    const { service } = harness();
+    const result = await service.createTenantPolicy(requestFor(["hr_admin"], MANAGE), content({ unpaidBreakMinutes: undefined, dailyOvertimeThresholdMinutes: undefined }));
+    expect(result.kind).toBe("success");
+    if (result.kind === "success") {
+      expect(result.value.policy.unpaidBreakMinutes).toBeUndefined();
+      expect(result.value.policy.dailyOvertimeThresholdMinutes).toBeUndefined();
+    }
   });
 
   it("rejects a second baseline that overlaps the tenant's current one as a conflict", async () => {
@@ -87,8 +109,15 @@ describe("AttendancePolicyService — createTenantPolicy", () => {
 
   it("rejects invalid content with a validation failure, not a conflict", async () => {
     const { service } = harness();
-    const result = await service.createTenantPolicy(requestFor(["hr_admin"], MANAGE), content({ rounding: { incrementMinutes: 7, direction: "NEAREST" } }));
+    const result = await service.createTenantPolicy(requestFor(["hr_admin"], MANAGE), content({ roundingIntervalMinutes: 0 }));
     expect(result.kind).toBe("validation_failure");
+  });
+
+  it("accepts a roundingIntervalMinutes that does not evenly divide 60 — no divisibility rule is authorized", async () => {
+    const { service } = harness();
+    const result = await service.createTenantPolicy(requestFor(["hr_admin"], MANAGE), content({ roundingIntervalMinutes: 7 }));
+    expect(result.kind).toBe("success");
+    if (result.kind === "success") expect(result.value.policy.roundingIntervalMinutes).toBe(7);
   });
 
   it("computes a fingerprint deterministically from the resolved values", async () => {
@@ -104,22 +133,23 @@ async function seedCurrent() {
   const request = requestFor(["hr_admin"], MANAGE);
   const first = await h.service.createTenantPolicy(request, content({ effectiveFrom: "2026-01-01T00:00:00.000Z" }));
   if (first.kind !== "success") throw new Error("seed failed");
-  return { ...h, request, firstVersionId: first.value.policy.attendancePolicyVersionId, lineageId: first.value.policy.attendancePolicyId };
+  return { ...h, request, firstVersionId: first.value.policy.policyVersionId, lineageId: first.value.policy.policyId };
 }
 
 describe("AttendancePolicyService — replaceTenantPolicy", () => {
   it("ends the current policy and opens a new one, atomically, forming adjacent windows and carrying the lineage id forward", async () => {
     const { service, request, firstVersionId, lineageId, reader, readContext } = await seedCurrent();
-    const result = await service.replaceTenantPolicy(request, content({ effectiveFrom: "2026-06-01T00:00:00.000Z", rounding: { incrementMinutes: 30, direction: "UP" } }));
+    const result = await service.replaceTenantPolicy(request, content({ effectiveFrom: "2026-06-01T00:00:00.000Z", roundingIntervalMinutes: 30, roundingDirection: "up" }));
     expect(result.kind).toBe("success");
     if (result.kind === "success") {
-      expect(result.value.previous.attendancePolicyVersionId).toBe(firstVersionId);
+      expect(result.value.previous.policyVersionId).toBe(firstVersionId);
       expect(result.value.previous.effectiveUntil).toBe("2026-06-01T00:00:00.000Z");
-      expect(result.value.policy.attendancePolicyId).toBe(lineageId);
-      expect(result.value.policy.rounding.incrementMinutes).toBe(30);
+      expect(result.value.policy.policyId).toBe(lineageId);
+      expect(result.value.policy.roundingIntervalMinutes).toBe(30);
+      expect(result.value.policy.roundingDirection).toBe("up");
     }
     const current = await reader.findCurrentPolicy(readContext(), "TENANT", "tenant-a");
-    expect(current?.rounding.incrementMinutes).toBe(30);
+    expect(current?.roundingIntervalMinutes).toBe(30);
   });
 
   it("emits an ended event for the superseded record and a created event for the new one, in that order", async () => {
@@ -144,10 +174,10 @@ describe("AttendancePolicyService — replaceTenantPolicy", () => {
 
   it("historical policy resolution against the superseded version is preserved after replace", async () => {
     const { service, request, firstVersionId, reader, readContext } = await seedCurrent();
-    await service.replaceTenantPolicy(request, content({ effectiveFrom: "2026-06-01T00:00:00.000Z", rounding: { incrementMinutes: 30, direction: "UP" } }));
+    await service.replaceTenantPolicy(request, content({ effectiveFrom: "2026-06-01T00:00:00.000Z", roundingIntervalMinutes: 30, roundingDirection: "up" }));
     const historical = await reader.findPolicyAtInstant(readContext(), "TENANT", "tenant-a", "2026-03-01T00:00:00.000Z");
-    expect(historical?.attendancePolicyVersionId).toBe(firstVersionId);
-    expect(historical?.rounding.incrementMinutes).toBe(15);
+    expect(historical?.policyVersionId).toBe(firstVersionId);
+    expect(historical?.roundingIntervalMinutes).toBe(15);
   });
 });
 
@@ -182,11 +212,11 @@ describe("AttendancePolicyService — endTenantPolicy", () => {
     const { unitOfWork, firstVersionId } = await seedCurrent();
     await expect(
       unitOfWork.execute({ tenantId: "tenant-a", correlationId: "c" }, async (tx) => {
-        await tx.repositories.attendancePolicies.end({ tenantId: "tenant-a", attendancePolicyVersionId: firstVersionId, effectiveUntil: "2026-06-01" });
+        await tx.repositories.attendancePolicies.end({ tenantId: "tenant-a", policyVersionId: firstVersionId, effectiveUntil: "2026-06-01" });
         throw new Error("downstream failure");
       }),
     ).rejects.toThrow("downstream failure");
-    const stillOpen = unitOfWork.getStore().policies.find((p) => p.attendancePolicyVersionId === firstVersionId);
+    const stillOpen = unitOfWork.getStore().policies.find((p) => p.policyVersionId === firstVersionId);
     expect(stillOpen?.effectiveUntil).toBeUndefined();
   });
 });

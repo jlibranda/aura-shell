@@ -4,6 +4,7 @@ import { AuthorizationError } from "@/platform/errors";
 import { AttendancePolicyStore, InMemoryAttendancePolicyReadRepository, InMemoryAttendancePolicyWriteRepository } from "@/platform/timekeeping/in-memory-attendance-policy-repository";
 import { BaselineAttendancePolicyResolver } from "@/platform/timekeeping/baseline-attendance-policy-resolver";
 import type { AttendancePolicyResolutionInput } from "@/platform/timekeeping/attendance-policy";
+import type { CreateAttendancePolicyInput } from "@/platform/timekeeping/attendance-policy-repository";
 
 function context(tenantId = "tenant-a", roles: readonly PlatformRole[] = ["hr_admin"]): TenantContext {
   return {
@@ -22,19 +23,21 @@ function input(overrides: Partial<AttendancePolicyResolutionInput> = {}): Attend
   return { tenantId: "tenant-a", personId: "p1", attendanceAnchorInstant: "2026-06-01T00:00:00.000Z", ...overrides };
 }
 
-async function seedTenantPolicy(store: AttendancePolicyStore, overrides: Partial<Parameters<InMemoryAttendancePolicyWriteRepository["create"]>[0]> = {}) {
+async function seedTenantPolicy(store: AttendancePolicyStore, overrides: Partial<CreateAttendancePolicyInput> = {}) {
   const write = new InMemoryAttendancePolicyWriteRepository(store);
   return write.create({
     tenantId: "tenant-a",
     scope: "TENANT",
     scopeId: "tenant-a",
     effectiveFrom: "2026-01-01T00:00:00.000Z",
-    rounding: { incrementMinutes: 15, direction: "NEAREST" },
-    gracePeriod: { lateArrivalGraceMinutes: 5, earlyDepartureGraceMinutes: 5 },
-    breakRules: { unpaidBreakMinutes: 60, paidBreakMinutes: 15 },
-    overtime: { dailyThresholdMinutes: 480, weeklyThresholdMinutes: 2400 },
-    overtimeThresholdsAreStatutoryFloor: false,
-    tolerance: { missedPunchToleranceMinutes: 10 },
+    roundingIntervalMinutes: 15,
+    roundingDirection: "nearest",
+    gracePeriodMinutes: 5,
+    latenessToleranceMinutes: 10,
+    unpaidBreakMinutes: 60,
+    standardWorkWeekMinutes: 2400,
+    isStandardWorkWeekStatutoryFloor: false,
+    dailyOvertimeThresholdMinutes: 480,
     calculationAlgorithmVersion: 1,
     fingerprint: "hash-1",
     createdBy: "actor",
@@ -43,7 +46,7 @@ async function seedTenantPolicy(store: AttendancePolicyStore, overrides: Partial
 }
 
 describe("BaselineAttendancePolicyResolver", () => {
-  it("resolves the configured Tenant-scoped policy as of the anchor instant", async () => {
+  it("resolves the configured Tenant-scoped policy as of the anchor instant, with the exact approved flat contract", async () => {
     const store = new AttendancePolicyStore();
     await seedTenantPolicy(store);
     const resolver = new BaselineAttendancePolicyResolver(new InMemoryAttendancePolicyReadRepository(store));
@@ -51,7 +54,28 @@ describe("BaselineAttendancePolicyResolver", () => {
     expect(result.kind).toBe("resolved");
     if (result.kind === "resolved") {
       expect(result.policy.scope).toBe("TENANT");
-      expect(result.policy.rounding.incrementMinutes).toBe(15);
+      expect(result.policy.roundingIntervalMinutes).toBe(15);
+      expect(result.policy.roundingDirection).toBe("nearest");
+      expect(Object.keys(result.policy).sort()).toEqual(
+        [
+          "policyId",
+          "policyVersionId",
+          "scope",
+          "scopeId",
+          "tenantId",
+          "effectiveFrom",
+          "roundingIntervalMinutes",
+          "roundingDirection",
+          "gracePeriodMinutes",
+          "latenessToleranceMinutes",
+          "unpaidBreakMinutes",
+          "standardWorkWeekMinutes",
+          "isStandardWorkWeekStatutoryFloor",
+          "dailyOvertimeThresholdMinutes",
+          "calculationAlgorithmVersion",
+          "fingerprint",
+        ].sort(),
+      );
     }
   });
 
@@ -78,8 +102,8 @@ describe("BaselineAttendancePolicyResolver", () => {
     const store = new AttendancePolicyStore();
     const first = await seedTenantPolicy(store, { effectiveFrom: "2026-01-01T00:00:00.000Z", fingerprint: "hash-old" });
     const write = new InMemoryAttendancePolicyWriteRepository(store);
-    await write.end({ tenantId: "tenant-a", attendancePolicyVersionId: first.attendancePolicyVersionId, effectiveUntil: "2026-06-01T00:00:00.000Z" });
-    await seedTenantPolicy(store, { attendancePolicyId: first.attendancePolicyId, effectiveFrom: "2026-06-01T00:00:00.000Z", fingerprint: "hash-new" });
+    await write.end({ tenantId: "tenant-a", policyVersionId: first.policyVersionId, effectiveUntil: "2026-06-01T00:00:00.000Z" });
+    await seedTenantPolicy(store, { policyId: first.policyId, effectiveFrom: "2026-06-01T00:00:00.000Z", fingerprint: "hash-new" });
 
     const resolver = new BaselineAttendancePolicyResolver(new InMemoryAttendancePolicyReadRepository(store));
     const historical = await resolver.resolve(context(), input({ attendanceAnchorInstant: "2026-03-01T00:00:00.000Z" }));
