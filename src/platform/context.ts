@@ -10,7 +10,9 @@ export type Permission =
   | "settings.audit.view"
   | "organization.view"
   | "organization.manage"
-  | "timekeeping.view";
+  | "timekeeping.view"
+  | "timekeeping.clock"
+  | "timekeeping.manage";
 
 /** The canonical runtime list of every platform permission, for validation and enumeration. */
 export const ALL_PERMISSIONS: readonly Permission[] = Object.freeze([
@@ -25,6 +27,8 @@ export const ALL_PERMISSIONS: readonly Permission[] = Object.freeze([
   "organization.view",
   "organization.manage",
   "timekeeping.view",
+  "timekeeping.clock",
+  "timekeeping.manage",
 ]);
 
 /** Type guard: is an arbitrary string a recognized platform permission? */
@@ -65,16 +69,33 @@ export interface TenantContext {
 // (ADR-014 §13/Slice 1 investigation): hr_admin, hr_operations, payroll, and
 // auditor already see placement/administrative data; manager and employee
 // get no Timekeeping access by default, matching how they get no
-// organization.view today. clock/manage/approve/adjust permissions are
-// deliberately not introduced yet — they arrive with the slices that need
-// them (ADR-014 §13; roadmap Slice 2+).
+// organization.view today.
+//
+// Slice 2 introduces the two write permissions ADR-014 §13 already names,
+// with orthogonal, deliberately narrow grants (Decision 2 — no third
+// permission introduced):
+// - timekeeping.clock ("record my own attendance") goes to manager and
+//   employee — the general staff population — plus hr_admin/hr_operations,
+//   since real HR staff are also employees who clock in for themselves.
+//   This is the first non-empty grant either manager or employee ever
+//   receives in this codebase; ADR-014 §13 names it without restricting it
+//   to administrative roles, unlike every other Timekeeping/Organization
+//   permission so far.
+// - timekeeping.manage ("record on behalf of another person" — device,
+//   import, API, and admin-entered channels) goes to hr_admin only,
+//   mirroring organization.manage's identically narrow precedent (the only
+//   other domain-wide "manage" permission in this file). payroll and
+//   auditor get neither — both already carry zero write permissions
+//   anywhere in this table, and self-clock for a real payroll/auditor
+//   staff member is served by also holding the employee role, not by
+//   widening their functional role's own grant.
 const ROLE_PERMISSIONS: Readonly<Record<PlatformRole, readonly Permission[]>> = Object.freeze({
-  hr_admin: ["people.read", "people.write", "people.government_ids.read", "people.employee.hire", "settings.view", "settings.manage", "settings.publish", "settings.audit.view", "organization.view", "organization.manage", "timekeeping.view"],
-  hr_operations: ["people.read", "people.write", "people.government_ids.read", "people.employee.hire", "settings.view", "settings.manage", "organization.view", "timekeeping.view"],
+  hr_admin: ["people.read", "people.write", "people.government_ids.read", "people.employee.hire", "settings.view", "settings.manage", "settings.publish", "settings.audit.view", "organization.view", "organization.manage", "timekeeping.view", "timekeeping.clock", "timekeeping.manage"],
+  hr_operations: ["people.read", "people.write", "people.government_ids.read", "people.employee.hire", "settings.view", "settings.manage", "organization.view", "timekeeping.view", "timekeeping.clock"],
   payroll: ["people.government_ids.read", "settings.view", "organization.view", "timekeeping.view"],
   auditor: ["settings.view", "settings.audit.view", "organization.view", "timekeeping.view"],
-  manager: [],
-  employee: [],
+  manager: ["timekeeping.clock"],
+  employee: ["timekeeping.clock"],
 });
 
 export function hasPermission(context: TenantContext, permission: Permission): boolean {

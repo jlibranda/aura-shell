@@ -85,6 +85,50 @@ describe("attendance event platform (integration)", () => {
     expect(dbOutbox?.tenantId).toBe(tenantA);
   });
 
+  it("regression: resolves a same-key/same-fact retry as a deterministic replay when create() runs inside the real UnitOfWork's interactive transaction, not just against the bare repository", async () => {
+    // A failed unique-constraint INSERT aborts the whole Postgres
+    // transaction; a naive try/catch-then-lookup implementation would fail
+    // the follow-up lookup with "current transaction is aborted" (25P02)
+    // the moment create() ran inside $transaction, which is the ONLY way
+    // PrismaAttendanceEventUnitOfWork ever calls it in production. This
+    // test exercises exactly that path, not the bare repository.
+    await seedTenant(tenantA);
+    const personId = `emp-${randomUUID().slice(0, 8)}`;
+    await seedEmployee(tenantA, personId);
+    const unitOfWork = new PrismaAttendanceEventUnitOfWork(prisma, new InMemoryDomainEventCollector(), new InMemoryAuditCollector());
+    const draft = input(tenantA, personId);
+
+    const first = await unitOfWork.execute(unitOfWorkContext(tenantA), (tx) => tx.repositories.attendanceEvents.create(draft));
+    const second = await unitOfWork.execute(unitOfWorkContext(tenantA), (tx) => tx.repositories.attendanceEvents.create(draft));
+
+    expect(first.kind).toBe("created");
+    expect(second.kind).toBe("replayed");
+    const rows = await prisma.attendanceEvent.count({ where: { tenantId: tenantA, idempotencyKey: draft.idempotencyKey } });
+    expect(rows).toBe(1);
+  });
+
+  it("regression: resolves a same-key/different-fact submission as a conflict when create() runs inside the real UnitOfWork's interactive transaction, leaving the existing row unmutated", async () => {
+    await seedTenant(tenantA);
+    const personId = `emp-${randomUUID().slice(0, 8)}`;
+    await seedEmployee(tenantA, personId);
+    const unitOfWork = new PrismaAttendanceEventUnitOfWork(prisma, new InMemoryDomainEventCollector(), new InMemoryAuditCollector());
+    const draft = input(tenantA, personId);
+
+    const first = await unitOfWork.execute(unitOfWorkContext(tenantA), (tx) => tx.repositories.attendanceEvents.create(draft));
+    const conflict = await unitOfWork.execute(unitOfWorkContext(tenantA), (tx) =>
+      tx.repositories.attendanceEvents.create({ ...draft, occurredAtUtc: "2026-07-26T09:30:00.000Z" }),
+    );
+
+    expect(first.kind).toBe("created");
+    expect(conflict.kind).toBe("conflict");
+    if (first.kind === "created" && conflict.kind === "conflict") {
+      expect(conflict.existing.id).toBe(first.event.id);
+      expect(conflict.existing.occurredAtUtc).toBe(first.event.occurredAtUtc);
+    }
+    const rows = await prisma.attendanceEvent.count({ where: { tenantId: tenantA, idempotencyKey: draft.idempotencyKey } });
+    expect(rows).toBe(1);
+  });
+
   it("the database rejects a second row with the same (tenant_id, idempotency_key) at the constraint level", async () => {
     await seedTenant(tenantA);
     const personId = `emp-${randomUUID().slice(0, 8)}`;
