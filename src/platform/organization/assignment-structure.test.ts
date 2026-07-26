@@ -33,8 +33,8 @@ describe("a single Assignment aggregate and a single overlap implementation", ()
     expect(declarers.map((f) => f.path)).toEqual(["src/platform/organization/assignment.ts"]);
   });
 
-  it("declares the overlap-detection helper in exactly one file", () => {
-    const overlapCheckers = files.filter((f) => /export\s+function\s+windowsOverlap\b/.test(f.content));
+  it("declares the overlap-detection helper in exactly one file within the organization domain (a differently-scoped aggregate in another bounded context, e.g. Timekeeping's ScheduleAssignment, may legitimately declare its own identically-named pure helper against its own GIST constraint)", () => {
+    const overlapCheckers = files.filter((f) => f.path.startsWith("src/platform/organization/") && /export\s+function\s+windowsOverlap\b/.test(f.content));
     expect(overlapCheckers.map((f) => f.path)).toEqual(["src/platform/organization/assignment.ts"]);
   });
 

@@ -736,6 +736,14 @@ Entity delivery was held to:
 
 ---
 
+## Part 7 — Deferred Technical Debt Backlog
+
+| Item | Raised in | Description | Timing |
+|---|---|---|---|
+| Extract shared temporal interval helpers (`windowsOverlap`, `[)` boundary utilities) into a shared kernel/common temporal utility | Slice 4 (ScheduleAssignment) | `Assignment` (Organization) and `ScheduleAssignment` (Timekeeping) each independently declare an identical-shaped `windowsOverlap`/boundary-check helper, by deliberate bounded-context self-containment (no cross-context import of pure logic). Once a third or fourth aggregate needs the same half-open-interval discipline (`AttendancePolicy` in Slice 7 is a likely candidate), the duplication is worth collapsing into one shared, dependency-free utility module both contexts import. | **Do not implement before Slice 6 is complete.** Revisit only once the actual shape of a third consumer is known — extracting a "shared kernel" from two data points risks guessing the wrong abstraction. |
+
+---
+
 This plan contains no production code, no migrations, and no Prisma schema.
 Slice 1 is the first artifact that may contain any of the three, and only
 after this plan itself is reviewed and accepted.
