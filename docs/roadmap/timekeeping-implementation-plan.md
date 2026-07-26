@@ -194,6 +194,12 @@ and the policy-resolver interface, with a real, explicitly configured
 Tenant-wide baseline as the only implementation this slice ships. Full
 Tenant→LegalEntity→Location→OrgUnit→Employee precedence is **not** built
 here — that is Slice 7, against the same contract, without changing it.
+**Slice 6 (`AttendanceDay` Calculation) is blocked until Slice 5 Phase A is
+complete and frozen** — ADR-014 §9's own computation pipeline feeds a
+resolved `AttendancePolicy` into `AttendanceCalculationService` alongside
+`AttendanceEvent`/`ScheduleAssignment`/the Assignment snapshot; there is no
+factual-only path that omits it. No placeholder, temporary, or hardcoded
+policy value may be used to unblock Slice 6 in the interim.
 
 This slice has no dependency on Slices 1–4; it depends only on
 Organization's already-built `LegalEntity` (for statutory-floor metadata
@@ -202,19 +208,27 @@ shape) and can be built in parallel with them.
 **What this slice defines.**
 - The **resolved-policy value object** (`ResolvedAttendancePolicy`) —
   every field `AttendanceCalculationService` will ever need: rounding rule,
-  grace period, break rules, overtime rule, tolerance rule, timezone and
-  workday-boundary inputs, statutory-floor metadata (which values are
-  Legal-Entity-derived floors vs. operational, per ADR-014 §6.1), a stable
-  **policy version identity**, an **effective period**
-  (`effectiveFrom`/`effectiveUntil` — effective-dated from day one, per
-  ADR-014 §5, not retrofitted later), and a **deterministic
+  grace period, break rules, overtime rule, tolerance rule, statutory-floor
+  metadata (which values are Legal-Entity-derived floors vs. operational,
+  per ADR-014 §6.1), a stable **policy version identity**, an **effective
+  period** (`effectiveFrom`/`effectiveUntil` — effective-dated from day
+  one, per ADR-014 §5, not retrofitted later), and a **deterministic
   serialization/hash** (`fingerprint()`) so two computations against "the
   same" policy are provably identical, and so `AttendanceDay` can persist a
   compact, verifiable reference rather than only a full copy.
+  **`workdayBoundaryMinutes` is deliberately not part of this contract** —
+  the unscheduled-attribution boundary is an ADR-014 Algorithm Invariant
+  (Appendix G), not a tenant-configurable policy value (see the
+  Architectural Decision Gate resolved 2026-07-26).
 - The **`AttendancePolicyResolver` interface** — the sole seam
   `AttendanceCalculationService` (Slice 6) is allowed to depend on:
-  `resolve(context, personId, date) -> AttendancePolicyResolutionResult`,
-  where the result is an explicit discriminated union —
+  `resolve(context, input) -> AttendancePolicyResolutionResult`, where
+  `input` carries `tenantId`, `personId`, `attendanceDate`, and the
+  **caller-resolved** `legalEntityId`/`orgUnitId`/`locationId` — Slice 6
+  resolves Organization placement historically once (for its own
+  `AttendanceDay` snapshot) and passes those identifiers in explicitly;
+  **the resolver itself never independently queries current or historical
+  Organization state.** The result is an explicit discriminated union —
   `{ kind: "resolved", policy: ResolvedAttendancePolicy }` or
   `{ kind: "configuration_incomplete", missingScope, reason }` — **never**
   a bare value that silently defaults when nothing is configured.
@@ -226,26 +240,32 @@ shape) and can be built in parallel with them.
 - The `AttendancePolicy` aggregate itself (ADR-014 §4.7's shape — `scope`
   already supports all five values `Tenant`/`LegalEntity`/`Location`/
   `OrgUnit`/`Employee` at the data level, unmodified from ADR-014), but
-  this slice's write path (admin UI, `AttendancePolicyService`) only ever
-  creates `Tenant`-scoped records — the other four scopes are unlocked by
-  Slice 7, which extends the same aggregate's write surface, not its shape.
+  this slice's write path (`AttendancePolicyService`) only ever creates
+  `Tenant`-scoped records — the other four scopes are unlocked by Slice 7,
+  which extends the same aggregate's write surface, not its shape.
 
-**Files expected.**
+This slice splits into **Phase A (backend)** and **Phase B (administration
+UI)**, the same split already used operationally for Slices 2–4.
+
+**Phase A files expected (backend only).**
 - `src/platform/timekeeping/attendance-policy.ts` — `AttendancePolicy`
   aggregate, `ResolvedAttendancePolicy` value object,
-  `AttendancePolicyResolutionResult` discriminated union
+  `AttendancePolicyResolutionResult` discriminated union, fingerprint
 - `src/platform/timekeeping/attendance-policy-repository.ts` — CRUD port
 - `src/platform/timekeeping/attendance-policy-resolver.ts` — the resolver
   **port** (interface only)
 - `src/platform/timekeeping/baseline-attendance-policy-resolver.ts` — the
   Tenant-scope-only implementation
-- `src/platform/timekeeping/attendance-policy-service.ts` — admin write
-  path (Tenant scope only, this slice)
+- `src/platform/timekeeping/attendance-policy-service.ts` — write path
+  (Tenant scope only, this slice)
 - Prisma/in-memory adapters for `AttendancePolicyRepository`
-- `attendance-policy.test.ts` (value-object + validation),
-  `baseline-attendance-policy-resolver.test.ts` (including the
-  `configuration_incomplete` path — explicit, not incidental),
-  `attendance-policy-service.test.ts`
+- `attendance-policy.test.ts` (value-object + validation + fingerprint
+  determinism), `baseline-attendance-policy-resolver.test.ts` (including
+  the `configuration_incomplete` path — explicit, not incidental),
+  `attendance-policy-service.test.ts`, `attendance-policy-structure.test.ts`,
+  `attendance-policy-platform.integration.test.ts`
+
+**Phase B files expected (deferred — administration UI, not this pass).**
 - `src/app/(app)/settings/time/attendance-policy/{page.tsx,actions.ts}` —
   Tenant-scope configuration form (no scope picker yet; Slice 7 extends
   this same page with one)
@@ -257,23 +277,30 @@ only).
 **Services.** `AttendancePolicyService` (Tenant-scope create/update);
 `BaselineAttendancePolicyResolver` (the resolver implementation).
 **UI.** Settings > Time > Attendance Policy — single Tenant-wide
-configuration form.
+configuration form. **Phase B, deferred** — not built in this pass, same
+as the Web Clock and Work Schedule admin UIs deferred from Slices 2–3.
 **Tests.** Unit (value-object validation, fingerprint determinism —
 same inputs always hash identically), the `configuration_incomplete` path
 explicitly tested (not just the happy path), integration, structural
 (`AttendancePolicyResolver` is declared as an interface with more than one
 theoretically valid implementation — i.e. nothing in
 `attendance-policy-resolver.ts` couples the interface to
-`BaselineAttendancePolicyResolver`).
+`BaselineAttendancePolicyResolver`; no reference to
+`workdayBoundaryMinutes` anywhere in `ResolvedAttendancePolicy` or its
+fingerprint).
 **Migration.** New `attendance_policies` table: `id`, `tenant_id`, `scope`,
-`scope_id`, `effective_from`, `effective_until`, policy values, version,
+`scope_id`, `effective_from`, `effective_until`, policy values,
+`calculation_algorithm_version`, canonical fingerprint, version,
 exclusion constraint per `(tenant_id, scope, scope_id, period)` — the full
 five-value `scope` enum from ADR-014 §4.7, even though this slice's
 application code only ever writes `Tenant`.
 **Risks.** ADR-014 Open Decision §16.6 (overnight/midnight-spanning shift
-date attribution) **must resolve before this slice starts** — the
-workday-boundary input on `ResolvedAttendancePolicy` needs a real, decided
-shape now, since Slice 6 and Slice 7 both build on it permanently.
+date attribution) is **resolved** (ADR-014 §5.7, Appendix G) — it no longer
+blocks this slice. The live risk is implementation-level: the
+fingerprint/canonicalization logic must be validated against the
+`WorkScheduleVersion.canonicalHash` precedent, and DST library selection
+(Luxon, recommended) must be spike-tested before wall-clock-to-instant
+conversion code is written.
 **Acceptance criteria.**
 - `AttendanceDay` (Slice 6) can depend on a stable, versioned resolved-policy
   contract that will not change shape in Slice 7.
@@ -303,6 +330,17 @@ a future country pack might be implemented. It depends on the
 is later joined (Slice 7) by a `PrecedenceAttendancePolicyResolver`
 implementing the same interface, this slice's code does not change — only
 which implementation is wired into the composition root does.
+
+**This slice is blocked until Slice 5 Phase A is complete and frozen** —
+it is the sole consumer of `AttendancePolicyResolver`. `AttendanceCalculationService`
+resolves Organization placement historically itself (as of the relevant
+anchor instant — ADR-014 §5.7) and passes the resolved
+`legalEntityId`/`orgUnitId`/`locationId` explicitly into every
+`AttendancePolicyResolver.resolve()` call; the resolver never re-queries
+Organization on its own. Attendance-date ownership (scheduled-start-date,
+cross-midnight-unsplit, unscheduled-local-date-with-midnight-boundary) and
+DST disambiguation are **already fixed by ADR-014 §5.7/§7.4/Appendix G** —
+this slice implements those rules, it does not decide them.
 
 **Files expected.**
 - `src/platform/timekeeping/attendance-day.ts`, `-repository.ts`
@@ -611,8 +649,8 @@ graph TD
    single most complex slice in the roadmap.
 4. **Approval is decoupled from Adjustment.** Slice 8 has no dependency on
    Slices 3–7, so it can be built in parallel if Slice 5, 6, or 7 stalls on
-   an open decision (§16.3, §16.6) — the roadmap does not go idle waiting
-   on a single blocked slice.
+   an open decision (§16.3; §16.6 is now resolved, ADR-014 §5.7/Appendix G)
+   — the roadmap does not go idle waiting on a single blocked slice.
 5. **The highest-integration-risk slice (9) sits after every aggregate it
    touches is independently proven**, not before — by Slice 9,
    `AttendanceEvent`, `ScheduleAssignment`, `AttendanceDay`, the full
@@ -724,7 +762,7 @@ Entity delivery was held to:
 
 | Risk | Probability | Impact | Mitigation |
 |---|---|---|---|
-| Open decisions (§16.3 statutory-floor axes; §16.6 overnight-shift attribution) remain unresolved when Slices 5–7 are due to start | Medium | High — blocks the slice outright | Resolve as a fast-follow decision **before** the blocked slice's kickoff, not during it; Slice 8 can proceed in parallel so the roadmap doesn't go idle |
+| Open decision §16.3 (statutory-floor axes) remains unresolved when Slice 7 is due to start (§16.6, overnight-shift attribution, is resolved — ADR-014 §5.7, Appendix G) | Medium | High — blocks the slice outright | Resolve as a fast-follow decision **before** the blocked slice's kickoff, not during it; Slice 8 can proceed in parallel so the roadmap doesn't go idle |
 | Slice 5's contract (interface + value object) turns out insufficient once Slice 7's real precedence logic is implemented, forcing a signature change | Low–Medium | High — would mean Slice 6 was built against the wrong contract | Slice 5's Acceptance Criteria explicitly requires proving contract-sufficiency for Slice 7 before Slice 5 is accepted; if a gap is found only during Slice 7, that is itself evidence Slice 5's review gate was insufficiently rigorous, not a normal/expected occurrence |
 | Browser-verification script bugs mistaken for production bugs, or the reverse | High — directly evidenced this session, which needed 14 verification runs on the Legal Entity slice to separate real defects from selector/timing bugs | Medium — wastes review time; risks a wrong "fix" | Apply the same root-cause-first discipline used in that delivery: capture URL/console/network/DOM evidence and classify before writing any fix |
 | Dev-server first-compile latency causing false-negative browser verification on every new route this plan introduces (Slices 2, 4, 6, 8, 11) | High | Low–Medium — flaky verification, not a real defect | Wait on real navigation/state signals (URL change, element appearance), never a fixed timeout — the exact fix this session already had to apply twice on the Legal Entity slice |
