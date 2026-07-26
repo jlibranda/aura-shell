@@ -307,7 +307,8 @@ classDiagram
   last-out, break duration, worked minutes) — the record `AttendanceAdjustment`
   attaches to, and the unit Payroll ultimately consumes.
 - **Identity.** `id`, `tenantId`, `personId`, `attendanceDate` (a calendar
-  date, resolved in the effective timezone for that day — §5), `status`
+  date, resolved in the effective timezone for that day, by the
+  shift-start-date/unscheduled-boundary rules of §5.7), `status`
   (`computed` → `adjusted` → `finalized`).
 - **Lifecycle.** Computed (derived, freely recomputable while `computed`) →
   `adjusted` (an `AttendanceAdjustment` has been applied) → `finalized`
@@ -396,12 +397,29 @@ classDiagram
   given instant (same overlap-prevention discipline as `Assignment` and
   `ScheduleAssignment`); precedence resolution across scopes is deterministic
   (§ Part 4 / §8 below).
+- **Historical immutability (architectural invariant, not a mandated
+  mechanism).** A policy record or version that was ever effective, or ever
+  used by an `AttendanceDay` computation, is never mutated by a later
+  policy change. A change is always represented as a *new* policy state —
+  never a rewrite of the old one — and that new state must preserve:
+  historical effective periods, policy identity and version, the resolved
+  `fingerprint()`, calculation reproducibility, auditability, and
+  historical explainability. **This ADR defines the invariant, not the
+  storage mechanism that satisfies it** — close-existing-row-and-create-
+  replacement, append-only effective-dated versioning, or any other
+  equivalent immutable mechanism are all conformant; which one an
+  implementation slice chooses is a roadmap-level recommendation, not an
+  ADR-level mandate.
 - **Effective dating.** Core to the aggregate.
 - **Ownership.** Timekeeping.
 - **Relationships.** Resolved via precedence at `AttendanceDay` computation
   time; the resolved policy id and the specific values used are snapshotted
   onto the `AttendanceDay` (§4.4), never re-resolved after the fact for an
   already-computed day.
+- **Not to be confused with Algorithm Invariants (Appendix G).** Attendance-
+  date attribution, DST disambiguation, canonical hashing, and other
+  deterministic computation rules are never modeled as `AttendancePolicy`
+  fields — they are fixed algorithm behavior, not a business policy choice.
 
 ## 5. Temporal Model [Part 3]
 
@@ -473,6 +491,52 @@ the policy resolution (an open decision, §14).
   privileged, audited action requiring the Payroll-side reason the day needs
   to be reopened (§9, §11). A `finalized` day that is unlocked reverts to
   `adjusted`, not `computed` — its history is preserved, not discarded.
+
+### 5.7 Attendance-date attribution and historical anchor (resolves Open Decision §16.6)
+
+**Scheduled work — shift-start-date ownership.** A concrete scheduled work
+period belongs to the local calendar date, in the effective attendance
+timezone (§7.1), on which its **scheduled start** occurs. Example: a period
+with scheduled start `22:00` local and scheduled end `06:00` local the next
+day (`crossesMidnight = true`) belongs entirely to the local date its
+`22:00` start falls on. The period is **never split at midnight** — its
+`AttendanceEvent`s, breaks, anomalies, and raw factual worked duration all
+attach to that one `AttendanceDay`. Later policy or payroll processing may
+apportion statutory or monetary treatment across the calendar boundary
+without changing which `AttendanceDay` owns the period. **This rule is a
+global algorithm invariant (Appendix G) — it is not tenant-configurable and
+is never modeled as an `AttendancePolicy` value.**
+
+**Multiple scheduled periods on one weekday.** Every concrete scheduled
+period whose scheduled start falls on the same local date belongs to the
+same `AttendanceDay` — a direct consequence of the rule above applied
+per-period, requiring no separate rule. Schedule expansion may produce an
+internal, non-persisted list of concrete period instances (scheduled start
+instant, scheduled end instant, break instants, source period identifier)
+to compute against; this is never a persisted aggregate — no
+`ShiftInstance`-shaped record is introduced by this ADR.
+
+**Unscheduled and rest-day attribution.** Events with no applicable
+scheduled period (rest-day work, an unmatched punch outside any
+`ScheduleAssignment` window) attribute by **local calendar date**, in the
+resolved attendance timezone, under an **algorithmic workday boundary that
+defaults to local midnight**. This boundary is fixed algorithm behavior for
+the initial calculation version (Appendix G) — it is **not** an
+`AttendancePolicy` field. A future ADR amendment may introduce a
+configurable, non-midnight boundary if genuine operational evidence (not
+ADR-014's own conceptual mention) shows it is needed. The system must never
+silently discard an unscheduled event for lack of an attribution rule.
+
+**Historical placement/timezone anchor.** For scheduled work, the
+Organization placement and (for `LOCATION` timezone-resolution mode)
+timezone used for the whole period are resolved **once, as of the
+period's scheduled-start instant**, and that single resolution governs the
+entire `AttendanceDay` — never re-resolved per `AttendanceEvent`, and never
+split because the person's `Assignment` changes while the period is in
+progress. For an unscheduled event cluster, the equivalent anchor is the
+**earliest event's instant** in that cluster. The exact mechanics of
+grouping events into a cluster are Slice 6's concern; this ADR fixes only
+the anchor rule itself.
 
 ## 6. Policy Model [Part 4]
 
@@ -560,6 +624,34 @@ resolved timezone for that date — never a fixed UTC offset cached at write
 time. This means a DST transition is computed correctly and reproducibly no
 matter when the computation runs, matching the ISO-8601-instant discipline
 `Assignment` already uses platform-wide.
+
+### 7.4 DST determinism — nonexistent and ambiguous local times
+
+Converting a `WorkScheduleVersion`'s wall-clock (`HH:mm`) schedule times into
+concrete UTC instants for a specific date and timezone requires a
+timezone-aware conversion — **plain JavaScript `Date` parsing of a local
+time string is prohibited** for this purpose. `Date` has no reliable,
+environment-independent IANA-zone-aware wall-clock conversion and no way to
+detect a nonexistent or ambiguous local time; using it would make schedule
+expansion silently non-deterministic across runtimes, which is unacceptable
+for a record this financial-adjacent.
+
+- **Nonexistent local time** (a spring-forward gap — e.g., a schedule
+  boundary of `02:30` when the clock jumps `02:00` → `03:00`): the
+  affected schedule occurrence is **blocked**, with an explicit,
+  deterministic anomaly code. It is never silently shifted to the nearest
+  valid instant.
+- **Ambiguous local time** (a fall-back repeat — e.g., `01:30` occurring
+  twice): resolves deterministically to its **earlier** occurrence. This
+  must be enforced explicitly by the implementation — never left to an
+  underlying library's undocumented default — and protected by a dedicated
+  test.
+
+Both rules are **global algorithm invariants (Appendix G)**, versioned
+through `calculationAlgorithmVersion` if a future revision ever changes
+them, and are never modeled as `AttendancePolicy` values — no tenant has a
+legitimate business reason to want DST arithmetic resolved differently than
+another.
 
 ## 8. Attendance Ingestion [Part 6]
 
@@ -813,9 +905,11 @@ Timekeeping data, not merely documented as a rule for the AI to follow.
   detection while retaining `occurredAtUtc` (device-reported) as the primary
   business timestamp — a large divergence between the two is exactly the
   kind of anomaly AI (§12) should be allowed to surface.
-- **DST edge cases for shifts spanning midnight or a DST transition.** Needs
-  explicit test coverage in the implementation slice; not solvable by policy
-  alone.
+- **DST edge cases for shifts spanning midnight or a DST transition.** The
+  rule is now fixed (§7.4, Appendix G — a nonexistent local time blocks the
+  occurrence; an ambiguous local time resolves to its earlier occurrence),
+  but still needs dedicated, explicit test coverage at implementation time —
+  a correct rule does not by itself guarantee a correct implementation.
 - **Retroactive `Assignment` correction colliding with an already-`finalized`
   `AttendanceDay`.** A late-discovered wrong `orgUnitId` on a past Assignment
   cannot retroactively change an already-snapshotted, already-paid
@@ -852,9 +946,11 @@ before the implementation slices that depend on them begin:
    (§13), and if so, the exact tolerance/threshold rule.
 5. **Multi-shift-per-day (split shifts) support** — assumed in scope for
    `WorkSchedule` but not designed in this ADR.
-6. **Overnight/midnight-spanning shift date attribution** — which calendar
-   date (and therefore which `AttendanceDay`) a night shift's hours belong
-   to is not resolved here and materially affects §5/§7.
+6. ~~**Overnight/midnight-spanning shift date attribution**~~ — **RESOLVED.**
+   See §5.7 and Appendix G: scheduled work uses shift-start-date ownership
+   (unsplit at midnight); unscheduled/rest-day events use local calendar
+   date under an algorithmic midnight boundary. Neither is
+   tenant-configurable or an `AttendancePolicy` value.
 7. **Whether `ScheduleAssignment` is mandatory** — can `AttendanceDay` be
    computed for a person with no active schedule (e.g., a flexible/unscheduled
    role), and if so, against what expected pattern?
@@ -966,9 +1062,9 @@ amended:
 |---|---|---|---|---|---|
 | `AttendancePolicy` | Yes (§4.7, §6) | Mostly — statutory-floor axis list open (§16.3) | `LegalEntity` (Organization, built) | Open Decision §16.3 | **PARTIAL** |
 | `AttendanceEvent` | Yes (§4.3, §8) | Yes | `Employee` (People, built) — reference only | None domain-blocking; ingestion-scale is an engineering task, not a design gap (§15) | **READY** |
-| `WorkSchedule` | Yes (§4.1) | Mostly — split-shift shape open (§16.5), overnight date-attribution open (§16.6) | None within Timekeeping | Open Decisions §16.5, §16.6 | **PARTIAL** |
+| `WorkSchedule` | Yes (§4.1) | Mostly — split-shift shape open (§16.5) | None within Timekeeping | Open Decision §16.5 | **PARTIAL** |
 | `ScheduleAssignment` | Yes (§4.2) | Mostly — mandatory-or-not open (§16.7) | `WorkSchedule` (must reach READY first); `Assignment` (Organization, built, cross-aggregate invariant) | Open Decision §16.7; transitively blocked on `WorkSchedule` | **BLOCKED** (transitively, until `WorkSchedule` is READY) |
-| `AttendanceDay` | Yes (§4.4, §5, §9) | Mostly — overnight attribution (§16.6) and retroactive-Assignment reconciliation (§16.2) open | `AttendanceEvent`, `ScheduleAssignment`, `AttendancePolicy` (all three) | Open Decisions §16.2, §16.6; transitively blocked on `ScheduleAssignment` and `AttendancePolicy` | **BLOCKED** (transitively) |
+| `AttendanceDay` | Yes (§4.4, §5.7, §9) | Mostly — retroactive-Assignment reconciliation (§16.2) open | `AttendanceEvent`, `ScheduleAssignment`, `AttendancePolicy` (all three) | Open Decision §16.2; transitively blocked on `AttendancePolicy` (Slice 5, not yet built) | **BLOCKED** (transitively) |
 | `AttendanceAdjustment` | Yes (§4.5, §5.5) | Yes — self-evident-skip threshold (§16.4) is a refinement, not a blocker | `AttendanceDay` (must be computable first) | None domain-blocking; transitively follows `AttendanceDay` | **PARTIAL** |
 | `AttendanceApproval` | Yes (§4.6, §10) | Yes — routing rule fully resolved | `AttendanceAdjustment` as one subject type (others are independent) | None domain-blocking | **PARTIAL** (buildable in parallel with `AttendanceAdjustment`, but practically sequenced after it) |
 | Payroll Boundary Contract *(not an aggregate — `PayableAttendanceQueryService` + lock/unlock command, §11)* | Yes | Yes — exact hour-type breakdown is an implementation detail, not a design gap | `AttendanceDay` (must be READY) | None domain-blocking | **PARTIAL** (contract is fully specified; cannot be built until `AttendanceDay` is READY) |
@@ -1006,10 +1102,9 @@ in §17):
   `AttendancePolicyService`, the first item in the implementation order.
 - Multi-shift/split-shift support in `WorkSchedule` (§16.5) — changes the
   aggregate's shape, the second item in the implementation order.
-- Overnight/midnight-spanning shift date attribution (§16.6) — affects both
-  `WorkSchedule` and `AttendanceDay`'s core date-attribution logic; deferring
-  this would mean building `AttendanceDay` against an assumption likely to
-  be wrong.
+- ~~Overnight/midnight-spanning shift date attribution (§16.6)~~ —
+  **RESOLVED**, see §5.7 and Appendix G. No longer blocks the start of
+  implementation.
 - Whether `ScheduleAssignment` is mandatory for every person (§16.7) —
   determines whether `AttendanceDay` computation needs a no-schedule code
   path from the start.
@@ -1367,6 +1462,75 @@ publishes). It exposes no other surface to any other context.
 Any dependency not explicitly marked **Yes** above is forbidden by default —
 this table is a whitelist, not a starting point for negotiation per
 implementation slice.
+
+## Appendix G — Algorithm Invariants
+
+These are deterministic computation rules — mathematics, not business
+policy. They hold for every Timekeeping implementation, forever, unless
+this ADR is amended, and are **never** modeled as `AttendancePolicy` (§4.7)
+or PayrollPolicy values: no tenant has a legitimate reason to want any of
+the following resolved differently than another, and making one
+configurable would only fragment historical determinism for no proven
+benefit. A change to any of these requires an ADR amendment, and — where
+the change would alter a past computation's output — a
+`calculationAlgorithmVersion` bump, never a per-tenant override.
+
+**Layer separation, stated once.** Algorithm Invariants define *how the
+attendance calculation engine computes* — deterministic, versioned via
+`calculationAlgorithmVersion`, identical for every tenant. `AttendancePolicy`
+(§4.7) defines *which business attendance rules apply* — grace, rounding,
+tolerance, overtime thresholds — tenant-configurable, identified by a
+resolved `fingerprint()`. PayrollPolicy (not yet designed; §11's boundary)
+defines *how monetary or payable consequences are produced* — rates,
+currencies, payable amounts. These three layers are intentionally
+independent and must not be merged: algorithm behavior is never modeled as
+a tenant policy value; `AttendancePolicy` never computes a payroll amount;
+monetary or payable values never enter `AttendancePolicy`; and changing one
+layer must never silently redefine another — an algorithm change bumps
+`calculationAlgorithmVersion`, a policy change produces a new
+policy fingerprint, and neither implies anything about the other.
+
+1. **`AttendanceDay` ownership by scheduled-start date.** A scheduled
+   period belongs to the local calendar date its scheduled start falls on
+   (§5.7).
+2. **Cross-midnight periods remain unsplit.** A `crossesMidnight` period is
+   never divided at midnight into two `AttendanceDay`s (§5.7).
+3. **Half-open interval semantics: `[)`.** Every effective-dated or
+   scheduled window in this domain — `Assignment`, `ScheduleAssignment`,
+   `AttendancePolicy`, scheduled/break intervals — is inclusive-start,
+   exclusive-end, uniformly (§5.1, §5.2).
+4. **Deterministic canonical hashing.** Any fingerprint/canonical-hash
+   computation (e.g. `WorkScheduleVersion.canonicalHash`,
+   `ResolvedAttendancePolicy.fingerprint()`) uses a fixed field order and
+   excludes descriptive/provenance metadata that cannot change the
+   computed result — the same input values always hash identically,
+   regardless of record identity, key order, or human-authored text.
+5. **Historical placement resolution uses an explicit anchor instant.**
+   Scheduled work resolves Organization placement/timezone once, as of the
+   period's scheduled-start instant; unscheduled event clusters resolve as
+   of their earliest event's instant. Neither is ever re-resolved per
+   event or split mid-period by a later `Assignment` change (§5.7).
+6. **DST ambiguous-time resolution: earlier occurrence.** A local time that
+   occurs twice (fall-back) always resolves to its earlier occurrence,
+   enforced explicitly by the implementation, never a library default
+   (§7.4).
+7. **DST nonexistent-time handling: blocked, not shifted.** A local time
+   that does not exist (spring-forward gap) blocks the affected schedule
+   occurrence with an explicit anomaly code — it is never silently moved
+   to the nearest valid instant (§7.4).
+8. **No fallback to server, browser, or device-local timezone, ever.**
+   Every timezone used in a computation is resolved from tenant data
+   (`WorkScheduleVersion.timezone` or `Location.timezone`) or the
+   computation fails explicitly (§7.2, §7.4).
+9. **Pinned `WorkScheduleVersion` usage.** A `ScheduleAssignment`'s
+   calculation always uses the specific version it pins — never the
+   `WorkSchedule`'s current `ACTIVE` version, even if the pinned version
+   has since been retired (§4.1, §4.2).
+10. **Deterministic event ordering.** `AttendanceEvent`s are ordered by
+    `occurredAtUtc` ascending, never by insertion order (§4.3 baseline);
+    any additional tie-break rule for equal-instant events is Slice 6's to
+    define, and once defined becomes an Algorithm Invariant here, not a
+    per-tenant policy choice.
 
 ## Event Catalog
 
