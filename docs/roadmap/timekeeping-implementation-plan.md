@@ -317,10 +317,19 @@ conversion code is written.
 
 ### Slice 6 — AttendanceDay Calculation
 
+**Status.** Architecture is complete and frozen (ADR-014 §4.8, §5.8, §9,
+Appendix G). All Product/HR decisions required to implement this slice —
+grace/lateness formulas, break-deduction semantics, the overtime/undertime
+comparator, and the engine-profile field set — are final. Implementation
+of this slice **has not yet started**; this section is ready to drive an
+implementation prompt.
+
 **Objective.** Build the core computation pipeline —
 `AttendanceEvent` + `ScheduleAssignment` + Assignment snapshot +
 **`AttendancePolicyResolver`** (Slice 5's interface, injected — never a
-concrete resolver referenced directly) → `AttendanceDay`.
+concrete resolver referenced directly) + **`AttendanceEngineProfile`**
+(read directly through its own read repository, ADR-014 §9.2 — no
+resolver interface) → `AttendanceDay`.
 
 `AttendanceCalculationService` must not know, anywhere in its own code:
 how policy precedence is resolved, where a policy was configured, whether
@@ -331,60 +340,134 @@ is later joined (Slice 7) by a `PrecedenceAttendancePolicyResolver`
 implementing the same interface, this slice's code does not change — only
 which implementation is wired into the composition root does.
 
-**This slice is blocked until Slice 5 Phase A is complete and frozen** —
-it is the sole consumer of `AttendancePolicyResolver`. `AttendanceCalculationService`
-resolves Organization placement historically itself (as of the relevant
-anchor instant — ADR-014 §5.7) and passes the resolved
-`legalEntityId`/`orgUnitId`/`locationId` explicitly into every
+`AttendanceEngineProfile` (ADR-014 §4.8) is a second, independent input,
+owned entirely by this slice — it is not part of Slice 5's
+`AttendancePolicy` contract and does not extend it. It is tenant-only
+(no scope, no lineage id, no resolver interface — ADR-014 §4.8), so
+`AttendanceCalculationService` reads it directly via
+`AttendanceEngineProfileReadRepository.findAtInstant(tenantId,
+attendanceAnchorInstant)`, exactly as ADR-014 §9.2 requires.
+
+**This slice is blocked until Slice 5 Phase A is complete and frozen**
+(it is — Slice 5 Phase A shipped in commits `9f61d6c`/`8a51131`) — Slice 6
+is the sole consumer of `AttendancePolicyResolver`.
+`AttendanceCalculationService` resolves Organization placement historically
+itself (as of the relevant anchor instant — ADR-014 §5.7) and passes the
+resolved `legalEntityId`/`orgUnitId`/`locationId` explicitly into every
 `AttendancePolicyResolver.resolve()` call; the resolver never re-queries
 Organization on its own. Attendance-date ownership (scheduled-start-date,
-cross-midnight-unsplit, unscheduled-local-date-with-midnight-boundary) and
-DST disambiguation are **already fixed by ADR-014 §5.7/§7.4/Appendix G** —
-this slice implements those rules, it does not decide them.
+cross-midnight-unsplit, unscheduled-local-date-with-midnight-boundary),
+DST disambiguation, the event-selection window and its adjacent-period
+midpoint cap, grace/lateness (Model A), break deduction (`autoDeductBreak`),
+the `roundedWorkedMinutes` overtime/undertime comparator, and
+`maximumContinuousShiftHours` (= 24 hours) are **already fixed by ADR-014
+§5.7, §7.4, §9, Appendix G** — this slice implements those rules, it does
+not decide them.
 
-**Files expected.**
+This slice splits into **Phase A (backend)** and **Phase B (administration
+and read-only UI)**, the same split already used operationally for Slices
+2–5.
+
+**Phase A files expected (backend only).**
+- `src/platform/timekeeping/attendance-engine-profile.ts` —
+  `AttendanceEngineProfile` domain record (`engineProfileId`, `tenantId`,
+  `effectiveFrom`, `effectiveUntil?`, `preShiftWindowMinutes`,
+  `postShiftWindowMinutes`, `autoDeductBreak`), validation, and
+  `fingerprint()` (ADR-014 §9.7)
+- `src/platform/timekeeping/attendance-engine-profile-repository.ts` — read
+  port (`findAtInstant(tenantId, attendanceAnchorInstant)`) and write port
+  — no resolver port, no scope/lineage fields (ADR-014 §4.8)
+- `src/platform/timekeeping/attendance-engine-profile-service.ts` — write
+  path: `create` / `replace` / `end` operations only (close-and-replace
+  lifecycle, ADR-014 §4.8)
+- `src/platform/timekeeping/attendance-engine-profile-events.ts`,
+  `-write-transaction.ts` — audit-event pattern, matching
+  `AttendancePolicy`'s Slice 5 shape
+- Prisma/in-memory adapters and UnitOfWork for
+  `AttendanceEngineProfileRepository`
 - `src/platform/timekeeping/attendance-day.ts`, `-repository.ts`
 - `src/platform/timekeeping/attendance-calculation-service.ts` — constructor
-  takes `AttendancePolicyResolver` (the interface) as a dependency
-- Prisma/in-memory adapters, `attendance-day.test.ts`,
-  `attendance-calculation-service.test.ts`,
+  takes `AttendancePolicyResolver` (the interface) and
+  `AttendanceEngineProfileReadRepository` as dependencies
+- Prisma/in-memory adapters for `AttendanceDayRepository`
+- `attendance-engine-profile.test.ts` (validation, fingerprint
+  determinism, effective-dating helpers),
+  `attendance-engine-profile-service.test.ts` (create/replace/end,
+  non-overlap), `attendance-engine-profile-structure.test.ts` (asserts
+  exactly the three approved fields and no scope/lineage/resolver-interface
+  surface), `attendance-engine-profile-platform.integration.test.ts` (real
+  Postgres, GIST exclusion), `attendance-day.test.ts`,
+  `attendance-calculation-service.test.ts` (grace/lateness, break
+  deduction, `roundedWorkedMinutes` comparator, event-selection window and
+  midpoint cap, `maximumContinuousShiftHours`),
   `attendance-day-structure.test.ts` (asserts the snapshot fields are plain
   stored columns, never a live join back to `Assignment` — ADR-014 §5.4 —
   **and** that `attendance-calculation-service.ts` contains no reference to
   `LegalEntity`, `OrgUnit`, `Location`, `scope`, or `precedence` — the
   structural proof that it depends only on the resolver interface)
+
+**Phase B files expected (deferred — administration and read-only UI, not
+this pass).**
+- `src/app/(app)/settings/time/attendance-engine-profile/{page.tsx,actions.ts}` —
+  Tenant-wide engine-profile configuration form
+- `src/platform/timekeeping/admin/attendance-engine-profile-admin-loader.ts`
 - `src/app/(app)/people/[employeeId]/attendance/page.tsx`,
   `src/components/people/profile/runtime-profile-attendance.tsx` — read-only
+  "Attendance" tab showing computed days (first-in, last-out, worked
+  minutes) — no adjustment/approval UI yet
 
-**Aggregates affected.** `AttendanceDay` (new).
-**Repositories.** `AttendanceDayRepository`.
-**Services.** `AttendanceCalculationService`.
-**UI.** New read-only "Attendance" tab showing computed days (first-in,
-last-out, worked minutes) — no adjustment/approval UI yet.
-**Tests.** Unit (rollup math against the real baseline policy from Slice
-5), integration, structural (snapshot-not-live-reference per §5.4; the
-resolver-interface-only dependency described above), and an explicit test
-for the **`configuration_incomplete` path**: when the resolver reports no
-applicable policy, `AttendanceDay` computation is deferred with a clear,
-distinct status — never silently computed against assumed values.
-**Migration.** New `attendance_days` table: `id`, `tenant_id`, `person_id`,
-`attendance_date`, `status` (now including a `policy_missing`/blocked state
-alongside `computed`/`adjusted`/`finalized`), `legal_entity_id`/
-`org_unit_id`/`location_id` (Assignment snapshot columns),
-`policy_version`/`policy_fingerprint` (from Slice 5's value object — a real
-reference, not a placeholder marker). Unique
-`(tenant_id, person_id, attendance_date)`.
-**Risks.** The `configuration_incomplete` handling path is easy to under-test
-if development happens to always run against a tenant with a baseline
-already configured — explicit test coverage for the missing-configuration
-case is a named Acceptance Criterion precisely to prevent that.
+**Aggregates affected.** `AttendanceEngineProfile` (new), `AttendanceDay`
+(new).
+**Repositories.** `AttendanceEngineProfileRepository`,
+`AttendanceDayRepository`.
+**Services.** `AttendanceEngineProfileService` (create/replace/end),
+`AttendanceCalculationService`.
+**UI.** Settings > Time > Attendance Engine Profile — single Tenant-wide
+configuration form; read-only "Attendance" tab on the Employee Profile.
+**Both deferred to Phase B**, same as Slice 5's admin UI.
+**Tests.** Unit (`AttendanceEngineProfile` validation and fingerprint
+determinism; rollup math against the real baseline policy from Slice 5 and
+a real engine profile from this slice — grace/lateness Model A, break
+deduction under both `autoDeductBreak` states, `roundedWorkedMinutes`
+comparator), integration, structural (snapshot-not-live-reference per
+§5.4; the resolver-interface-only dependency for `AttendancePolicy`; the
+direct-read, no-resolver-interface shape for `AttendanceEngineProfile`),
+and explicit tests for both **`configuration_incomplete`** (no applicable
+`AttendancePolicy`) and the equivalent missing-`AttendanceEngineProfile`
+blocked path (ADR-014 §9.8) — never silently computed against assumed or
+default values.
+**Migration.** Two new tables:
+- `attendance_engine_profiles`: `engine_profile_id`, `tenant_id`,
+  `effective_from`, `effective_until`, `pre_shift_window_minutes`,
+  `post_shift_window_minutes`, `auto_deduct_break`, `fingerprint`,
+  `change_reason`, `created_at`, `created_by`; GIST exclusion on
+  `(tenant_id, tstzrange)` — no `scope`/`scope_id` columns (ADR-014 §4.8).
+- `attendance_days`: `id`, `tenant_id`, `person_id`, `attendance_date`,
+  `status` (now including a `policy_missing`/`engine_profile_missing`/
+  blocked state alongside `computed`/`adjusted`/`finalized`),
+  `legal_entity_id`/`org_unit_id`/`location_id` (Assignment snapshot
+  columns), `policy_version`/`policy_fingerprint` (from Slice 5's value
+  object), `engine_profile_id`/`engine_profile_fingerprint` (from this
+  slice's value object), `calculation_algorithm_version` — all real
+  references, never placeholder markers. Unique
+  `(tenant_id, person_id, attendance_date)`.
+**Risks.** The `configuration_incomplete`/missing-engine-profile handling
+paths are easy to under-test if development happens to always run against
+a tenant with both a baseline policy and an engine profile already
+configured — explicit test coverage for both missing-configuration cases
+is a named Acceptance Criterion precisely to prevent that.
 **Acceptance criteria.** A day's `AttendanceDay` correctly reflects that
-day's events under the real, Slice-5-configured baseline policy; a
-late-arriving event triggers a correct recompute while `status = computed`;
-snapshot fields do not change when an unrelated later `Assignment` change
-occurs (§5.4); a tenant with no configured baseline produces an explicit,
-visible `configuration_incomplete`/blocked state, not a silently computed
-result.
+day's events under the real, Slice-5-configured baseline policy and a
+real, Slice-6-configured `AttendanceEngineProfile`; a late-arriving event
+triggers a correct recompute while `status = computed`; snapshot fields do
+not change when an unrelated later `Assignment`, `AttendancePolicy`, or
+`AttendanceEngineProfile` change occurs (§5.4, §5.8); a tenant with no
+configured baseline policy produces an explicit, visible
+`configuration_incomplete`/blocked state, and a tenant with no effective
+`AttendanceEngineProfile` produces an equivalent explicit blocked state
+(§9.8) — neither is ever a silently computed result; grace/lateness,
+break deduction, and overtime/undertime match ADR-014 §9.4–§9.6 exactly for
+the documented worked examples.
 
 ### Slice 7 — Attendance Policy Hierarchy and Overrides
 

@@ -325,8 +325,9 @@ classDiagram
 - **Relationships / the snapshot decision (§6 preview).** `AttendanceDay`
   **snapshots** — does not merely reference — the `legalEntityId`,
   `orgUnitId`, `locationId` that were in force on that date (resolved once,
-  at computation time, from `Assignment`), and the resolved
-  `AttendancePolicy` id/values used for that computation. This is a
+  at computation time, from `Assignment`), the resolved `AttendancePolicy`
+  id/values, and the resolved `AttendanceEngineProfile` id/fingerprint/
+  values (§4.8, §9.7) used for that computation. This is a
   financial-adjacent record; its meaning must never silently change because
   someone was transferred six months later. See §6 for the full
   reference-vs-snapshot rule.
@@ -420,6 +421,78 @@ classDiagram
   date attribution, DST disambiguation, canonical hashing, and other
   deterministic computation rules are never modeled as `AttendancePolicy`
   fields — they are fixed algorithm behavior, not a business policy choice.
+
+### 4.8 AttendanceEngineProfile
+
+- **Purpose.** Tenant-specific configuration of *how* the attendance
+  calculation engine selects and processes events for a scheduled period —
+  engine behavior, never HR or payroll meaning. Distinct from
+  `AttendancePolicy` (§4.7), which owns HR/payroll business rules, and from
+  the Algorithm Invariants (Appendix G), which are deterministic and not
+  configurable by any tenant.
+- **Identity.** `engineProfileId`, `tenantId`, `effectiveFrom`,
+  `effectiveUntil?`. `tenantId` is the stable profile series key — there is
+  no separate lineage id, no scope hierarchy, no `scopeId`, and no resolver
+  hierarchy or dedicated resolver interface, because (unlike
+  `AttendancePolicy`) there is exactly one engine-profile series per
+  tenant, never a scope-precedence chain to walk. `AttendanceCalculationService`
+  reads the applicable profile directly through the Timekeeping read
+  repository (`findAtInstant(tenantId, attendanceAnchorInstant)`); the
+  reason a resolver abstraction exists for `AttendancePolicy` — to support
+  a second, precedence-walking implementation — does not apply here.
+- **Fields (exactly three, tenant-configurable).**
+  - `preShiftWindowMinutes` — minutes before `scheduledStart` an event may
+    still be attributed to this period (§9.3).
+  - `postShiftWindowMinutes` — minutes after `scheduledEnd` an event may
+    still be attributed to this period (§9.3).
+  - `autoDeductBreak` — boolean; governs unpaid-break deduction behavior in
+    combination with `AttendancePolicy.unpaidBreakMinutes` (§9.5).
+
+  No other field is part of this aggregate. In particular,
+  `ownershipStrategy` and `maximumContinuousShiftHours` are deliberately
+  excluded: `maximumContinuousShiftHours` is a fixed Algorithm Invariant
+  (Appendix G), not a tenant-configurable value, because it is a defensive
+  correctness bound against a data-quality defect (a missing `CLOCK_OUT`),
+  not a legitimate axis of cross-tenant business variation.
+- **Lifecycle.** Effective-dated, following the identical discipline as
+  `AttendancePolicy` and `Assignment`: `effectiveFrom` inclusive,
+  `effectiveUntil` exclusive-or-absent, half-open
+  `[effectiveFrom, effectiveUntil)`, never edited in place. `create` /
+  `replace` / `end` operations only — a change always closes the currently
+  open row and opens a new one (close-and-replace); there is no in-place
+  mutation of a historical or currently-effective row. Non-overlapping
+  effective periods per `tenantId` are a database invariant (GIST
+  exclusion), the same mechanism `AttendancePolicy` and `Assignment`
+  already use. Future-dated changes and historical querying (as of any
+  past `attendanceAnchorInstant`) are both supported by this model without
+  special-casing.
+- **Invariants.** At most one effective `AttendanceEngineProfile` per
+  `tenantId` at a given instant. If no `AttendanceEngineProfile` is
+  effective as of `attendanceAnchorInstant`, the calculation must fail
+  explicitly (a blocked/anomaly result, per the "never silently default"
+  discipline already established for `AttendancePolicy`) — it must never
+  silently apply a default, fallback, or current-profile value (§9.8).
+- **Effective dating — why it is mandatory, not merely preferred (§5.8).**
+  `AttendanceDay` snapshots make an *already-computed* day's result
+  reproducible, but they cannot make the *first* computation of a day
+  whose `attendanceAnchorInstant` is already in the past correct, because
+  that first computation has no prior snapshot to read from — it must
+  resolve the engine profile that was actually in force at that historical
+  instant. Late-arriving events, offline-device synchronization, and
+  historical batch imports are the ordinary, designed-for cases that make
+  this a routine rather than a hypothetical requirement. A mutable,
+  current-only profile would apply today's configuration retroactively to
+  that first-time historical computation and make the historically correct
+  configuration permanently unrecoverable — a direct violation of §5.4's
+  already-frozen snapshot-vs-live-reference rule. See §5.8 for the full
+  argument.
+- **Ownership.** Timekeeping.
+- **Relationships.** Resolved once per `AttendanceDay` computation, at
+  `attendanceAnchorInstant`; the resolved `engineProfileId`,
+  `engineProfileFingerprint`, and the specific resolved values used are
+  snapshotted onto `AttendanceDay` (§9.7), never re-resolved after the fact
+  for an already-computed day — identical treatment to `AttendancePolicy`
+  (§4.7).
 
 ## 5. Temporal Model [Part 3]
 
@@ -537,6 +610,43 @@ progress. For an unscheduled event cluster, the equivalent anchor is the
 **earliest event's instant** in that cluster. The exact mechanics of
 grouping events into a cluster are Slice 6's concern; this ADR fixes only
 the anchor rule itself.
+
+### 5.8 AttendanceEngineProfile snapshot sufficiency (why effective dating is mandatory)
+
+This question was deliberately evaluated from first principles rather than
+assumed, and the answer is now final: `AttendanceEngineProfile` **must** be
+effective-dated (§4.8). A simpler, mutable-current-only model is
+insufficient, for a reason distinct from — and narrower than — the general
+§5.4 rule, so it is stated explicitly here:
+
+`AttendanceDay` snapshots (§4.4) guarantee reproducibility of an
+**already-computed** day: once a day has been calculated and its resolved
+engine-profile values pinned onto the record, a later, unrelated
+engine-profile change cannot retroactively alter that stored result. But
+snapshots cannot help with the **first** computation of a day whose
+`attendanceAnchorInstant` is already in the past, because there is no prior
+snapshot yet to protect that computation — it must instead resolve, from
+the source itself, the engine profile that was actually in force at that
+historical instant. Late-arriving events, offline-device synchronization,
+and historical batch imports are the ordinary, designed-for cases that
+make this a routine occurrence in this domain, not an edge case.
+
+A mutable, current-only `AttendanceEngineProfile` discards its prior value
+the instant it changes. If such a source were used to compute a
+historically anchored day for the first time, it would silently apply
+*today's* configuration to a *past* instant and make the historically
+correct configuration permanently unrecoverable — a direct violation of
+the already-frozen §5.4 rule ("a record snapshots a fact the instant that
+fact becomes financially or legally consequential and is expected to
+survive later, unrelated changes unchanged").
+
+**Snapshots and effective dating are complementary, not redundant; neither
+substitutes for the other.** Snapshots protect an already-computed day from
+later, unrelated engine-profile changes. Effective dating protects the
+first computation of a past-anchored day by making the historically
+correct engine profile resolvable at all. Both mechanisms are required.
+This decision is final and is not reopened by any future slice without a
+new ADR amendment.
 
 ## 6. Policy Model [Part 4]
 
@@ -693,6 +803,7 @@ graph TD
     AE["AttendanceEvent (this date's raw events)"] --> Calc[AttendanceCalculationService]
     SA["ScheduleAssignment\n(resolved as of this date)"] --> Calc
     Pol["AttendancePolicy\n(resolved via precedence, §Part 4)"] --> Calc
+    EP["AttendanceEngineProfile\n(resolved as of attendanceAnchorInstant, §9.2)"] --> Calc
     Asg["Assignment snapshot\n(legalEntityId/orgUnitId/locationId as of this date)"] --> Calc
     Calc --> AD["AttendanceDay\n(status: computed)"]
     Adj["AttendanceAdjustment (applied)"] --> Calc2[AttendanceCalculationService\nrecompute]
@@ -710,6 +821,138 @@ day; (2) `AttendanceAdjustmentService`, immediately after an adjustment is
 triggers the `computed`/`adjusted` → `finalized` transition through the §9
 contract; it never computes a payable result itself and never writes into
 `AttendanceDay` directly.
+
+### 9.1 Three distinct layers, restated for calculation
+
+`AttendanceCalculationService` draws on exactly three distinct,
+non-overlapping sources of rule, never merged into one another:
+
+1. **`AttendancePolicy` (§4.7).** HR and payroll business rules:
+   `gracePeriodMinutes`, `latenessToleranceMinutes`, `unpaidBreakMinutes`,
+   `roundingIntervalMinutes`, `roundingDirection`,
+   `dailyOvertimeThresholdMinutes`, `standardWorkWeekMinutes`,
+   `isStandardWorkWeekStatutoryFloor`. Unchanged from the frozen Slice 5
+   contract — no field is added, removed, renamed, or moved by this
+   amendment.
+2. **`AttendanceEngineProfile` (§4.8).** Tenant-specific attendance
+   calculation *engine behavior* — exactly `preShiftWindowMinutes`,
+   `postShiftWindowMinutes`, `autoDeductBreak`. Never HR/payroll meaning,
+   and never merged into `AttendancePolicy`.
+3. **Algorithm Invariants (Appendix G).** Deterministic engine behavior and
+   safety constraints that no tenant may configure — including the
+   adjacent-period midpoint cap and `maximumContinuousShiftHours` (§9.3,
+   §9.8 below, Appendix G).
+
+`AttendanceDay` snapshots the resolved policy, the resolved engine profile,
+and the `calculationAlgorithmVersion` that governed its computation (§9.7).
+
+### 9.2 Resolution at `attendanceAnchorInstant`
+
+`AttendanceEngineProfile` is read directly through the Timekeeping read
+repository — `findAtInstant(tenantId, attendanceAnchorInstant)` — never
+through a resolver interface or a precedence chain. There is exactly one
+engine-profile series per tenant (§4.8); the resolver-interface pattern
+`AttendancePolicyResolver` uses exists specifically to support a second,
+precedence-walking implementation, which no future slice plans for engine
+behavior, so that abstraction is deliberately not introduced here.
+
+### 9.3 Event-selection window
+
+For a scheduled period, candidate `AttendanceEvent` selection uses the
+half-open window:
+
+```
+[ scheduledStart - preShiftWindowMinutes , scheduledEnd + postShiftWindowMinutes )
+```
+
+using the `preShiftWindowMinutes`/`postShiftWindowMinutes` values from the
+`AttendanceEngineProfile` effective at `attendanceAnchorInstant` (§9.2). The
+**adjacent-period midpoint cap** further bounds this window: it may never
+extend, on either side, past the midpoint in time between this period's
+boundary and an adjacent scheduled period's nearest boundary, regardless of
+the configured window minutes. The midpoint cap is a non-configurable
+Algorithm Invariant (Appendix G) — it guarantees two adjacent periods'
+candidate windows can never structurally overlap, independent of whatever
+`preShiftWindowMinutes`/`postShiftWindowMinutes` a tenant configures.
+
+### 9.4 Grace period and lateness tolerance (Model A)
+
+```
+rawLateMinutes = max(0, firstClockIn - scheduledStart)
+
+if rawLateMinutes <= gracePeriodMinutes:
+    lateMinutes = 0
+else:
+    lateMinutes = rawLateMinutes
+```
+
+`gracePeriodMinutes` and the resulting `lateMinutes` are `AttendancePolicy`
+(§4.7) territory — nothing in this formula is `AttendanceEngineProfile`
+behavior. `latenessToleranceMinutes` (also `AttendancePolicy`) does **not**
+change `lateMinutes`; it controls only whether a `late_arrival` anomaly is
+generated. `lateMinutes` and the `late_arrival` anomaly are deliberately
+distinct concepts and must never be conflated or derived from one another.
+
+### 9.5 Break deduction (`autoDeductBreak`)
+
+Break deduction draws on two distinct sources:
+`AttendanceEngineProfile.autoDeductBreak` (engine behavior) and
+`AttendancePolicy.unpaidBreakMinutes` (HR policy value). Approved
+semantics:
+
+- If `autoDeductBreak = false`: deduct only valid recorded breaks; never
+  automatically deduct `unpaidBreakMinutes`.
+- If `autoDeductBreak = true`: when at least one valid recorded break
+  exists, use the recorded break minutes; when no valid recorded break
+  exists, deduct `unpaidBreakMinutes`.
+
+In neither case may the calculation ever: fabricate a recorded break
+interval; top up a shorter valid recorded break; replace a longer recorded
+break; truncate recorded break minutes to `unpaidBreakMinutes`; or count a
+malformed or ambiguous break span as a valid recorded break.
+
+### 9.6 Overtime and undertime comparator
+
+`roundedWorkedMinutes` — the policy-rounded worked-minutes value, per
+`AttendancePolicy.roundingIntervalMinutes`/`roundingDirection` — is the
+official comparator against `dailyOvertimeThresholdMinutes` and
+`standardWorkWeekMinutes` for overtime and undertime determination. Raw
+(unrounded) worked minutes are never used as the final overtime/undertime
+comparator.
+
+### 9.7 Snapshot and fingerprint composition
+
+`AttendanceEngineProfile` carries a deterministic `fingerprint()` computed
+over exactly `preShiftWindowMinutes`, `postShiftWindowMinutes`, and
+`autoDeductBreak`, using the same fixed-key-order,
+identity/effective-period/provenance-excluding discipline as
+`ResolvedAttendancePolicy.fingerprint()` (Appendix G item 4). Row identity
+(`engineProfileId`), `tenantId`, effective dates, change reason, and audit
+metadata are excluded from the hash.
+
+`AttendanceDay` must snapshot and pin: `engineProfileId`,
+`engineProfileFingerprint`, the resolved engine-profile values needed to
+explain the result, `policyId`/`policyVersionId`/policy `fingerprint`, and
+`calculationAlgorithmVersion`. `AttendanceDay.inputFingerprint` must
+include: the canonical owned `AttendanceEvent` inputs, schedule and
+assignment inputs, placement and timezone inputs, the `AttendancePolicy`
+fingerprint, the `AttendanceEngineProfile` fingerprint, and
+`calculationAlgorithmVersion`.
+
+**Snapshots and effective dating are complementary, not redundant (§5.8).**
+Snapshots guarantee reproducibility of an already-computed `AttendanceDay`.
+Effective dating guarantees historically correct resolution for the first
+computation of a past-anchored `AttendanceDay`. Both mechanisms are
+required; neither replaces the other.
+
+### 9.8 Missing `AttendanceEngineProfile`
+
+If no `AttendanceEngineProfile` is effective as of
+`attendanceAnchorInstant`, `AttendanceCalculationService` must fail
+explicitly — the same `configuration_incomplete`-style blocked result
+already required when no applicable `AttendancePolicy` resolves (§4.7,
+§16). The calculation must never silently apply a default, fallback, or
+current-profile value.
 
 ## 10. Approvals [Part 8]
 
@@ -1477,18 +1720,25 @@ the change would alter a past computation's output — a
 
 **Layer separation, stated once.** Algorithm Invariants define *how the
 attendance calculation engine computes* — deterministic, versioned via
-`calculationAlgorithmVersion`, identical for every tenant. `AttendancePolicy`
+`calculationAlgorithmVersion`, identical for every tenant, never
+configurable. `AttendanceEngineProfile` (§4.8) defines *tenant-specific
+attendance calculation engine behavior* — event-selection window sizing
+and break-deduction behavior — configurable per tenant, identified by its
+own resolved `fingerprint()`, but never HR/payroll meaning. `AttendancePolicy`
 (§4.7) defines *which business attendance rules apply* — grace, rounding,
 tolerance, overtime thresholds — tenant-configurable, identified by a
 resolved `fingerprint()`. PayrollPolicy (not yet designed; §11's boundary)
 defines *how monetary or payable consequences are produced* — rates,
-currencies, payable amounts. These three layers are intentionally
+currencies, payable amounts. These four layers are intentionally
 independent and must not be merged: algorithm behavior is never modeled as
-a tenant policy value; `AttendancePolicy` never computes a payroll amount;
-monetary or payable values never enter `AttendancePolicy`; and changing one
-layer must never silently redefine another — an algorithm change bumps
-`calculationAlgorithmVersion`, a policy change produces a new
-policy fingerprint, and neither implies anything about the other.
+a tenant policy value; engine behavior is never modeled as HR/payroll
+policy and never merged into `AttendancePolicy`; `AttendancePolicy` never
+computes a payroll amount; monetary or payable values never enter
+`AttendancePolicy` or `AttendanceEngineProfile`; and changing one layer
+must never silently redefine another — an algorithm change bumps
+`calculationAlgorithmVersion`, a policy change produces a new policy
+fingerprint, an engine-profile change produces a new engine-profile
+fingerprint, and none of these implies anything about the others.
 
 1. **`AttendanceDay` ownership by scheduled-start date.** A scheduled
    period belongs to the local calendar date its scheduled start falls on
@@ -1531,6 +1781,21 @@ policy fingerprint, and neither implies anything about the other.
     any additional tie-break rule for equal-instant events is Slice 6's to
     define, and once defined becomes an Algorithm Invariant here, not a
     per-tenant policy choice.
+11. **Adjacent-period midpoint cap.** A scheduled period's event-selection
+    window (§9.3) may never extend, on either side, past the midpoint in
+    time between that boundary and an adjacent scheduled period's nearest
+    boundary — regardless of the tenant's configured
+    `preShiftWindowMinutes`/`postShiftWindowMinutes` (`AttendanceEngineProfile`,
+    §4.8). This guarantees two adjacent periods' candidate windows can
+    never structurally overlap.
+12. **`maximumContinuousShiftHours` = 24 hours.** A defensive correctness
+    bound against a data-quality defect (a missing `CLOCK_OUT`) that would
+    otherwise let an unscheduled event cluster absorb an unbounded span of
+    time. Fixed at 24 hours; **not** a tenant-configurable
+    `AttendanceEngineProfile` field (§4.8), because no tenant has a
+    legitimate reason to want this safety bound weaker or stronger than
+    another's. Any future change to this value requires a
+    `calculationAlgorithmVersion` bump, never a per-tenant override.
 
 ## Event Catalog
 
